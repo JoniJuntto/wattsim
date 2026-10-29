@@ -7,4 +7,5 @@ export * from './connection';
 export * from './ev';
 export * from './events';
 export * from './meter';
+export * from './metrics';
 export * from './station';
