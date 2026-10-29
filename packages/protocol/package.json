@@ -3,12 +3,23 @@
   "version": "0.0.1",
   "type": "module",
   "license": "Apache-2.0",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "build": "bun run scripts/generate.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "dependencies": { "zod": "catalog:" },
-  "devDependencies": { "typescript": "catalog:", "@types/bun": "catalog:" }
+  "dependencies": {
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "ajv": "^8.20.0",
+    "ajv-draft-04": "^1.0.0",
+    "ajv-formats": "^3.0.1",
+    "json-schema-to-zod": "^2.8.1",
+    "typescript": "catalog:"
+  }
 }
