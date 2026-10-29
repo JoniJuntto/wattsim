@@ -1,0 +1,16 @@
+#!/usr/bin/env bun
+import { defineCommand, runMain } from 'citty';
+import { check } from './commands/check';
+import { fmt } from './commands/fmt';
+import { run } from './commands/run';
+
+const main = defineCommand({
+  meta: {
+    name: 'wattsim',
+    version: '0.0.1',
+    description: 'OCPP 1.6J / 2.0.1 charge point simulator driven by .ws scenario files',
+  },
+  subCommands: { run, check, fmt },
+});
+
+await runMain(main);

@@ -15,8 +15,9 @@
   },
   "dependencies": {
     "@wattsim/core": "workspace:*",
+    "@wattsim/protocol": "workspace:*",
     "@wattsim/scenario": "workspace:*",
-    "@wattsim/protocol": "workspace:*"
+    "citty": "^0.2.2"
   },
   "devDependencies": {
     "typescript": "catalog:",
