@@ -16,7 +16,8 @@ export function formatDuration(d: Duration): string {
 }
 
 const str = (s: StringExpr) => `"${s.raw}"`;
-const num = (n: number) => String(n);
+/** Plain decimal digits, never exponent form, so the lexer can read the output back. */
+const num = (n: number) => n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 20 });
 
 function formatJson(v: JsonValue): string {
   switch (v.kind) {

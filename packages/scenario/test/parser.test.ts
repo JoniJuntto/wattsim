@@ -263,6 +263,75 @@ describe('parse errors', () => {
     expect(err('wattsim 1\nstation "x" {\n  choose {\n  }\n}').message).toContain('at least one');
   });
 
+  test('ev prop units may be attached or separated by a space', () => {
+    const attached = parse(
+      'wattsim 1\nstation "x" {\n  ev plug evse 1 { battery 60kWh soc 20% maxCurrent 32A phases 3 }\n}\n',
+    );
+    const spaced = parse(
+      'wattsim 1\nstation "x" {\n  ev plug evse 1 { battery 60 kWh soc 20 % maxCurrent 32 A phases 3 }\n}\n',
+    );
+    const props = (s: ReturnType<typeof parse>) => {
+      const stmt = s.stations[0]?.body[0];
+      if (stmt?.kind !== 'ev') throw new Error('expected an ev statement');
+      return stmt.props.map((p) => {
+        const { loc: _loc, ...value } = p.value;
+        return [p.name, value];
+      });
+    };
+    expect(props(spaced)).toEqual(props(attached));
+    expect(props(attached)).toEqual([
+      ['battery', { kind: 'number', value: 60, unit: 'kWh' }],
+      ['soc', { kind: 'number', value: 20, unit: '%' }],
+      ['maxCurrent', { kind: 'number', value: 32, unit: 'A' }],
+      ['phases', { kind: 'number', value: 3 }],
+    ]);
+  });
+
+  test('durations must be a whole number of milliseconds', () => {
+    expect(parse('wattsim 1\nstation "x" {\n  wait 1.5s\n}\n').stations[0]?.body[0]).toMatchObject({
+      duration: { ms: 1500 },
+    });
+    const e = err('wattsim 1\nstation "x" {\n  wait 0.4ms\n}\n');
+    expect(e.message).toBe('duration must be a whole number of milliseconds');
+    expect(e.line).toBe(3);
+    expect(e.col).toBe(8);
+    expect(err('wattsim 1\nstation "x" {\n  wait 0.0001s\n}\n').message).toBe(
+      'duration must be a whole number of milliseconds',
+    );
+  });
+
+  test('a bare identifier after expect/send is not a payload', () => {
+    const e = err('wattsim 1\nstation "x" {\n  expect StatusNotification Faulted\n}\n');
+    expect(e.message).toBe("unexpected 'Faulted' after expect StatusNotification; payload must be a JSON value");
+    expect(e.col).toBe(29);
+    expect(err('wattsim 1\nstation "x" {\n  send Heartbeat now\n}\n').message).toBe(
+      "unexpected 'now' after send Heartbeat; payload must be a JSON value",
+    );
+    // payloads still start on {, [, string, number and -
+    const ok = parse(
+      'wattsim 1\nstation "x" {\n  expect A {}\n  expect B [1]\n  expect C "s"\n  expect D 5\n  expect E -5 within 1s\n  expect F within 1s\n}\n',
+    );
+    const body = ok.stations[0]?.body ?? [];
+    expect(body.map((x) => (x as ExpectStmt).payload?.kind)).toEqual([
+      'object',
+      'array',
+      'string',
+      'number',
+      'number',
+      undefined,
+    ]);
+  });
+
+  test('interpolation errors point at the offending brace inside the string', () => {
+    const e = err('wattsim 1\nstation "x" {\n  log "ok {bad name}"\n}\n');
+    expect(e.message).toContain('interpolation');
+    expect(e.line).toBe(3);
+    expect(e.col).toBe(11);
+    const missing = err('wattsim 1\nstation "x" {\n  log "a\\"b {oops"\n}\n');
+    expect(missing.message).toContain("missing '}'");
+    expect(missing.col).toBe(13);
+  });
+
   test('semicolons separate statements on one line', () => {
     const s = parse('wattsim 1\nstation "x" { boot; wait 1s; stop evse 1 }\n');
     expect(s.stations[0]?.body.map((x) => x.kind)).toEqual(['boot', 'wait', 'stop']);

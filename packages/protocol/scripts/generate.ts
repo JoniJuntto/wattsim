@@ -37,17 +37,26 @@ const versions: Array<{ dir: string; parse: (file: string) => { action: string; 
   },
 ];
 
+/** Keywords whose value is a map of property-name -> schema; keys under them are names, not keywords. */
+const PROPERTY_MAP_KEYWORDS = new Set(['properties', 'patternProperties']);
+
 /**
- * Inline every `#/definitions/<name>` reference (schemas are known to be acyclic) and drop
- * `default`: it carries no validation meaning, and json-schema-to-zod wrongly treats a property
- * with a default as required when `withoutDefaults` is set.
+ * Inline every `#/definitions/<name>` reference (schemas are known to be acyclic) and drop the
+ * `default` keyword: it carries no validation meaning, and json-schema-to-zod wrongly treats a property
+ * with a default as required when `withoutDefaults` is set. A *property* named `default` (a key under
+ * `properties`) is kept.
  */
 function dereference(schema: Json): Json {
   const definitions = (schema.definitions ?? {}) as Record<string, Json>;
-  const resolve = (node: unknown, stack: string[]): unknown => {
+  const resolve = (node: unknown, stack: string[], isPropertyMap = false): unknown => {
     if (Array.isArray(node)) return node.map((n) => resolve(n, stack));
     if (node === null || typeof node !== 'object') return node;
     const obj = node as Json;
+    if (isPropertyMap) {
+      const out: Json = {};
+      for (const [name, sub] of Object.entries(obj)) out[name] = resolve(sub, stack);
+      return out;
+    }
     if (typeof obj.$ref === 'string') {
       const prefix = '#/definitions/';
       if (!obj.$ref.startsWith(prefix)) throw new Error(`unsupported $ref ${obj.$ref}`);
@@ -60,7 +69,8 @@ function dereference(schema: Json): Json {
     }
     const out: Json = {};
     for (const [k, v] of Object.entries(obj)) {
-      if (k !== 'default') out[k] = resolve(v, stack);
+      if (k === 'default') continue;
+      out[k] = resolve(v, stack, PROPERTY_MAP_KEYWORDS.has(k));
     }
     return out;
   };

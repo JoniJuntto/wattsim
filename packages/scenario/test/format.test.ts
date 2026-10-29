@@ -56,6 +56,16 @@ describe('format', () => {
     );
   });
 
+  test('numbers never format in exponent form', () => {
+    const src =
+      'wattsim 1\nstation "x" {\n  send Foo {a: 1000000000000000000000, b: 0.0000001, c: -2500000000000000000000}\n}\n';
+    const once = format(parse(src));
+    expect(once).not.toMatch(/e[+-]?\d/i);
+    expect(once).toContain('a: 1000000000000000000000');
+    expect(once).toContain('b: 0.0000001');
+    expect(format(parse(once))).toBe(once);
+  });
+
   test('no csms or lets means a single blank line after the header', () => {
     expect(format(parse('wattsim 1\nstation "x" {\n}\n'))).toBe('wattsim 1\n\nstation "x" {\n}\n');
   });

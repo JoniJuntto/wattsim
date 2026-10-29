@@ -26,6 +26,13 @@ export function encodeFrame(f: Frame): string {
   }
 }
 
+/** OCPP-J caps the message id at 36 characters (a UUID). */
+export const MAX_MESSAGE_ID_LENGTH = 36;
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
 export function decodeFrame(raw: string): Frame {
   let parsed: unknown;
   try {
@@ -37,38 +44,56 @@ export function decodeFrame(raw: string): Frame {
     throw new FrameDecodeError('frame must be a JSON array', raw);
   }
   const [type, id, ...rest] = parsed as unknown[];
-  if (typeof id !== 'string') {
-    throw new FrameDecodeError('message id must be a string', raw);
-  }
+  const requireLength = (name: string, n: number): void => {
+    if (parsed.length !== n) throw new FrameDecodeError(`${name} must have ${n} elements, got ${parsed.length}`, raw);
+  };
+  const requireId = (): string => {
+    if (typeof id !== 'string') throw new FrameDecodeError('message id must be a string', raw);
+    if (id.length > MAX_MESSAGE_ID_LENGTH) {
+      throw new FrameDecodeError(
+        `message id must be at most ${MAX_MESSAGE_ID_LENGTH} characters, got ${id.length}`,
+        raw,
+      );
+    }
+    return id;
+  };
+  // Type first: a frame of the wrong shape is reported in terms of the message type it claims to be.
   switch (type) {
     case MessageType.Call: {
-      if (rest.length !== 2) {
-        throw new FrameDecodeError(`CALL must have 4 elements, got ${parsed.length}`, raw);
-      }
+      requireLength('CALL', 4);
+      const messageId = requireId();
       const [action, payload] = rest;
       if (typeof action !== 'string') {
         throw new FrameDecodeError('CALL action must be a string', raw);
       }
-      return { type: MessageType.Call, id, action, payload };
+      if (!isPlainObject(payload)) {
+        throw new FrameDecodeError('CALL payload must be a JSON object', raw);
+      }
+      return { type: MessageType.Call, id: messageId, action, payload };
     }
     case MessageType.CallResult: {
-      if (rest.length !== 1) {
-        throw new FrameDecodeError(`CALLRESULT must have 3 elements, got ${parsed.length}`, raw);
+      requireLength('CALLRESULT', 3);
+      const messageId = requireId();
+      const payload = rest[0];
+      if (!isPlainObject(payload)) {
+        throw new FrameDecodeError('CALLRESULT payload must be a JSON object', raw);
       }
-      return { type: MessageType.CallResult, id, payload: rest[0] };
+      return { type: MessageType.CallResult, id: messageId, payload };
     }
     case MessageType.CallError: {
-      if (rest.length !== 3) {
-        throw new FrameDecodeError(`CALLERROR must have 5 elements, got ${parsed.length}`, raw);
-      }
+      requireLength('CALLERROR', 5);
+      const messageId = requireId();
       const [code, description, details] = rest;
       if (typeof code !== 'string' || typeof description !== 'string') {
         throw new FrameDecodeError('CALLERROR code and description must be strings', raw);
       }
-      return { type: MessageType.CallError, id, code, description, details };
+      if (!isPlainObject(details)) {
+        throw new FrameDecodeError('CALLERROR details must be a JSON object', raw);
+      }
+      return { type: MessageType.CallError, id: messageId, code, description, details };
     }
     default:
-      throw new FrameDecodeError(`unknown message type ${String(type)}`, raw);
+      throw new FrameDecodeError(`unknown message type ${JSON.stringify(type) ?? String(type)}`, raw);
   }
 }
 

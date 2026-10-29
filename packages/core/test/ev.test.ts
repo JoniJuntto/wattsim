@@ -83,9 +83,19 @@ describe('EvModel', () => {
     expect(pFull).toBeCloseTo(22.08, 9);
     expect(pTaper).toBeLessThan(pFull);
     expect(pTaper).toBeCloseTo(22.08 * 0.55, 9); // linear 1.0 at 0.8 -> 0.1 at 1.0
-    const end = chargingEv({ initialSoc: 1, targetSoc: 1 });
-    // at soc 1.0 the model is Full on construction? no: Full only via tick. Curve gives 0.1.
-    expect(end.requestedPowerKw(50, 230)).toBeCloseTo(22.08 * 0.1, 9);
+    const end = chargingEv({ initialSoc: 0.99, targetSoc: 1 });
+    expect(end.requestedPowerKw(50, 230)).toBeCloseTo(22.08 * 0.145, 9);
+  });
+
+  test('requestedPowerKw at or above targetSoc goes Full and requests 0', () => {
+    const ev = new EvModel({ initialSoc: 0.9, targetSoc: 0.8 });
+    ev.plug();
+    ev.ready();
+    expect(ev.requestedPowerKw(22, 230)).toBe(0);
+    expect(ev.state).toBe('Full');
+    const exact = chargingEv({ initialSoc: 1, targetSoc: 1 });
+    expect(exact.requestedPowerKw(50, 230)).toBe(0);
+    expect(exact.state).toBe('Full');
   });
 
   test('custom curve is honoured', () => {

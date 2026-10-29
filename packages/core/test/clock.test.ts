@@ -85,6 +85,42 @@ describe('VirtualClock', () => {
     expect(log).toEqual(['a', 'a.then1', 'a.then2', 'b']);
   });
 
+  test('a throwing timer does not stop later timers; advance rejects with the error afterwards', async () => {
+    const c = new VirtualClock(0);
+    const fired: number[] = [];
+    c.setTimeout(() => {
+      throw new Error('boom');
+    }, 10);
+    c.setTimeout(() => fired.push(c.now()), 50);
+    await expect(c.advance(100)).rejects.toThrow('boom');
+    expect(fired).toEqual([50]);
+    expect(c.now()).toBe(100);
+    expect(c.pendingTimers()).toBe(0);
+    // the clock is usable again afterwards
+    c.setTimeout(() => fired.push(c.now()), 10);
+    await c.advance(10);
+    expect(fired).toEqual([50, 110]);
+  });
+
+  test('several throwing timers surface as an AggregateError', async () => {
+    const c = new VirtualClock(0);
+    c.setTimeout(() => {
+      throw new Error('one');
+    }, 10);
+    c.setTimeout(() => {
+      throw new Error('two');
+    }, 20);
+    let caught: unknown;
+    try {
+      await c.advance(100);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors.map((e) => (e as Error).message)).toEqual(['one', 'two']);
+    expect(c.now()).toBe(100);
+  });
+
   test('advanceTo moves to an absolute epoch and never backwards', async () => {
     const c = new VirtualClock(1000);
     await c.advanceTo(5000);

@@ -72,6 +72,45 @@ describe('decodeFrame', () => {
     expect(() => decodeFrame('[2,"id","Action"]')).toThrow(FrameDecodeError);
   });
 
+  test('checks the message type before the id, so a bare [2] reports the missing fields', () => {
+    expect(() => decodeFrame('[2]')).toThrow(/CALL must have 4 elements, got 1/);
+    expect(() => decodeFrame('[3]')).toThrow(/CALLRESULT must have 3 elements, got 1/);
+    expect(() => decodeFrame('[4]')).toThrow(/CALLERROR must have 5 elements, got 1/);
+    expect(() => decodeFrame('[9,5,"x",{}]')).toThrow(/unknown message type 9/);
+    expect(() => decodeFrame('["2","id","Action",{}]')).toThrow(/unknown message type/);
+  });
+
+  test('rejects message ids longer than 36 characters', () => {
+    const ok = 'a'.repeat(36);
+    expect(decodeFrame(`[2,"${ok}","Heartbeat",{}]`).id).toBe(ok);
+    expect(() => decodeFrame(`[2,"${'a'.repeat(37)}","Heartbeat",{}]`)).toThrow(/36/);
+    expect(() => decodeFrame(`[3,"${'a'.repeat(37)}",{}]`)).toThrow(/36/);
+  });
+
+  test('requires CALL and CALLRESULT payloads to be plain objects', () => {
+    for (const bad of ['null', '[]', '"s"', '5', 'true']) {
+      expect(() => decodeFrame(`[2,"id","Heartbeat",${bad}]`)).toThrow(/CALL payload must be a JSON object/);
+      expect(() => decodeFrame(`[3,"id",${bad}]`)).toThrow(/CALLRESULT payload must be a JSON object/);
+    }
+    expect(decodeFrame('[2,"id","Heartbeat",{}]')).toMatchObject({ type: 2, payload: {} });
+  });
+
+  test('requires CALLERROR details to be a plain object', () => {
+    for (const bad of ['null', '[]', '"s"', '5']) {
+      expect(() => decodeFrame(`[4,"id","GenericError","d",${bad}]`)).toThrow(
+        /CALLERROR details must be a JSON object/,
+      );
+    }
+    expect(() => decodeFrame('[4,"id","GenericError","d"]')).toThrow(/CALLERROR must have 5 elements, got 4/);
+    expect(decodeFrame('[4,"id","GenericError","d",{}]')).toEqual({
+      type: 4,
+      id: 'id',
+      code: 'GenericError',
+      description: 'd',
+      details: {},
+    });
+  });
+
   test('rejects a non-array', () => {
     expect(() => decodeFrame('{"a":1}')).toThrow(FrameDecodeError);
   });

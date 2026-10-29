@@ -4,6 +4,8 @@
  * `Events` maps event name -> listener argument tuple, e.g.
  *   type E = { state: [ConnectionState]; error: [Error] };
  */
+import { throwCollected } from './clock';
+
 type Listener<Args extends unknown[]> = (...args: Args) => void;
 type AnyListener = (...args: unknown[]) => void;
 type Entry = { fn: AnyListener; once: boolean };
@@ -41,7 +43,16 @@ export class TypedEmitter<Events extends Record<string, unknown[]>> {
     const remaining = entries.filter((e) => !e.once);
     if (remaining.length === 0) this.listeners.delete(event);
     else this.listeners.set(event, remaining);
-    for (const e of snapshot) (e.fn as unknown as Listener<Events[K]>)(...args);
+    // One throwing listener must not starve the rest; errors are rethrown once every listener has run.
+    const errors: unknown[] = [];
+    for (const e of snapshot) {
+      try {
+        (e.fn as unknown as Listener<Events[K]>)(...args);
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+    throwCollected(errors, `listeners threw during emit('${String(event)}')`);
     return true;
   }
 

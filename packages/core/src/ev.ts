@@ -101,9 +101,14 @@ export class EvModel {
 
   /**
    * Power the EV will draw given what the EVSE offers. Returns 0 unless the EV is (or, on a positive offer,
-   * becomes) Charging. Cap = curve(soc) * phases * voltage * maxCurrentA / 1000.
+   * becomes) Charging. A Ready or Charging EV whose soc is already at or above `targetSoc` goes Full and
+   * draws nothing. Cap = curve(soc) * phases * voltage * maxCurrentA / 1000.
    */
   requestedPowerKw(offeredKw: number, voltageV: number): number {
+    if ((this._state === 'Ready' || this._state === 'Charging') && this._soc >= this.cfg.targetSoc) {
+      this._state = 'Full';
+      return 0;
+    }
     if (this._state === 'Ready' && offeredKw > 0) this._state = 'Charging';
     if (this._state !== 'Charging') return 0;
     const curve = this.cfg.curve ?? defaultChargeCurve;

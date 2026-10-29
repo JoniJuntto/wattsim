@@ -47,11 +47,13 @@ export function parseStringParts(raw: string, loc: Loc, file?: string): StringEx
   const parts: StringExpr['parts'] = [];
   let buf = '';
   let i = 0;
+  // `loc` is the opening quote; raw index i sits at column loc.col + 1 + i on the same line.
+  const colOf = (index: number) => loc.col + 1 + index;
   while (i < raw.length) {
     const ch = raw[i] as string;
     if (ch === '\\') {
       const next = raw[i + 1];
-      if (next === undefined) throw new ParseError('dangling backslash in string', loc.line, loc.col, file);
+      if (next === undefined) throw new ParseError('dangling backslash in string', loc.line, colOf(i), file);
       buf += next === 'n' ? '\n' : next === 't' ? '\t' : next === 'r' ? '\r' : next;
       i += 2;
       continue;
@@ -63,7 +65,7 @@ export function parseStringParts(raw: string, loc: Loc, file?: string): StringEx
         throw new ParseError(
           `invalid interpolation in "${raw}": expected {identifier}${close === -1 ? ", missing '}'" : ''}`,
           loc.line,
-          loc.col,
+          colOf(i),
           file,
         );
       }
@@ -201,7 +203,11 @@ class Parser {
     const factor = DURATION_UNITS[unit.value];
     if (factor === undefined) this.fail(`unknown duration unit '${unit.value}', expected ms, s, m, min or h`);
     this.advance();
-    return { ms: Math.round(Number(num.value) * factor) };
+    const exact = Number(num.value) * factor;
+    const ms = Math.round(exact);
+    // Tolerate binary float noise (1.1s -> 1100.0000000000002) but reject real fractions (0.4ms).
+    if (Math.abs(exact - ms) > 1e-6) this.fail('duration must be a whole number of milliseconds', num);
+    return { ms };
   }
 
   private parseSignedDuration(what: string): Duration {
@@ -424,6 +430,7 @@ class Parser {
       case 'send': {
         this.advance();
         const action = this.expectIdent("OCPP action name after 'send'");
+        this.rejectBarePayloadWord('send', action);
         return { kind: 'send', action, payload: this.parseJson(), loc };
       }
       case 'expect':
@@ -536,7 +543,7 @@ class Parser {
       if (u.type === 'punct' && u.value === '%' && u.line === t.line) {
         this.advance();
         value.unit = '%';
-      } else if (Parser.isWord(u) && u.line === t.line && u.col === t.col + t.value.length) {
+      } else if (Parser.isWord(u) && u.line === t.line && this.isPropUnit(u, t)) {
         this.advance();
         value.unit = u.value;
       }
@@ -545,23 +552,40 @@ class Parser {
     return this.fail(`expected number or string for property '${name}', got ${Parser.describe(t)}`);
   }
 
+  /**
+   * `60kWh` and `60 kWh` both carry a unit. A spaced word is a unit unless it is itself followed by a
+   * property value (`battery 60 soc 20%`), in which case it is the next property's name.
+   */
+  private isPropUnit(word: Token, num: Token): boolean {
+    if (word.col === num.col + num.value.length) return true;
+    const after = this.peek(1);
+    return after.type !== 'int' && after.type !== 'number' && after.type !== 'string';
+  }
+
   private parseExpect(loc: Loc): Stmt {
     this.advance();
     const action = this.expectIdent("OCPP action name after 'expect'");
     const node: Stmt = { kind: 'expect', action, loc };
-    const t = this.peek();
-    const startsJson =
-      (t.type === 'punct' && (t.value === '{' || t.value === '[' || t.value === '-')) ||
-      t.type === 'string' ||
-      t.type === 'int' ||
-      t.type === 'number' ||
-      (Parser.isWord(t) && t.value !== 'within');
-    if (startsJson) node.payload = this.parseJson();
+    if (!this.atWord('within')) this.rejectBarePayloadWord('expect', action);
+    if (this.atPayloadStart()) node.payload = this.parseJson();
     if (this.atWord('within')) {
       this.advance();
       node.within = this.parseDuration("after 'within'");
     }
     return node;
+  }
+
+  /** A statement-level payload begins only with `{`, `[`, a string, a number or `-`. */
+  private atPayloadStart(): boolean {
+    const t = this.peek();
+    if (t.type === 'punct') return t.value === '{' || t.value === '[' || t.value === '-';
+    return t.type === 'string' || t.type === 'int' || t.type === 'number';
+  }
+
+  /** `expect StatusNotification Faulted`: a bare word is never a payload, even though refs are valid inside one. */
+  private rejectBarePayloadWord(stmt: string, action: string): void {
+    const t = this.peek();
+    if (Parser.isWord(t)) this.fail(`unexpected '${t.value}' after ${stmt} ${action}; payload must be a JSON value`);
   }
 
   private parseChoose(loc: Loc): Stmt {

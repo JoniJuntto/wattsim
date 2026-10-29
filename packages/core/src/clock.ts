@@ -54,6 +54,13 @@ type VirtualTimer = {
   cancelled: boolean;
 };
 
+/** Rethrow collected callback errors: the single error as-is, several wrapped in an AggregateError. */
+export function throwCollected(errors: readonly unknown[], message: string): void {
+  if (errors.length === 0) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, message);
+}
+
 /** Yield to the event loop so every pending microtask (and I/O callback) runs before the next timer fires. */
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => {
@@ -111,18 +118,25 @@ export class VirtualClock implements Clock {
     if (this.advancing) throw new Error('VirtualClock.advance called re-entrantly');
     if (!Number.isFinite(ms) || ms < 0) throw new RangeError(`advance: ms must be a finite number >= 0, got ${ms}`);
     const target = this.current + ms;
+    const errors: unknown[] = [];
     this.advancing = true;
     try {
       for (;;) {
         const next = this.timers[0];
         if (!next || next.due > target) break;
-        this.fire(next);
+        // A throwing callback must not stall the clock: keep firing, report afterwards.
+        try {
+          this.fire(next);
+        } catch (err) {
+          errors.push(err);
+        }
         await yieldToEventLoop();
       }
       this.current = target;
     } finally {
       this.advancing = false;
     }
+    throwCollected(errors, 'timer callbacks threw during VirtualClock.advance');
   }
 
   /** Advance to an absolute epoch. A target in the past is a no-op. */
