@@ -1,0 +1,14 @@
+{
+  "name": "@wattsim/protocol",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "build": "bun run scripts/generate.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": { "zod": "catalog:" },
+  "devDependencies": { "typescript": "catalog:", "@types/bun": "catalog:" }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "wattsim-monorepo",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "packageManager": "bun@1.4.4",
+  "workspaces": {
+    "packages": ["packages/*"],
+    "catalog": {
+      "zod": "^4.4.3",
+      "typescript": "^5.9.3",
+      "@types/bun": "^1.4.0"
+    }
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "lint": "biome check . --diagnostic-level=error --max-diagnostics=100",
+    "lint:fix": "biome check . --diagnostic-level=error --max-diagnostics=100 --write",
+    "test": "bun test",
+    "check": "bun run typecheck && bun run lint && bun run test",
+    "prepare": "sh -c 'if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then lefthook install; fi'"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.9",
+    "@types/bun": "catalog:",
+    "lefthook": "^2.1.10",
+    "turbo": "^2.5.0",
+    "typescript": "catalog:"
+  }
+}
