@@ -15,3 +15,10 @@ Known gaps found while building milestone 1. Not scheduled; ordered roughly by h
 
 - OCPP 2.1 schemas are vendored but not generated or wired.
 - Security profiles 2 and 3 (TLS, client certificates) and the certificate lifecycle messages.
+
+## Smart charging simplifications
+
+- A charging schedule is reduced to the limit of its first period: `stackLevel`, purpose precedence, `validFrom` / `validTo`, `duration` and every schedule period beyond the first are ignored.
+- A `ChargingStationMaxProfile` / `ChargePointMaxProfile` sent for evseId 0 is applied per EVSE, so the station total is N x limit rather than a shared cap.
+- `ClearChargingProfile` ignores its criteria (id, stackLevel, purpose) and returns `Accepted` even when nothing was cleared (spec: `Unknown`).
+- All inbound schema failures collapse to FormationViolation/FormatViolation; 1.6 PropertyConstraintViolation and TypeConstraintViolation are not distinguished.

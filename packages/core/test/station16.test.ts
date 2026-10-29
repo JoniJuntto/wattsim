@@ -480,7 +480,7 @@ describe('Station 1.6: inbound CALLs', () => {
     });
     expect(station.evse(1)?.status).toBe('SuspendedEV');
     await station.stopTransaction(1);
-    expect(station.evse(1)?.status).toBe('Finishing');
+    expect(station.evse(1)?.status).toBe('Unavailable'); // the scheduled change applies even with the EV plugged in
     await station.unplug(1);
     expect(station.evse(1)?.status).toBe('Unavailable');
     expect(await call('ChangeAvailability', { connectorId: 0, type: 'Operative' })).toEqual({

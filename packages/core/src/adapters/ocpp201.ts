@@ -55,7 +55,7 @@ function endTrigger(reason: string, stopped: StopReason201): TriggerReason201 {
     case 'Remote':
       return 'RemoteStop';
     case 'EVDisconnected':
-      return 'EVCommunicationLost';
+      return 'EVDeparted';
     case 'DeAuthorized':
       return 'Deauthorized';
     case 'ImmediateReset':
@@ -91,15 +91,13 @@ export function wireStatus201(status: ConnectorStatus): WireStatus201 {
   }
 }
 
+/** `Idle` whenever no EV is plugged in, including a remotely started transaction still waiting for the cable. */
 export function chargingState201(evse: EvseState): ChargingState201 {
   switch (evse.status) {
     case 'Charging':
     case 'SuspendedEV':
     case 'SuspendedEVSE':
       return evse.status;
-    case 'Preparing':
-    case 'Finishing':
-      return 'EVConnected';
     default:
       return evse.ev ? 'EVConnected' : 'Idle';
   }
@@ -220,29 +218,35 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
   switch (call.action) {
     case 'Reset': {
       const p = call.payload as v201.ResetRequest;
-      const status = st.scheduleReset({
-        stopReason: 'ImmediateReset',
-        bootReason: 'RemoteReset',
-        onIdle: p.type === 'OnIdle',
-      });
+      const onIdle = p.type === 'OnIdle';
+      if (p.evseId !== undefined) {
+        // Per-EVSE reset: end that transaction and re-send its status; the station itself stays up.
+        const evse = st.evse(p.evseId);
+        if (!evse) return { result: { status: 'Rejected' } satisfies v201.ResetResponse };
+        const status: v201.ResetResponse['status'] = evse.tx && onIdle ? 'Scheduled' : 'Accepted';
+        return { result: { status } satisfies v201.ResetResponse, after: () => st.resetEvse(evse.id, onIdle) };
+      }
+      const status = st.scheduleReset({ stopReason: 'ImmediateReset', bootReason: 'RemoteReset', onIdle });
       return { result: { status } satisfies v201.ResetResponse };
     }
     case 'RequestStartTransaction': {
       const p = call.payload as v201.RequestStartTransactionRequest;
       const evse = pickEvse(st, p.evseId);
-      if (!evse) return { result: { status: 'Rejected' } satisfies v201.RequestStartTransactionResponse };
+      if (!evse || st.resetPending(evse.id)) {
+        return { result: { status: 'Rejected' } satisfies v201.RequestStartTransactionResponse };
+      }
+      // The profile of a remote start is a TxProfile by definition: it applies to this transaction only.
       const limitKw = scheduleLimitKw(p.chargingProfile?.chargingSchedule[0], st.cfg);
       return {
         result: { status: 'Accepted' } satisfies v201.RequestStartTransactionResponse,
-        after: async () => {
-          if (limitKw !== undefined) st.setLimitKw(evse.id, limitKw);
-          await st.beginTransaction(evse.id, {
+        after: () =>
+          st.beginTransaction(evse.id, {
             idTag: p.idToken.idToken,
             idTokenType: p.idToken.type,
             remote: true,
             remoteStartId: p.remoteStartId,
-          });
-        },
+            limitKw,
+          }),
       };
     }
     case 'RequestStopTransaction': {
@@ -337,9 +341,14 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       if (p.evseId !== 0 && !st.evse(p.evseId)) {
         return { result: { status: 'Rejected' } satisfies v201.SetChargingProfileResponse };
       }
+      const purpose = p.chargingProfile.chargingProfilePurpose;
+      // A TxProfile needs a running transaction on one specific EVSE; otherwise it is discarded.
+      if (purpose === 'TxProfile' && (p.evseId === 0 || !st.evse(p.evseId)?.tx)) {
+        return { result: { status: 'Rejected' } satisfies v201.SetChargingProfileResponse };
+      }
       const limitKw = scheduleLimitKw(p.chargingProfile.chargingSchedule[0], st.cfg);
       if (limitKw === undefined) return { result: { status: 'Rejected' } satisfies v201.SetChargingProfileResponse };
-      st.setLimitKw(p.evseId === 0 ? undefined : p.evseId, limitKw);
+      st.setLimitKw(p.evseId === 0 ? undefined : p.evseId, limitKw, purpose);
       return { result: { status: 'Accepted' } satisfies v201.SetChargingProfileResponse };
     }
     case 'ClearChargingProfile': {

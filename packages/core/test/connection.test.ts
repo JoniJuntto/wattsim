@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { CallFrame, Frame, Violation } from '@wattsim/protocol';
 import type { ConnectionState } from '../src/index';
-import { CallError, ChaosEngine, Connection, RequestTimeoutError, ViolationError, VirtualClock } from '../src/index';
+import {
+  CallError,
+  ChaosEngine,
+  Connection,
+  QueueOverflowError,
+  RequestTimeoutError,
+  ViolationError,
+  VirtualClock,
+} from '../src/index';
 import { CsmsCallError, FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
@@ -529,5 +537,94 @@ describe('Connection: chaos', () => {
     await clock.advance(30_000);
     expect(await second).toBeInstanceOf(RequestTimeoutError);
     await expect(conn.request('Heartbeat', {})).resolves.toHaveProperty('currentTime');
+  });
+});
+
+describe('Connection: version-specific CALLERROR codes', () => {
+  test('a schema-invalid inbound CALL is FormatViolation on 2.0.1 and FormationViolation on 1.6', async () => {
+    const conn16 = make();
+    conn16.on('call', (_call, reply) => reply({ status: 'Accepted' }));
+    await conn16.connect();
+    await until(() => csms.isConnected('CP1'));
+    const err16 = await csms.call('CP1', 'Reset', { type: 'Bogus' }).catch((e: unknown) => e);
+    expect((err16 as Error).message).toMatch(/CALLERROR FormationViolation/);
+
+    const csms201 = await FakeCsms.start({ version: 'ocpp2.0.1' });
+    try {
+      const conn201 = make({ url: csms201.url, version: 'ocpp2.0.1' });
+      conn201.on('call', (_call, reply) => reply({ status: 'Accepted' }));
+      await conn201.connect();
+      await until(() => csms201.isConnected('CP1'));
+      const err201 = await csms201.call('CP1', 'Reset', { type: 'Bogus' }).catch((e: unknown) => e);
+      expect((err201 as Error).message).toMatch(/CALLERROR FormatViolation/);
+      await conn201.disconnect();
+    } finally {
+      await csms201.stop();
+    }
+  });
+});
+
+describe('Connection: offline queue cap', () => {
+  test('maxQueue 3 drops the oldest non-transaction message with a QueueOverflowError', async () => {
+    const conn = make({ maxQueue: 3 });
+    const errors: Error[] = [];
+    conn.on('error', (e) => errors.push(e));
+    const hb1 = outcome(conn.request('Heartbeat', {}));
+    const hb2 = outcome(conn.request('Heartbeat', {}));
+    const mv = outcome(conn.request('MeterValues', { connectorId: 1, meterValue: [] }));
+    expect(conn.queuedCount()).toBe(3);
+    expect(errors).toEqual([]);
+    const hb3 = outcome(conn.request('Heartbeat', {}));
+    expect(conn.queuedCount()).toBe(3);
+    expect(errors.length).toBe(1);
+    expect(errors[0]).toBeInstanceOf(QueueOverflowError);
+    expect(await hb1).toBeInstanceOf(QueueOverflowError);
+    expect((await hb1) as Error).toBe(errors[0] as Error);
+
+    // Transaction messages survive: the newest Heartbeat is the only non-transaction message, so it goes.
+    const start1 = outcome(
+      conn.request('StartTransaction', { connectorId: 1, idTag: 'A', meterStart: 0, timestamp: 't' }),
+    );
+    expect(errors.length).toBe(2);
+    expect(await hb2).toBeInstanceOf(QueueOverflowError);
+    const start2 = outcome(
+      conn.request('StartTransaction', { connectorId: 1, idTag: 'B', meterStart: 0, timestamp: 't' }),
+    );
+    expect(await mv).toBeInstanceOf(QueueOverflowError);
+    const start3 = outcome(
+      conn.request('StartTransaction', { connectorId: 1, idTag: 'C', meterStart: 0, timestamp: 't' }),
+    );
+    expect(await hb3).toBeInstanceOf(QueueOverflowError);
+    expect(conn.queuedCount()).toBe(3);
+    // All queued are transaction messages: the oldest one goes.
+    const stop = outcome(conn.request('StopTransaction', { transactionId: 1, meterStop: 1, timestamp: 't' }));
+    expect(await start1).toBeInstanceOf(QueueOverflowError);
+    expect(errors.length).toBe(5);
+    expect(conn.queuedCount()).toBe(3);
+
+    await conn.connect();
+    await Promise.all([start2, start3, stop]);
+    expect(csms.callsFrom('CP1').map((c) => c.action)).toEqual([
+      'StartTransaction',
+      'StartTransaction',
+      'StopTransaction',
+    ]);
+    expect(csms.callsFrom('CP1', 'StartTransaction').map((c) => (c.payload as { idTag: string }).idTag)).toEqual([
+      'B',
+      'C',
+    ]);
+  });
+
+  test('the default cap is 10000', async () => {
+    const conn = make();
+    const errors: Error[] = [];
+    conn.on('error', (e) => errors.push(e));
+    const all: Promise<unknown>[] = [];
+    for (let i = 0; i < 10_000; i++) all.push(outcome(conn.request('Heartbeat', {})));
+    expect(errors).toEqual([]);
+    all.push(outcome(conn.request('Heartbeat', {})));
+    expect(errors.length).toBe(1);
+    expect(conn.queuedCount()).toBe(10_000);
+    await conn.disconnect();
   });
 });

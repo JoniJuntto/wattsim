@@ -33,6 +33,14 @@ export type BootResult = { status: string; intervalMs: number; currentTime: stri
 
 export type ResetRequest = { stopReason: string; bootReason: BootReason; onIdle?: boolean };
 
+/** `chargingProfilePurpose` of either version. Only `TxProfile` is scoped to the running transaction. */
+export type ProfilePurpose =
+  | 'TxProfile'
+  | 'TxDefaultProfile'
+  | 'ChargePointMaxProfile'
+  | 'ChargingStationMaxProfile'
+  | 'ChargingStationExternalConstraints';
+
 /**
  * Result of handling an inbound CALL. `after` runs once the CALLRESULT has been written to the socket, so any
  * CALLs it causes (StartTransaction after RemoteStartTransaction, ...) are ordered after the reply. `null` means
@@ -69,9 +77,19 @@ export interface StationContext {
   setMeterIntervalMs(ms: number): void;
   /** ChangeAvailability. `undefined` targets every EVSE. `Scheduled` when a transaction is still running. */
   setOperative(evseId: number | undefined, operative: boolean): 'Accepted' | 'Scheduled';
-  /** Smart-charging limit in kW; `undefined` evseId targets every EVSE, `undefined` kw clears the limit. */
-  setLimitKw(evseId: number | undefined, kw: number | undefined): void;
+  /**
+   * Smart-charging limit in kW; `undefined` evseId targets every EVSE, `undefined` kw clears the limit. A
+   * `TxProfile` limit is cleared when the transaction it was set during ends; every other purpose persists.
+   */
+  setLimitKw(evseId: number | undefined, kw: number | undefined, purpose?: ProfilePurpose): void;
   scheduleReset(req: ResetRequest): 'Accepted' | 'Scheduled';
+  /**
+   * 2.0.1 Reset with `evseId`: end that EVSE's transaction (`ImmediateReset`) and re-send its StatusNotification;
+   * no disconnect, no BootNotification. With `onIdle` and a running transaction, the status goes out once it ends.
+   */
+  resetEvse(evseId: number, onIdle: boolean): Promise<void>;
+  /** True while an OnIdle reset (station-wide, or for `evseId`) waits for transactions to end; no new ones start. */
+  resetPending(evseId?: number): boolean;
 }
 
 export interface VersionAdapter {

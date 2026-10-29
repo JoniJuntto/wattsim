@@ -8,6 +8,7 @@ import {
   decodeFrame,
   encodeFrame,
   FrameDecodeError,
+  formatViolationCode,
   isKnownAction,
   MessageType,
   newMessageId,
@@ -35,6 +36,12 @@ export type ConnectionOptions = {
   chaos?: ChaosEngine;
   /** Default true: validate payloads via `validatePayload` and emit `violation`. */
   strict?: boolean;
+  /**
+   * Default 10000. Cap on CALLs waiting to be sent. When full, the oldest non-transaction message (anything but
+   * StartTransaction / StopTransaction / TransactionEvent) is dropped and reported through `error` with a
+   * `QueueOverflowError`; when every queued message is a transaction message, the oldest one goes.
+   */
+  maxQueue?: number;
 };
 
 export type ConnectionEvents = {
@@ -51,6 +58,21 @@ export type ConnectionEvents = {
 
 export const DEFAULT_RECONNECT: ReconnectPolicy = { initialMs: 1000, maxMs: 60000, factor: 2 };
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+export const DEFAULT_MAX_QUEUE = 10_000;
+
+/** Actions that are kept in a full offline queue in preference to everything else. */
+const TRANSACTION_ACTIONS: ReadonlySet<string> = new Set(['StartTransaction', 'StopTransaction', 'TransactionEvent']);
+
+/** A queued CALL was dropped because the offline queue reached `maxQueue`. */
+export class QueueOverflowError extends Error {
+  constructor(
+    readonly action: string,
+    readonly maxQueue: number,
+  ) {
+    super(`${action}: dropped from the outbound queue (${maxQueue} CALLs already queued)`);
+    this.name = 'QueueOverflowError';
+  }
+}
 
 /** A CALL got no CALLRESULT/CALLERROR within `requestTimeoutMs`. */
 export class RequestTimeoutError extends Error {
@@ -111,6 +133,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   private readonly reconnect: ReconnectPolicy | false;
   private readonly chaos: ChaosEngine | undefined;
   private readonly strict: boolean;
+  private readonly maxQueue: number;
 
   private currentState: ConnectionState = 'Disconnected';
   private ws: WebSocket | undefined;
@@ -135,6 +158,9 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
     this.reconnect = opts.reconnect === undefined ? DEFAULT_RECONNECT : opts.reconnect;
     this.chaos = opts.chaos;
     this.strict = opts.strict ?? true;
+    const maxQueue = opts.maxQueue ?? DEFAULT_MAX_QUEUE;
+    if (!Number.isInteger(maxQueue) || maxQueue < 1) throw new RangeError(`maxQueue must be >= 1, got ${maxQueue}`);
+    this.maxQueue = maxQueue;
   }
 
   get state(): ConnectionState {
@@ -183,8 +209,20 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
     if (this.strict) this.check(action, 'request', payload);
     return new Promise<unknown>((resolve, reject) => {
       this.queue.push({ id: newMessageId(), action, payload, resolve, reject });
+      this.enforceQueueCap();
       this.pump();
     });
+  }
+
+  /** Drop the oldest non-transaction CALL (or the oldest of all when only transaction CALLs remain) past the cap. */
+  private enforceQueueCap(): void {
+    if (this.queue.length <= this.maxQueue) return;
+    const i = this.queue.findIndex((p) => !TRANSACTION_ACTIONS.has(p.action));
+    const [dropped] = this.queue.splice(i >= 0 ? i : 0, 1);
+    if (!dropped) return;
+    const err = new QueueOverflowError(dropped.action, this.maxQueue);
+    this.emit('error', err);
+    dropped.reject(err);
   }
 
   /** CALLs waiting to be sent (not counting the one in flight). */
@@ -434,7 +472,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
           ? {
               type: MessageType.CallError,
               id: call.id,
-              code: 'FormationViolation',
+              code: formatViolationCode(this.version),
               description: 'request payload failed schema validation',
               details: { violations: violations.map((v) => ({ path: v.path, message: v.message })) },
             }

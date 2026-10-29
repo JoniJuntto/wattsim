@@ -222,7 +222,7 @@ describe('Station 2.0.1: transactions', () => {
     expect(payload<v201.StatusNotificationRequest>(calls('StatusNotification')[2]).connectorStatus).toBe('Available');
   });
 
-  test('unplugging mid-transaction ends it with EVDisconnected / EVCommunicationLost and Idle', async () => {
+  test('unplugging mid-transaction ends it with EVDisconnected / EVDeparted and Idle', async () => {
     const station = await booted();
     await station.plugIn(1);
     await station.evReady(1);
@@ -231,7 +231,7 @@ describe('Station 2.0.1: transactions', () => {
     const ended = txEvents().at(-1);
     expect(ended).toMatchObject({
       eventType: 'Ended',
-      triggerReason: 'EVCommunicationLost',
+      triggerReason: 'EVDeparted',
       transactionInfo: { stoppedReason: 'EVDisconnected', chargingState: 'Idle' },
     });
     expect(station.evse(1)?.status).toBe('Available');
@@ -265,11 +265,14 @@ describe('Station 2.0.1: transactions', () => {
       await call('RequestStartTransaction', { idToken: { idToken: 'X', type: 'Central' }, remoteStartId: 1 }),
     ).toEqual({ status: 'Accepted' });
     await until(() => txEvents().length === 1);
-    expect(station.evse(1)?.status).toBe('SuspendedEV');
+    expect(station.evse(1)?.status).toBe('Preparing'); // no EV yet: nothing to suspend
+    expect(txEvents()[0]?.transactionInfo.chargingState).toBe('Idle');
     await until(() => calls('StatusNotification').length === 2); // Available -> Occupied
     await station.plugIn(1);
     await until(() => txEvents().length === 2);
     expect(txEvents()[1]?.triggerReason).toBe('CablePluggedIn');
+    expect(txEvents()[1]?.transactionInfo.chargingState).toBe('SuspendedEV');
+    expect(station.evse(1)?.status).toBe('SuspendedEV');
   });
 
   test('a rejected idToken ends the transaction as DeAuthorized', async () => {

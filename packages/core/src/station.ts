@@ -14,6 +14,7 @@ import { ocpp16 } from './adapters/ocpp16';
 import { ocpp201 } from './adapters/ocpp201';
 import type {
   BootReason,
+  ProfilePurpose,
   ResetRequest,
   SampleContext,
   StationContext,
@@ -23,7 +24,7 @@ import type {
 import type { ChaosEngine } from './chaos';
 import type { Clock, Timer } from './clock';
 import type { ConnectionEvents, ConnectionOptions, ConnectionState } from './connection';
-import { CallError, Connection, RequestTimeoutError, ViolationError } from './connection';
+import { CallError, Connection, QueueOverflowError, RequestTimeoutError, ViolationError } from './connection';
 import type { EvConfig } from './ev';
 import { EvModel } from './ev';
 import { TypedEmitter } from './events';
@@ -68,6 +69,8 @@ export type StationConfig = {
   strict?: boolean;
   requestTimeoutMs?: number;
   reconnect?: ConnectionOptions['reconnect'];
+  /** Offline queue cap, see `ConnectionOptions.maxQueue`. */
+  maxQueue?: number;
 };
 
 export type ResolvedStationConfig = {
@@ -105,6 +108,8 @@ export type TransactionState = {
   /** Pending start message, so a stop issued before the CSMS answered waits for the transaction id. */
   starting?: Promise<boolean>;
   ending?: Promise<void>;
+  /** The EVSE's `limitKw` came from a TxProfile: it is cleared when this transaction ends. */
+  txProfileLimit?: boolean;
 };
 
 export type EvseState = {
@@ -139,6 +144,8 @@ export type StartOptions = {
   remote?: boolean;
   remoteStartId?: number;
   idTokenType?: string;
+  /** TxProfile limit sent with the remote start; in force for this transaction only. */
+  limitKw?: number;
 };
 
 export const DEFAULT_ID_TAG = 'WATTSIM';
@@ -158,7 +165,12 @@ function fire(p: Promise<unknown>): void {
 
 /** True for rejections `request()` has already reported through the `error` event. */
 function alreadyReported(err: unknown): boolean {
-  return err instanceof RequestTimeoutError || err instanceof CallError || err instanceof ViolationError;
+  return (
+    err instanceof RequestTimeoutError ||
+    err instanceof CallError ||
+    err instanceof ViolationError ||
+    err instanceof QueueOverflowError
+  );
 }
 
 export class Station extends TypedEmitter<StationEvents> implements StationContext {
@@ -181,8 +193,17 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   private mvMs: number;
   private mvTimer: Timer | undefined;
   private bootRetry: Timer | undefined;
+  private resetTimer: Timer | undefined;
   private pending = 0;
   private resetOnIdle: ResetRequest | undefined;
+  /** EVSEs with a 2.0.1 per-EVSE OnIdle reset waiting for their transaction to end. */
+  private readonly evseResetOnIdle = new Set<number>();
+  /**
+   * BootNotification was answered Pending/Rejected: nothing but BootNotification may go out. Other CALLs are
+   * held here and flushed, in order, once a boot is Accepted.
+   */
+  private bootHold = false;
+  private held: Array<() => void> = [];
 
   constructor(cfg: StationConfig) {
     super();
@@ -226,6 +247,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       strict: cfg.strict,
       requestTimeoutMs: cfg.requestTimeoutMs,
       reconnect: cfg.reconnect,
+      maxQueue: cfg.maxQueue,
     });
     this.conn.on('state', (s) => {
       this.emit('connection', s);
@@ -273,19 +295,22 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     this.ensureMeterTimer();
   }
 
-  /** Close the socket and stop every timer. Queued CALLs stay queued for the next `connect()`. */
+  /** Close the socket and stop every timer, including a pending Reset. Queued CALLs stay queued for the next `connect()`. */
   async disconnect(): Promise<void> {
     this.stopHeartbeat();
     this.mvTimer?.cancel();
     this.mvTimer = undefined;
     this.bootRetry?.cancel();
     this.bootRetry = undefined;
+    this.resetTimer?.cancel();
+    this.resetTimer = undefined;
     await this.conn.disconnect();
   }
 
   /**
-   * BootNotification. On `Accepted`: applies the interval (unless `heartbeatMs` was configured), starts the
-   * heartbeat and sends one StatusNotification per EVSE. On `Pending`/`Rejected`: retries after the interval.
+   * BootNotification. On `Accepted`: applies the interval (unless `heartbeatMs` was configured), flushes CALLs
+   * held while Pending/Rejected, starts the heartbeat and sends one StatusNotification per EVSE. On
+   * `Pending`/`Rejected`: sends nothing else and retries after the interval (60 s when the CSMS gives none).
    */
   async boot(reason: BootReason = 'PowerUp'): Promise<void> {
     this.bootRetry?.cancel();
@@ -294,7 +319,10 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     const res = this.adapter.parseBootResult(raw);
     if (res.status !== 'Accepted') {
       this.booted = false;
+      this.bootHold = true;
       this.stopHeartbeat();
+      this.mvTimer?.cancel();
+      this.mvTimer = undefined;
       const retryMs = res.intervalMs > 0 ? res.intervalMs : BOOT_RETRY_FALLBACK_MS;
       this.bootRetry = this.clock.setTimeout(() => {
         this.bootRetry = undefined;
@@ -304,8 +332,11 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       return;
     }
     this.booted = true;
+    this.bootHold = false;
+    for (const send of this.held.splice(0)) send();
     this.hbMs = this.cfg.heartbeatMs ?? res.intervalMs;
     this.startHeartbeat();
+    this.ensureMeterTimer();
     this.emitState();
     await this.sendStatus();
   }
@@ -321,7 +352,10 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     this.integrate(evse);
     evse.ev = model;
     if (evse.tx) {
-      this.refresh(evse);
+      // One update carries both the cable and the new charging state: status first (no trigger of its own), then
+      // a single TransactionEvent Updated with CablePluggedIn.
+      const status = this.settle(evse);
+      if (!this.manual.has(evseId)) this.applyStatus(evse, status);
       await this.adapter.txUpdate(this, evse, this.takeSample(evse, evse.tx, 'Other'), 'CablePluggedIn');
       return;
     }
@@ -411,6 +445,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
    * MeterValues (1.6) / TransactionEvent Updated (2.0.1). Public so scenarios can force a sample.
    */
   tick(): void {
+    if (this.bootHold) return;
     let active = false;
     for (const evse of this.evses) {
       const tx = evse.tx;
@@ -428,17 +463,28 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
 
   request(action: string, payload: unknown): Promise<unknown> {
     this.pending++;
-    const p = this.conn.request(action, payload);
+    const p =
+      this.bootHold && action !== 'BootNotification'
+        ? this.holdRequest(action, payload)
+        : this.conn.request(action, payload);
     p.then(
       () => {
         this.pending--;
       },
       (err: unknown) => {
         this.pending--;
-        this.emit('error', toError(err));
+        // A queue overflow was already reported by the Connection's own `error` event.
+        if (!(err instanceof QueueOverflowError)) this.emit('error', toError(err));
       },
     );
     return p;
+  }
+
+  /** Park a CALL until a BootNotification is Accepted; the caller's promise settles with the eventual reply. */
+  private holdRequest(action: string, payload: unknown): Promise<unknown> {
+    return new Promise<unknown>((resolve, reject) => {
+      this.held.push(() => this.conn.request(action, payload).then(resolve, reject));
+    });
   }
 
   async sendHeartbeat(): Promise<void> {
@@ -481,6 +527,9 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   async beginTransaction(evseId: number, opts: StartOptions = {}): Promise<void> {
     const evse = this.evseOrThrow(evseId);
     if (evse.tx) throw new Error(`EVSE ${evseId} already has an active transaction`);
+    if (this.resetPending(evseId)) {
+      throw new Error(`EVSE ${evseId}: a Reset is pending until the running transactions end; no new transaction`);
+    }
     const now = this.clock.now();
     const tx: TransactionState = {
       idTag: opts.idTag ?? evse.idTag ?? DEFAULT_ID_TAG,
@@ -495,6 +544,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     };
     evse.tx = tx;
     evse.idTag = tx.idTag;
+    if (opts.limitKw !== undefined) this.applyLimit(evse, opts.limitKw, 'TxProfile');
     // Close the contactor first so the start message carries the real charging state, then send it, then the
     // StatusNotification: the wire order is StartTransaction -> StatusNotification(Charging).
     const prev = evse.status;
@@ -558,12 +608,11 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     return scheduled ? 'Scheduled' : 'Accepted';
   }
 
-  setLimitKw(evseId: number | undefined, kw: number | undefined): void {
+  setLimitKw(evseId: number | undefined, kw: number | undefined, purpose?: ProfilePurpose): void {
     const targets = evseId === undefined ? this.evses : [this.evseOrThrow(evseId)];
     for (const evse of targets) {
       this.integrate(evse);
-      evse.limitKw = kw;
-      evse.offeredKw = kw === undefined ? this.ratedKw : Math.max(0, Math.min(this.ratedKw, kw));
+      this.applyLimit(evse, kw, purpose);
       // A limit that flips the state (-> SuspendedEVSE) is a ChargingStateChanged; otherwise report the new rate.
       const changed = this.refresh(evse);
       if (!changed && evse.tx) {
@@ -577,8 +626,29 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       this.resetOnIdle = req;
       return 'Scheduled';
     }
-    this.clock.setTimeout(() => void this.performReset(req), RESET_DELAY_MS);
+    this.resetTimer?.cancel();
+    this.resetTimer = this.clock.setTimeout(() => {
+      this.resetTimer = undefined;
+      void this.performReset(req);
+    }, RESET_DELAY_MS);
     return 'Accepted';
+  }
+
+  async resetEvse(evseId: number, onIdle: boolean): Promise<void> {
+    const evse = this.evseOrThrow(evseId);
+    if (evse.tx) {
+      if (onIdle) {
+        this.evseResetOnIdle.add(evseId);
+        return;
+      }
+      await this.endTransaction(evseId, 'ImmediateReset');
+    }
+    await this.sendStatus(evseId);
+  }
+
+  resetPending(evseId?: number): boolean {
+    if (this.resetOnIdle !== undefined) return true;
+    return evseId !== undefined && this.evseResetOnIdle.has(evseId);
   }
 
   // ---- internals -------------------------------------------------------------------------------------------
@@ -645,10 +715,19 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     return this.deriveStatus(evse);
   }
 
+  /** Set or clear the limit on one EVSE and remember, on the transaction, whether a TxProfile set it. */
+  private applyLimit(evse: EvseState, kw: number | undefined, purpose: ProfilePurpose | undefined): void {
+    evse.limitKw = kw;
+    evse.offeredKw = kw === undefined ? this.ratedKw : Math.max(0, Math.min(this.ratedKw, kw));
+    if (evse.tx) evse.tx.txProfileLimit = kw !== undefined && purpose === 'TxProfile';
+  }
+
   private deriveStatus(evse: EvseState): ConnectorStatus {
     if (evse.tx) {
+      // A transaction without an EV (remote start before plug-in) is Preparing: nothing to suspend yet.
+      if (!evse.ev) return 'Preparing';
       if (evse.offeredKw <= 0) return 'SuspendedEVSE';
-      return evse.ev?.state === 'Charging' ? 'Charging' : 'SuspendedEV';
+      return evse.ev.state === 'Charging' ? 'Charging' : 'SuspendedEV';
     }
     if (this.inoperative.has(evse.id)) return 'Unavailable';
     if (evse.ev) return evse.status === 'Finishing' ? 'Finishing' : 'Preparing';
@@ -671,7 +750,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     if (prev === status) return false;
     evse.status = status;
     this.emit('status', evse.id, status);
-    if (this.adapter.wireStatus(prev) !== this.adapter.wireStatus(status)) {
+    // While the boot is Pending/Rejected no StatusNotification goes out; the Accepted boot sends every current status.
+    if (!this.bootHold && this.adapter.wireStatus(prev) !== this.adapter.wireStatus(status)) {
       fire(this.request('StatusNotification', this.adapter.statusPayload(evse, this.clock)));
     }
     if (trigger && evse.tx) {
@@ -714,10 +794,16 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     evse.tx = undefined;
     evse.transactionId = undefined;
     evse.idTag = undefined;
-    if (!this.manual.has(evse.id)) this.applyStatus(evse, evse.ev ? 'Finishing' : this.deriveStatus(evse));
+    if (tx.txProfileLimit) this.applyLimit(evse, undefined, undefined);
+    if (!this.manual.has(evse.id)) {
+      // Finishing while the EV stays plugged in, unless a scheduled ChangeAvailability now takes the EVSE out.
+      const next = evse.ev && !this.inoperative.has(evse.id) ? 'Finishing' : this.deriveStatus(evse);
+      this.applyStatus(evse, next);
+    }
     this.emit('transaction', 'stopped', evse.id, txId);
     this.stopMeterTimerIfIdle();
     this.emitState();
+    if (this.evseResetOnIdle.delete(evse.id)) fire(this.sendStatus(evse.id));
     const pendingReset = this.resetOnIdle;
     if (pendingReset && !this.evses.some((e) => e.tx)) {
       this.resetOnIdle = undefined;
@@ -732,7 +818,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     if (ms === undefined || ms <= 0) return;
     this.hbTimer = this.clock.setInterval(() => {
       // A real charge point does not queue heartbeats while offline; MeterValues and StopTransaction do queue.
-      if (this.connected) void this.sendHeartbeat();
+      if (this.connected) fire(this.sendHeartbeat());
     }, ms);
   }
 
@@ -742,7 +828,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   }
 
   private ensureMeterTimer(): void {
-    if (this.mvTimer || this.mvMs <= 0) return;
+    if (this.mvTimer || this.mvMs <= 0 || this.bootHold) return;
     if (!this.evses.some((e) => e.tx)) return;
     this.mvTimer = this.clock.setInterval(() => this.tick(), this.mvMs);
   }

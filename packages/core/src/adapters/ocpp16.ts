@@ -130,15 +130,15 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
     case 'RemoteStartTransaction': {
       const p = call.payload as v16.RemoteStartTransactionRequest;
       const evse = pickEvse(st, p.connectorId);
-      if (!evse) return { result: { status: 'Rejected' } satisfies v16.RemoteStartTransactionResponse };
+      if (!evse || st.resetPending(evse.id)) {
+        return { result: { status: 'Rejected' } satisfies v16.RemoteStartTransactionResponse };
+      }
       const profile = p.chargingProfile;
+      // The profile of a remote start is a TxProfile by definition: it applies to this transaction only.
       const limitKw = profile ? scheduleLimitKw(profile.chargingSchedule, st.cfg) : undefined;
       return {
         result: { status: 'Accepted' } satisfies v16.RemoteStartTransactionResponse,
-        after: async () => {
-          if (limitKw !== undefined) st.setLimitKw(evse.id, limitKw);
-          await st.beginTransaction(evse.id, { idTag: p.idTag, remote: true });
-        },
+        after: () => st.beginTransaction(evse.id, { idTag: p.idTag, remote: true, limitKw }),
       };
     }
     case 'RemoteStopTransaction': {
@@ -211,9 +211,14 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       if (p.connectorId !== 0 && !st.evse(p.connectorId)) {
         return { result: { status: 'Rejected' } satisfies v16.SetChargingProfileResponse };
       }
+      const purpose = p.csChargingProfiles.chargingProfilePurpose;
+      // A TxProfile needs a running transaction on one specific connector; otherwise it is discarded.
+      if (purpose === 'TxProfile' && (p.connectorId === 0 || !st.evse(p.connectorId)?.tx)) {
+        return { result: { status: 'Rejected' } satisfies v16.SetChargingProfileResponse };
+      }
       const limitKw = scheduleLimitKw(p.csChargingProfiles.chargingSchedule, st.cfg);
       if (limitKw === undefined) return { result: { status: 'Rejected' } satisfies v16.SetChargingProfileResponse };
-      st.setLimitKw(p.connectorId === 0 ? undefined : p.connectorId, limitKw);
+      st.setLimitKw(p.connectorId === 0 ? undefined : p.connectorId, limitKw, purpose);
       return { result: { status: 'Accepted' } satisfies v16.SetChargingProfileResponse };
     }
     case 'ClearChargingProfile': {
