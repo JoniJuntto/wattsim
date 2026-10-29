@@ -1,0 +1,193 @@
+# wattsim interop harness: two real open-source CSMSs for the nightly station-side matrix.
+#
+#   docker compose -f interop/docker-compose.yml up -d --wait
+#   docker compose -f interop/docker-compose.yml down -v
+#
+# Host ports (fixed defaults, each overridable with the env var in ${...}; documented in interop/README.md):
+#   8180  STEVE_PORT              SteVe HTTP UI + OCPP 1.6J websocket (ws://localhost:8180/steve/websocket/CentralSystemService/<id>)
+#   13306 STEVE_DB_PORT           SteVe MariaDB
+#   18080 CITRINEOS_HTTP_PORT     CitrineOS REST API + Swagger (/docs); 18080 because 8080 is commonly taken on dev machines
+#   8081  CITRINEOS_WS_PORT       CitrineOS OCPP websocket, security profile 0 (no auth, unknown stations accepted)
+#   8082  CITRINEOS_WS_AUTH_PORT  CitrineOS OCPP websocket, security profile 1 (basic auth, known stations only)
+#   15432 CITRINEOS_DB_PORT       CitrineOS Postgres
+#   15672 CITRINEOS_AMQP_UI_PORT  CitrineOS RabbitMQ management UI
+#
+# Pins (see README "Pinned versions"):
+#   SteVe      git tag steve-3.14.1 (2026-08-12), built from source at container start (upstream has no image)
+#   CitrineOS  ghcr.io/citrineos/citrineos-server:v2.1.0 (2026-10-21)
+name: wattsim-interop
+
+services:
+  # ───────────────────────────── SteVe (OCPP 1.6J) ─────────────────────────────
+  steve-db:
+    image: mariadb:10.11.16
+    # SteVe's docker profile (application-docker.properties) and its Dockerfile both
+    # hard-code the DB hostname "mariadb"; keep that name as a network alias.
+    networks:
+      default:
+        aliases: [mariadb]
+    environment:
+      MYSQL_RANDOM_ROOT_PASSWORD: 'yes'
+      TZ: '+00:00'
+      MYSQL_DATABASE: stevedb
+      MYSQL_USER: steve
+      MYSQL_PASSWORD: changeme
+    ports:
+      - '${STEVE_DB_PORT:-13306}:3306'
+    volumes:
+      - steve-db-data:/var/lib/mysql
+    healthcheck:
+      test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  steve:
+    # Upstream publishes no image. Its Dockerfile copies the source and runs
+    # `./mvnw clean package -Pdocker,mariadb` at container start (jOOQ codegen needs the
+    # live DB), then launches the WAR. First start takes 4-10 min; ~/.m2 is cached in a volume.
+    build:
+      context: https://github.com/steve-community/steve.git#steve-3.14.1
+    image: wattsim-interop/steve:3.14.1
+    restart: unless-stopped
+    depends_on:
+      steve-db:
+        condition: service_healthy
+    ports:
+      - '${STEVE_PORT:-8180}:8180'
+    volumes:
+      - steve-m2:/root/.m2
+    healthcheck:
+      # Sign-in page is permitAll in SecurityConfiguration; 200 means Flyway ran and Jetty is up.
+      # The eclipse-temurin image has no curl/wget, so probe with bash's /dev/tcp.
+      test:
+        - CMD
+        - bash
+        - -c
+        - "exec 3<>/dev/tcp/127.0.0.1/8180 && printf 'GET /steve/manager/signin HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 600s
+
+  steve-init:
+    # Pre-registers charge box WS-16-1 and idTag TAG-16-1 so the simulator can connect
+    # without touching the UI. SteVe rejects unknown chargeBoxIds by default
+    # (auto.register.unknown.stations=false). Runs once after SteVe is healthy (tables exist).
+    # Stays alive (sleep) after the insert with a marker-file healthcheck: `compose up --wait` (v2.x/v5.x) treats
+    # any exited container, even exit 0, as a failure, so a true one-shot would make `--wait` return 1.
+    image: mariadb:10.11.16
+    depends_on:
+      steve:
+        condition: service_healthy
+    volumes:
+      - ./init/steve.sql:/init/steve.sql:ro
+    entrypoint: ['sh', '-c']
+    command:
+      - "mariadb -h steve-db -u steve -pchangeme stevedb < /init/steve.sql && echo 'steve-init done: WS-16-1 / TAG-16-1 registered' && touch /tmp/init-done && exec sleep infinity"
+    healthcheck:
+      test: ['CMD', 'test', '-f', '/tmp/init-done']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # ─────────────────────────── CitrineOS (OCPP 2.0.1) ───────────────────────────
+  citrineos-db:
+    # Upstream compose image. amd64-only; runs under emulation on Apple Silicon (OrbStack/Rosetta).
+    # CitrineOS needs PostGIS (Locations.coordinates is geometry(Point)), so plain postgres won't do.
+    image: postgis/postgis:16-3.5
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: citrine
+      POSTGRES_USER: citrine
+      POSTGRES_PASSWORD: citrine
+    ports:
+      - '${CITRINEOS_DB_PORT:-15432}:5432'
+    volumes:
+      - citrineos-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -p 5432 -U citrine -d citrine']
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  citrineos-amqp:
+    image: rabbitmq:3.13.7-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - '${CITRINEOS_AMQP_UI_PORT:-15672}:15672'
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'check_port_connectivity']
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+
+  citrineos:
+    image: ghcr.io/citrineos/citrineos-server:v2.1.0
+    restart: unless-stopped
+    depends_on:
+      citrineos-db:
+        condition: service_healthy
+      citrineos-amqp:
+        condition: service_healthy
+    environment:
+      # One process running router + every module + REST APIs.
+      APP_NAME: all
+      # entrypoint.sh runs sequelize migrations before starting the server.
+      DB_STRATEGY: migrate
+      # SystemConfig overrides: CITRINEOS_<PATH> (see packages/types/src/config/types.ts).
+      CITRINEOS_HOST: 0.0.0.0
+      CITRINEOS_DATABASE_HOST: citrineos-db
+      CITRINEOS_MESSAGEBROKER_AMQP_URL: amqp://guest:guest@citrineos-amqp:5672
+      CITRINEOS_TIMEOUTS_MAXCALLLENGTHSECONDS: '20'
+      # websocket-servers.json (ports 8081/8082/8443/8444, 8081 = profile 0 with
+      # allowUnknownChargingStations=true) and TLS material are read relative to this root.
+      CITRINEOS_FILEACCESS_LOCAL_DEFAULTFILEPATH: /usr/local/apps/citrineos/apps/ocpp-server/dist/assets
+      CITRINEOS_SWAGGER_LOGOPATH: /usr/local/apps/citrineos/apps/ocpp-server/dist/assets/logo.png
+      # Certificate authorities (Hubject / ACME) stay off: not needed for a profile-0 2.0.1 session.
+    ports:
+      - '${CITRINEOS_HTTP_PORT:-18080}:8080'
+      - '${CITRINEOS_WS_PORT:-8081}:8081'
+      - '${CITRINEOS_WS_AUTH_PORT:-8082}:8082'
+    healthcheck:
+      # Upstream healthcheck: the HTTP port only opens after migrations finished.
+      test:
+        - CMD-SHELL
+        - node -e "const n=require('net');const c=n.createConnection(8080,'127.0.0.1',()=>{c.end();process.exit(0)});c.on('error',()=>process.exit(1));c.setTimeout(5000,()=>{c.destroy();process.exit(1)})"
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 60s
+
+  citrineos-init:
+    # Pre-registers station WS-201-1 and idToken TAG-201-1 (ISO14443, Accepted) for tenant 1.
+    # Port 8081 accepts unknown stations anyway; the row exists so the station also works on 8082
+    # once a password is set, and so Authorize returns Accepted instead of Unknown.
+    # Same sleep-after-insert pattern as steve-init (see there).
+    image: postgis/postgis:16-3.5
+    platform: linux/amd64
+    depends_on:
+      citrineos:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: citrine
+    volumes:
+      - ./init/citrineos.sql:/init/citrineos.sql:ro
+    entrypoint: ['sh', '-c']
+    command:
+      - "psql -v ON_ERROR_STOP=1 -h citrineos-db -U citrine -d citrine -f /init/citrineos.sql && echo 'citrineos-init done: WS-201-1 / TAG-201-1 registered' && touch /tmp/init-done && exec sleep infinity"
+    healthcheck:
+      test: ['CMD', 'test', '-f', '/tmp/init-done']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  steve-db-data:
+  steve-m2:
+  citrineos-db-data:

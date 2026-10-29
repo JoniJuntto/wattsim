@@ -1,0 +1,54 @@
+# Nightly interop matrix: wattsim station simulator vs real CSMSs (SteVe 1.6J, CitrineOS 2.0.1).
+# Stack and pins: interop/docker-compose.yml, interop/README.md.
+name: interop
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    # SteVe builds from source inside its container on first start (4-10 min) before the 2-min scenarios run.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: Start CSMSs
+        run: docker compose -f interop/docker-compose.yml up -d --build --wait --wait-timeout 1200
+      - name: Probe websocket endpoints
+        run: |
+          bun interop/scripts/ws-probe.ts ws://localhost:8180/steve/websocket/CentralSystemService/WS-16-1 ocpp1.6
+          bun interop/scripts/ws-probe.ts ws://localhost:8081/WS-201-1 ocpp2.0.1
+      - name: SteVe 1.6J
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p interop/results
+          bun packages/cli/src/index.ts run interop/scenarios/steve-16.ws \
+            --csms ws://localhost:8180/steve/websocket/CentralSystemService \
+            --junit interop/results/steve-16.xml
+      - name: CitrineOS 2.0.1
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p interop/results
+          bun packages/cli/src/index.ts run interop/scenarios/citrineos-201.ws \
+            --csms ws://localhost:8081 \
+            --junit interop/results/citrineos-201.xml
+      - name: Collect CSMS logs
+        if: always()
+        run: |
+          mkdir -p interop/results
+          docker compose -f interop/docker-compose.yml ps -a > interop/results/compose-ps.txt || true
+          docker compose -f interop/docker-compose.yml logs --no-color > interop/results/compose-logs.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: interop-results
+          path: interop/results/
+          if-no-files-found: warn
+      - name: Tear down
+        if: always()
+        run: docker compose -f interop/docker-compose.yml down -v --remove-orphans
