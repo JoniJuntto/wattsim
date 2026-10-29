@@ -1,7 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { FakeCsms } from '../../core/test/fake-csms';
 
 const repoRoot = new URL('../../..', import.meta.url).pathname;
 const basicFixture = join(repoRoot, 'packages/scenario/test/fixtures/basic.ws');
@@ -107,9 +108,100 @@ describe('wattsim fmt', () => {
 });
 
 describe('wattsim run', () => {
-  test('is a stub that exits 2', async () => {
-    const { stderr, code } = await cli('run', basicFixture);
+  let csms: FakeCsms;
+  let csmsUrl: string;
+  beforeAll(async () => {
+    csms = await FakeCsms.start();
+    csmsUrl = `${csms.url}/ocpp`;
+  });
+  afterAll(() => csms.stop());
+
+  const station = (body: string, csmsLine = '') =>
+    `wattsim 1\n${csmsLine}\nstation "CP-1" {\n  version 1.6\n${body}\n}\n`;
+
+  test('basic.ws --virtual against FakeCsms → exit 0, events and an ok summary row', async () => {
+    const { stdout, code } = await cli('run', basicFixture, '--csms', csmsUrl, '--virtual');
+    expect(code).toBe(0);
+    expect(stdout).toContain('→ BootNotification');
+    expect(stdout).toContain('← BootNotification');
+    expect(stdout).toContain('✓ expect StatusNotification');
+    expect(stdout).toMatch(/^CP-1\s+ok\s+1\/1\s+/m);
+    expect(stdout).toContain('1 stations, 0 failed; 1/1 asserts passed; 0 violations');
+  });
+
+  test('--quiet prints only the summary', async () => {
+    const { stdout, code } = await cli('run', basicFixture, '--csms', csmsUrl, '--virtual', '--quiet');
+    expect(code).toBe(0);
+    expect(stdout).not.toContain('BootNotification');
+    expect(stdout).toMatch(/^CP-1\s+ok\s+/m);
+  });
+
+  test('unmatched expect → exit 1, FAIL row and a JUnit <failure>', async () => {
+    const file = await tmpFile('bogus.ws', station('  boot\n  expect Bogus within 1s'));
+    const junit = join(scratch, 'bogus.xml');
+    const { stdout, code } = await cli('run', file, '--csms', csmsUrl, '--virtual', '--junit', junit);
+    expect(code).toBe(1);
+    expect(stdout).toContain('✗ expect Bogus within 1s');
+    expect(stdout).toMatch(/^CP-1\s+FAIL\s+0\/1\s+/m);
+    const xml = await Bun.file(junit).text();
+    expect(xml).toContain('<failure');
+    expect(xml).toContain('name="bogus.ws"');
+  });
+
+  test('no --csms and no csms line → exit 2', async () => {
+    const file = await tmpFile('nocsms.ws', station('  boot'));
+    const { stderr, code } = await cli('run', file, '--virtual');
     expect(code).toBe(2);
-    expect(stderr).toContain('not yet implemented');
+    expect(stderr).toContain('no CSMS URL');
+  });
+
+  test('syntax error → exit 2 with file:line:col', async () => {
+    const file = await tmpFile('bad-run.ws', 'wattsim 1\nstation "CP-1" {\n');
+    const { stderr, code } = await cli('run', file, '--csms', csmsUrl);
+    expect(code).toBe(2);
+    expect(stderr).toMatch(/:\d+:\d+: /);
+  });
+
+  test('bad --speed → exit 2', async () => {
+    const { stderr, code } = await cli('run', basicFixture, '--csms', csmsUrl, '--speed', 'fast');
+    expect(code).toBe(2);
+    expect(stderr).toContain('invalid --speed');
+  });
+
+  test('--metrics serves wattsim_ metrics during a wall-clock run; SIGINT aborts with exit 1', async () => {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response('') });
+    const port = probe.port;
+    probe.stop(true);
+    const file = await tmpFile('slow.ws', station('  boot\n  wait 60s'));
+    const proc = Bun.spawn(
+      ['bun', 'packages/cli/src/index.ts', 'run', file, '--csms', csmsUrl, '--metrics', String(port)],
+      {
+        cwd: repoRoot,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    );
+    const stderr = new Response(proc.stderr).text();
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let stdout = '';
+    const readUntil = async (pred: (s: string) => boolean) => {
+      while (!pred(stdout)) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        stdout += decoder.decode(value, { stream: true });
+      }
+    };
+    await readUntil((s) => s.includes('← BootNotification'));
+    expect(stdout).toContain(`metrics: http://localhost:${port}/metrics`);
+    const body = await (await fetch(`http://localhost:${port}/metrics`)).text();
+    expect(body).toContain('wattsim_');
+    expect(body).toMatch(/wattsim_messages_total\{[^}]*action="BootNotification"/);
+    proc.kill('SIGINT');
+    await readUntil(() => false);
+    expect(await proc.exited).toBe(1);
+    expect(stdout).toContain('interrupted');
+    expect(stdout).toMatch(/^CP-1\s+FAIL\s+/m);
+    expect(await stderr).toBe('');
   });
 });
