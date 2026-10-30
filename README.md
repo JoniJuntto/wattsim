@@ -4,7 +4,7 @@ A spec-strict, scriptable OCPP 1.6/2.0.1/2.1 simulator for every side of the wir
 
 ## Status
 
-A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. AI agents can drive it through an MCP server. The CSMS side, vendor quirk profiles and record/replay are in progress. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
+A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. It also ships a CSMS simulator that checks any charger's traffic for spec conformance, and an MCP server so AI agents can drive it. Vendor quirk profiles and record/replay are in progress. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
 
 ## Quick start
 
@@ -129,6 +129,53 @@ The complete reference is in [docs/dsl.md](docs/dsl.md). More examples:
 
 Milestone 1 ships the faults named in the third column; the rest of each row is roadmap.
 
+## CSMS simulator
+
+`@wattsim/csms` is a central system for testing real or simulated chargers, and a conformance checker: every frame a station sends is checked against the OCA schema of its version and against the protocol's state machines, and each finding is recorded with the spec section it breaks. It is a library for now; there is no CLI command yet.
+
+```ts
+import { startCsms, toJUnit } from '@wattsim/csms';
+
+const csms = startCsms({ port: 9000, topology: { evses: 2 } });   // ws://127.0.0.1:9000/<identity>
+csms.on('violation', (v) => console.log(`${v.identity} [${v.rule}] ${v.message} (${v.specRef})`));
+
+const station = await csms.waitForConnection('CP-1');
+await station.call('TriggerMessage', { requestedMessage: 'StatusNotification' });
+station.respondWith('Authorize', () => ({ idTagInfo: { status: 'Invalid' } }));   // a 1.6 reply
+
+const report = csms.report();          // totals, byRule, byIdentity, violations
+await Bun.write('csms.xml', toJUnit(report));
+await csms.stop();
+```
+
+The station connects to `<url>/<identity>`; the CSMS picks the first subprotocol in the client's offer that it speaks (`versions` narrows it) and answers anything else with HTTP 400. With `basicAuth` (a password per identity, or a check function) the user name must be the identity, as in security profile 1; a failed check is HTTP 401. `tls: { cert, key, ca?, requestCert? }` serves `wss://`.
+
+Out of the box it behaves like a reasonable CSMS for every station-initiated action of 1.6 (with the security extension), 2.0.1 and 2.1: BootNotification Accepted with `heartbeatInterval` (default 300 s), Authorize Accepted unless the token is in `blockedIdTokens`, StartTransaction with increasing ids, TransactionEvent and notifications accepted, DataTransfer `UnknownVendorId`, SignCertificate Accepted. With a `signer` hook each accepted SignCertificate is followed by a CertificateSigned CALL carrying the chain it returns. `respondWith(action, fn)` overrides a reply for every station (`csms.respondWith`) or one (`session.respondWith`); `fn` returns the payload, a `CsmsCallError`, or `undefined` for no answer, and gets `next()` for the default. Replies that fail their schema are not sent (the station gets `InternalError`) unless `strict: false`.
+
+`session.call(action, payload)` validates the payload before sending (an invalid one throws), keeps one CALL in flight per station, and resolves with the CALLRESULT; a CALLERROR, a timeout (`callTimeoutMs`, default 30 s, on the injected `clock`) or a disconnect rejects. Events: `connected`, `disconnected`, `frame`, `call`, `violation`, `error`. A session keeps its boot and transaction state across reconnects, since a 1.6 station does not boot again after a network drop.
+
+| Rule | Severity | What it flags |
+|---|---|---|
+| `schema.request`, `schema.response` | error | a station CALL / SEND payload, or its reply to a CSMS CALL, fails the OCA schema |
+| `rpc.malformed` | error | a message that is not an OCPP-J frame |
+| `rpc.unknown-action` | error | an action the version lacks, or one only the CSMS sends |
+| `rpc.send-misuse` | error | 2.1: SEND for a CALL action, or CALL for a SEND action |
+| `rpc.call-in-flight` | warning | a CALL while the previous one is unanswered (OCPP-J synchronicity) |
+| `rpc.unknown-result-id` | error | a CALLRESULT / CALLERROR / CALLRESULTERROR for no pending CALL (warning when it is merely late) |
+| `rpc.message-id-reuse` | error | a message id used twice on one connection |
+| `boot.not-accepted` | error | requests before an accepted BootNotification; while Pending only what the CSMS asked for (1.6 §4.2, 2.0.1 B01–B03) |
+| `boot.retry-too-soon` | error | BootNotification again before a Rejected (error) or Pending (warning) interval elapsed |
+| `topology.unknown-evse` | error | an EVSE / connector outside `topology`, or a transaction on connector / EVSE 0 |
+| `status.connector-zero` | error | 1.6 connectorId 0 with a connector status (§4.9); 2.x evseId or connectorId 0 |
+| `tx.not-started`, `tx.started-twice`, `tx.after-ended` | error | transaction messages out of order (2.0.1 E01, E06; 1.6 §4.7, §4.8) |
+| `tx.seqno` | error / warning | 2.x seqNo repeated (error) or skipped (warning) |
+| `tx.unknown-stop` | error | 1.6 StopTransaction for an id never issued or already stopped (§4.10) |
+| `meter.backwards` | error | Energy.Active.Import.Register going down within a transaction |
+| `time.skew` | warning | a timestamp more than 5 min off the CSMS clock (old timestamps on queueable messages are fine) |
+| `heartbeat.too-often` | warning | Heartbeats less than half the interval apart, unless triggered |
+
+Every violation carries `identity`, `rule`, `severity`, `message`, `specRef` and the `frameId` of the offending frame. The rules are plain functions over a session state and a frame (`checkStationCall`, `checkStationReply` and friends), exported for use without sockets.
+
 ## Development
 
 ```sh
@@ -143,6 +190,7 @@ Packages, all Bun workspaces under `packages/`:
 - `scenario`: the DSL (lexer, parser, AST, formatter, interpreter) and JUnit reporting
 - `server`: the local UI server: HTTP API and browser stream over the core, the built-in test CSMS, session export
 - `ui`: the browser app (React, Vite, Tailwind, shadcn); `bun run --filter @wattsim/ui dev` runs it against a server on port 7700
+- `csms`: the CSMS simulator and conformance checker
 - `mcp`: the MCP server for AI agents (`wattsim mcp`)
 - `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`, `mcp`)
 

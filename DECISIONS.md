@@ -53,3 +53,7 @@ GetCompositeSchedule periods start on whole seconds from the request, but profil
 ## 2026-10-30 MCP `run_scenario` ignores the scenario's `csms` line
 
 Without a `csmsUrl` argument, `run_scenario` runs against the embedded test CSMS (`POST /api/loopback`) even when the scenario has a `csms` line. An agent can then run any example with no setup, and the file's URL usually points at a CSMS that exists only on its author's machine. Passing the URL from the file as `csmsUrl` restores `wattsim run`'s behaviour. It runs on the virtual clock by default with the CLI's 24 hour cap; a wall-clock run is aborted after `timeoutSeconds` (default 300) so a tool call cannot hang the agent.
+
+## 2026-10-30 The CSMS checker keeps station state across reconnects and grades by spec wording
+
+`@wattsim/csms` keeps a station's boot status, transactions and heartbeat interval for as long as the CSMS runs, not per WebSocket connection: a 1.6 charge point does not send BootNotification after a network drop, so a per-connection checker would flag every message after a reconnect. Only message ids, the in-flight CALL and pending CSMS CALLs are per connection. A station that returns with another subprotocol starts from scratch. Severity follows the spec's wording: `error` for SHALL / MUST, `warning` for SHOULD (OCPP-J one CALL in flight, 1.6 requests while Pending) and for heuristics (clock skew over 5 min, Heartbeats under half the interval apart, a seqNo gap).
