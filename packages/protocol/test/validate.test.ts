@@ -152,6 +152,11 @@ describe.each(['ocpp2.0.1', 'ocpp2.1'] as const)('violation codes %s', (v) => {
     expect(codes(validatePayload(v, 'Reset', 'request', {}))).toEqual(['occurrence']);
   });
 
+  test('an array outside its cardinality (Card. 1..*) is occurrence', () => {
+    expect(codes(validatePayload(v, 'SetVariables', 'request', { setVariableData: [] }))).toEqual(['occurrence']);
+    expect(codes(validatePayload(v, 'MeterValues', 'request', { evseId: 1, meterValue: [] }))).toEqual(['occurrence']);
+  });
+
   test('a present value of the wrong JSON type is type', () => {
     expect(codes(validatePayload(v, 'BootNotification', 'request', { reason: 1, chargingStation }))).toEqual(['type']);
     expect(codes(validatePayload(v, 'Reset', 'request', { type: 'Immediate', evseId: '1' }))).toEqual(['type']);

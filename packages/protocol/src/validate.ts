@@ -8,8 +8,9 @@ export type Direction = 'request' | 'response';
 
 /**
  * Which OCPP constraint a violation breaks; `violationErrorCode` turns it into the version's CALLERROR code.
- * `occurrence`: a required field is missing or an unexpected field is present. `type`: a field has the wrong JSON
- * type. `property`: a value of the right type breaks an enum, length, range, pattern or format constraint.
+ * `occurrence`: a required field is missing, an unexpected field is present, or an array has too few or too many
+ * items. `type`: a field has the wrong JSON type. `property`: a value of the right type breaks an enum, string
+ * length, range, pattern or format constraint.
  * `format`: anything else, a payload that is not an object or an unknown action included.
  */
 export type ViolationCode = 'format' | 'property' | 'type' | 'occurrence';
@@ -85,9 +86,11 @@ function violationCode(issue: z.core.$ZodIssue, payload: unknown): ViolationCode
     case 'invalid_value':
       // Zod checks an enum by value only; the schema also says `"type": "string"`, so `1` for an enum is a type error.
       return issue.values.some((allowed) => typeof allowed === typeof value) ? 'property' : 'type';
-    case 'invalid_format':
     case 'too_big':
     case 'too_small':
+      // An array's minItems/maxItems is the spec's cardinality ("Card." column), which OCPP-J calls occurrence.
+      return Array.isArray(value) ? 'occurrence' : 'property';
+    case 'invalid_format':
     case 'not_multiple_of':
       return 'property';
     default:
