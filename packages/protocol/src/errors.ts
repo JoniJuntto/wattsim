@@ -1,9 +1,11 @@
+import type { ViolationCode } from './validate';
 import type { OcppVersion } from './version';
 
 /**
  * CALLERROR codes per spec, in spec order. Note the two spellings that changed between versions:
  * 1.6 `FormationViolation` / `OccurenceConstraintViolation` (sic) vs 2.0.1 `FormatViolation` /
- * `OccurrenceConstraintViolation` (2.1 keeps the 2.0.1 list); use `formatViolationCode` / `occurrenceViolationCode` to pick the right one.
+ * `OccurrenceConstraintViolation` (2.1 keeps the 2.0.1 list); use `violationErrorCode` (or `formatViolationCode` /
+ * `occurrenceViolationCode`) to pick the right one.
  */
 const CALL_ERROR_CODES_2X: readonly string[] = [
   'FormatViolation',
@@ -48,4 +50,18 @@ export function occurrenceViolationCode(
   v: OcppVersion,
 ): 'OccurenceConstraintViolation' | 'OccurrenceConstraintViolation' {
   return v === 'ocpp1.6' ? 'OccurenceConstraintViolation' : 'OccurrenceConstraintViolation';
+}
+
+/** The CALLERROR code that answers a schema violation of the given kind, in the version's spelling. */
+export function violationErrorCode(v: OcppVersion, code: ViolationCode): string {
+  switch (code) {
+    case 'format':
+      return formatViolationCode(v);
+    case 'occurrence':
+      return occurrenceViolationCode(v);
+    case 'property':
+      return 'PropertyConstraintViolation';
+    case 'type':
+      return 'TypeConstraintViolation';
+  }
 }

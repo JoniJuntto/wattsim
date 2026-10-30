@@ -321,7 +321,7 @@ describe('Connection: strict mode', () => {
     expect(csms.callsFrom('CP1', 'BootNotification').length).toBe(1);
   });
 
-  test('schema-invalid inbound CALL is answered with FormationViolation and not dispatched', async () => {
+  test('schema-invalid inbound CALL is answered with a CALLERROR and not dispatched', async () => {
     const conn = make();
     const violations: Violation[] = [];
     conn.on('violation', (v) => violations.push(v));
@@ -333,7 +333,7 @@ describe('Connection: strict mode', () => {
     await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     const err = await csms.call('CP1', 'RemoteStartTransaction', { idTag: 42 }).catch((e: unknown) => e);
-    expect((err as Error).message).toMatch(/FormationViolation/);
+    expect((err as Error).message).toMatch(/TypeConstraintViolation/);
     expect(dispatched).toBe(0);
     expect(violations.length).toBe(1);
   });
@@ -564,23 +564,55 @@ describe('Connection: chaos', () => {
 });
 
 describe('Connection: version-specific CALLERROR codes', () => {
-  test('a schema-invalid inbound CALL is FormatViolation on 2.0.1 and FormationViolation on 1.6', async () => {
-    const conn16 = make();
-    conn16.on('call', (_call, reply) => reply({ status: 'Accepted' }));
-    await conn16.connect();
-    await until(() => csms.isConnected('CP1'));
-    const err16 = await csms.call('CP1', 'Reset', { type: 'Bogus' }).catch((e: unknown) => e);
-    expect((err16 as Error).message).toMatch(/CALLERROR FormationViolation/);
+  /** Send each schema-invalid CALL from `server` and collect the CALLERROR code the station answers with. */
+  async function replyCodes(server: FakeCsms, calls: [action: string, payload: unknown][]): Promise<string[]> {
+    const codes: string[] = [];
+    for (const [action, payload] of calls) {
+      const err = await server.call('CP1', action, payload).catch((e: unknown) => e);
+      codes.push(/CALLERROR (\w+)/.exec((err as Error).message)?.[1] ?? `no CALLERROR: ${String(err)}`);
+    }
+    return codes;
+  }
 
+  test('ocpp1.6: missing field, wrong type and bad enum get the 1.6 spellings', async () => {
+    const conn = await connected();
+    let dispatched = 0;
+    conn.on('call', (_call, reply) => {
+      dispatched++;
+      reply({ status: 'Accepted' });
+    });
+    await until(() => csms.isConnected('CP1'));
+    const codes = await replyCodes(csms, [
+      ['RemoteStartTransaction', {}],
+      ['RemoteStartTransaction', { idTag: 42 }],
+      ['Reset', { type: 'Bogus' }],
+    ]);
+    expect(codes).toEqual(['OccurenceConstraintViolation', 'TypeConstraintViolation', 'PropertyConstraintViolation']);
+    expect(dispatched).toBe(0);
+  });
+
+  test('ocpp2.0.1: missing field, wrong type and bad enum get the 2.x spellings', async () => {
     const csms201 = await FakeCsms.start({ version: 'ocpp2.0.1' });
     try {
-      const conn201 = make({ url: csms201.url, version: 'ocpp2.0.1' });
-      conn201.on('call', (_call, reply) => reply({ status: 'Accepted' }));
-      await conn201.connect();
+      const conn = await connected({ url: csms201.url, version: 'ocpp2.0.1' });
+      let dispatched = 0;
+      conn.on('call', (_call, reply) => {
+        dispatched++;
+        reply({ status: 'Accepted' });
+      });
       await until(() => csms201.isConnected('CP1'));
-      const err201 = await csms201.call('CP1', 'Reset', { type: 'Bogus' }).catch((e: unknown) => e);
-      expect((err201 as Error).message).toMatch(/CALLERROR FormatViolation/);
-      await conn201.disconnect();
+      const codes = await replyCodes(csms201, [
+        ['Reset', {}],
+        ['Reset', { type: 1 }],
+        ['Reset', { type: 'Bogus' }],
+      ]);
+      expect(codes).toEqual([
+        'OccurrenceConstraintViolation',
+        'TypeConstraintViolation',
+        'PropertyConstraintViolation',
+      ]);
+      expect(dispatched).toBe(0);
+      await conn.disconnect();
     } finally {
       await csms201.stop();
     }

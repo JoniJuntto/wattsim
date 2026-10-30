@@ -8,12 +8,12 @@ import {
   decodeFrame,
   encodeFrame,
   FrameDecodeError,
-  formatViolationCode,
   isKnownAction,
   MessageType,
   newMessageId,
   SEND_ACTIONS,
   validatePayload,
+  violationErrorCode,
 } from '@wattsim/protocol';
 import type { ChaosDirection, ChaosEngine, ChaosRule } from './chaos';
 import type { Clock, Timer } from './clock';
@@ -483,11 +483,13 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       const violations = this.check(call.action, 'request', call.payload);
       if (violations.length > 0) {
         const known = isKnownAction(this.version, call.action);
+        const [first] = violations;
         const err: CallErrorFrame = known
           ? {
               type: MessageType.CallError,
               id: call.id,
-              code: formatViolationCode(this.version),
+              // First violation wins: its constraint kind picks the CALLERROR code in this version's spelling.
+              code: violationErrorCode(this.version, first?.code ?? 'format'),
               description: 'request payload failed schema validation',
               details: { violations: violations.map((v) => ({ path: v.path, message: v.message })) },
             }
@@ -539,6 +541,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
           direction: 'request',
           path: '',
           message,
+          code: 'format',
         });
         return;
       }

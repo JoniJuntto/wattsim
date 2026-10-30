@@ -281,10 +281,10 @@ describe('Review Focus 3: invalid CSMS replies in strict mode', () => {
     expect(station.evse(1)?.transactionId).toBe(5);
   });
 
-  test('a schema-invalid inbound CALL is answered FormationViolation and never reaches the adapter', async () => {
+  test('a schema-invalid inbound CALL is answered TypeConstraintViolation and never reaches the adapter', async () => {
     const station = await booted();
     const err = await csms.call('CP1', 'RemoteStartTransaction', { idTag: 42 }).catch((e: unknown) => e);
-    expect((err as Error).message).toMatch(/FormationViolation/);
+    expect((err as Error).message).toMatch(/CALLERROR TypeConstraintViolation/);
     await Bun.sleep(20);
     expect(calls('StartTransaction').length).toBe(0);
     expect(station.evse(1)?.tx).toBeUndefined();

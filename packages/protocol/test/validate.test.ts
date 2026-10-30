@@ -88,6 +88,90 @@ describe('unknown actions', () => {
   });
 });
 
+/** The violation codes of a failed validation, in issue order. */
+function codes(result: ReturnType<typeof validatePayload>): string[] {
+  return result.ok ? [] : result.violations.map((v) => v.code);
+}
+
+describe('violation codes ocpp1.6', () => {
+  const v = 'ocpp1.6';
+
+  test('a missing required field or an unexpected key is occurrence', () => {
+    expect(codes(validatePayload(v, 'BootNotification', 'request', { chargePointVendor: 'x' }))).toEqual([
+      'occurrence',
+    ]);
+    expect(codes(validatePayload(v, 'Heartbeat', 'request', { extra: 1 }))).toEqual(['occurrence']);
+    // Zod reports a missing enum field as `invalid_value`, not `invalid_type`; still a missing field.
+    expect(codes(validatePayload(v, 'ChangeAvailability', 'request', { connectorId: 1 }))).toEqual(['occurrence']);
+    // An empty-object schema (`record(string, never)`) rejects any key the same way.
+    expect(codes(validatePayload(v, 'SignedFirmwareStatusNotification', 'response', { extra: 1 }))).toEqual([
+      'occurrence',
+    ]);
+  });
+
+  test('a present value of the wrong JSON type is type, null and non-integers included', () => {
+    expect(
+      codes(validatePayload(v, 'BootNotification', 'request', { chargePointVendor: 1, chargePointModel: 'y' })),
+    ).toEqual(['type']);
+    expect(
+      codes(validatePayload(v, 'BootNotification', 'request', { chargePointVendor: null, chargePointModel: 'y' })),
+    ).toEqual(['type']);
+    expect(codes(validatePayload(v, 'CancelReservation', 'request', { reservationId: 1.5 }))).toEqual(['type']);
+    // An enum field is `"type": "string"` in the schema, so a number there is a type error, not a bad enum value.
+    expect(codes(validatePayload(v, 'ChangeAvailability', 'request', { connectorId: 1, type: 1 }))).toEqual(['type']);
+  });
+
+  test('enum, length, date-time, url and multipleOf failures are property', () => {
+    expect(codes(validatePayload(v, 'ChangeAvailability', 'request', { connectorId: 1, type: 'Bogus' }))).toEqual([
+      'property',
+    ]);
+    const long = { chargePointVendor: 'x'.repeat(21), chargePointModel: 'y' };
+    expect(codes(validatePayload(v, 'BootNotification', 'request', long))).toEqual(['property']);
+    expect(codes(validatePayload(v, 'Heartbeat', 'response', { currentTime: 'yesterday' }))).toEqual(['property']);
+    expect(codes(validatePayload(v, 'GetDiagnostics', 'request', { location: 'not a url' }))).toEqual(['property']);
+  });
+
+  test('a payload that is not an object, or an unknown action, is format', () => {
+    expect(codes(validatePayload(v, 'Heartbeat', 'request', 'abc'))).toEqual(['format']);
+    expect(codes(validatePayload(v, 'Heartbeat', 'request', null))).toEqual(['format']);
+    expect(codes(validatePayload(v, 'Heartbeat', 'request', []))).toEqual(['format']);
+    expect(codes(validatePayload(v, 'NoSuchThing', 'request', {}))).toEqual(['format']);
+  });
+});
+
+describe.each(['ocpp2.0.1', 'ocpp2.1'] as const)('violation codes %s', (v) => {
+  const chargingStation = { model: 'm', vendorName: 'v' };
+
+  test('a missing nested required field or an unexpected key is occurrence', () => {
+    expect(
+      codes(validatePayload(v, 'BootNotification', 'request', { reason: 'PowerUp', chargingStation: { model: 'm' } })),
+    ).toEqual(['occurrence']);
+    expect(
+      codes(validatePayload(v, 'BootNotification', 'request', { reason: 'PowerUp', chargingStation, extra: 1 })),
+    ).toEqual(['occurrence']);
+    expect(codes(validatePayload(v, 'Reset', 'request', {}))).toEqual(['occurrence']);
+  });
+
+  test('a present value of the wrong JSON type is type', () => {
+    expect(codes(validatePayload(v, 'BootNotification', 'request', { reason: 1, chargingStation }))).toEqual(['type']);
+    expect(codes(validatePayload(v, 'Reset', 'request', { type: 'Immediate', evseId: '1' }))).toEqual(['type']);
+  });
+
+  test('enum, length and date-time failures are property', () => {
+    expect(codes(validatePayload(v, 'BootNotification', 'request', { reason: 'Bogus', chargingStation }))).toEqual([
+      'property',
+    ]);
+    const long = { reason: 'PowerUp', chargingStation: { model: 'm'.repeat(21), vendorName: 'v' } };
+    expect(codes(validatePayload(v, 'BootNotification', 'request', long))).toEqual(['property']);
+    expect(codes(validatePayload(v, 'Heartbeat', 'response', { currentTime: 'yesterday' }))).toEqual(['property']);
+  });
+
+  test('a payload that is not an object, or an unknown action, is format', () => {
+    expect(codes(validatePayload(v, 'Heartbeat', 'request', []))).toEqual(['format']);
+    expect(codes(validatePayload(v, 'StartTransaction', 'request', {}))).toEqual(['format']);
+  });
+});
+
 describe('ACTIONS', () => {
   test('lists actions per version in sorted order', () => {
     expect(ACTIONS['ocpp1.6'].length).toBeGreaterThanOrEqual(28);
