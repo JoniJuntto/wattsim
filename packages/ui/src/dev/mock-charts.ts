@@ -7,6 +7,7 @@
 import type {
   ConformanceViolation,
   EvseSeriesView,
+  EvseView,
   FindingsBinsView,
   FleetBin,
   FleetSeriesView,
@@ -53,96 +54,290 @@ function hash(s: string): number {
 /** A deterministic number in [0, 1) for a key. */
 const rand = (key: string) => (hash(key) % 100_000) / 100_000;
 
-type Plan = {
-  period: number;
-  offset: number;
-  length: number;
-  maxKw: number;
-  phases: 1 | 3;
+/** A stretch of one EVSE's history at constant power. `session` indexes `Timeline.sessions`. */
+type Seg = {
+  from: number;
+  to: number;
+  status: string;
+  kw: number;
   limitKw: number | null;
-  faultAt: number;
-  ratedKw: number;
-  priced: boolean;
+  session: number | null;
+  /** A transaction is running (the running cost is defined). */
+  inTx: boolean;
 };
 
-const plans = new Map<string, Plan>();
+/** One plug-in: the EV's battery and SoC at its start, and the register when it started. */
+type Session = { battery: number; socStart: number; target: number; phases: 1 | 3; startWh: number; ev: boolean };
 
-function planOf(stationId: string, evse: number, view?: StationView): Plan {
-  const key = `${stationId}/${evse}`;
-  let p = plans.get(key);
-  if (!p) {
-    const r = (k: string) => rand(`${key}:${k}`);
-    const phases: 1 | 3 = r('phases') < 0.25 ? 1 : 3;
-    const ratedKw = view?.evses.find((e) => e.id === evse)?.offeredKw || 22;
-    p = {
-      period: (2 + r('period') * 2.5) * HOUR,
-      offset: r('offset') * 3 * HOUR,
-      length: (35 + r('length') * 85) * MIN,
-      maxKw: Math.min(ratedKw, phases === 1 ? 7.4 : ([11, 22, 16, 11][Math.floor(r('kw') * 4)] ?? 11)),
-      phases,
-      limitKw: r('limit') < 0.35 ? Math.round(ratedKw * 0.55) : null,
-      faultAt: r('fault') < 0.3 ? START - r('faultAt') * 20 * HOUR : Number.NaN,
-      ratedKw,
-      priced: view?.version === 'ocpp2.1' || r('priced') < 0.2,
-    };
-    plans.set(key, p);
+/**
+ * One EVSE's history: contiguous segments ending in the state the mock EVSE is in when the page loaded (the last
+ * segment runs on), and the energy register at each segment start, anchored so it reads the live register then.
+ */
+type Timeline = {
+  segs: Seg[];
+  whAt: number[];
+  sessions: Session[];
+  priced: boolean;
+  rated: number;
+};
+
+/** When the history ends and the live mock takes over (set by `seedHistory`). */
+let anchor = START;
+const timelines = new Map<string, Timeline>();
+const tlKey = (stationId: string, evse: number) => `${stationId}/${evse}`;
+
+const phasesFor = (maxKw: number | undefined): 1 | 3 => (maxKw !== undefined && maxKw <= 7.4 ? 1 : 3);
+
+/** The power the live mock draws for this EVSE (see `tick` in mock.ts), without its noise. */
+function liveCap(e: EvseView): number {
+  const ev = e.ev;
+  return Math.min(e.offeredKw, e.limitKw ?? Number.POSITIVE_INFINITY, ev?.maxKw ?? e.offeredKw);
+}
+
+/**
+ * Builds the timeline backwards from the live state at `at`: the current session (plug-in, Preparing, a ramp, Charging
+ * with a smart-charging limit step when a limit is in force, then whatever the EVSE does now), then idle gaps and
+ * earlier sessions back to 27 h before.
+ */
+function buildTimeline(view: StationView, e: EvseView, at: number): Timeline {
+  const key = tlKey(view.id, e.id);
+  const r = (k: string) => rand(`${key}:${k}`);
+  const rated = e.offeredKw || 22;
+  const sessions: Session[] = [];
+  // Built newest first, reversed at the end; `t` walks back from `at`.
+  const back: Seg[] = [];
+  let t = at;
+  const push = (dur: number, seg: Omit<Seg, 'from' | 'to'>) => {
+    back.push({ ...seg, from: t - dur, to: t });
+    t -= dur;
+  };
+  const ev = e.ev && e.ev.state !== 'Unplugged' ? e.ev : undefined;
+  const inTx = e.transactionId !== undefined;
+  const tail = (status: string, kw: number, limitKw: number | null, session: number | null, tx: boolean) =>
+    back.push({ from: at, to: Number.POSITIVE_INFINITY, status, kw, limitKw, session, inTx: tx });
+
+  /** The charging part of a session that delivered `kwh` and ended `endAgo` ms before `t` started walking. */
+  const charge = (kwh: number, power: number, limit: { kw: number; ms: number } | null, sess: number, tx: boolean) => {
+    let left = kwh;
+    if (limit && limit.kw > 0) {
+      const ms = Math.min(limit.ms, ((left * 0.45) / limit.kw) * HOUR);
+      push(ms, { status: 'Charging', kw: limit.kw, limitKw: limit.kw, session: sess, inTx: tx });
+      left -= (limit.kw * ms) / HOUR;
+    }
+    // A minute's ramp at half power, then full power for the rest.
+    const ramp = Math.min(MIN, ((left * 0.5) / Math.max(0.1, power / 2)) * HOUR);
+    const full = Math.max(0, ((left - ((power / 2) * ramp) / HOUR) / Math.max(0.1, power)) * HOUR);
+    push(full, { status: 'Charging', kw: power, limitKw: null, session: sess, inTx: tx });
+    push(ramp, { status: 'Charging', kw: power / 2, limitKw: null, session: sess, inTx: tx });
+    push(2 * MIN, { status: 'Preparing', kw: 0, limitKw: null, session: sess, inTx: tx });
+  };
+
+  // ---- the current state and the session that led to it ----
+  const cur = sessions.length;
+  const battery = ev?.batteryKwh ?? 50;
+  const evMax = ev?.maxKw ?? Math.min(rated, 11);
+  const fullPower = Math.min(rated, evMax);
+  const txKwh = e.txEnergyWh !== undefined ? e.txEnergyWh / 1000 : undefined;
+  const session = (kwh: number) => {
+    sessions.push({
+      battery,
+      socStart: ev ? Math.max(0.05, ev.soc - kwh / battery) : 0.3,
+      target: ev?.targetSoc ?? 0.8,
+      phases: phasesFor(evMax),
+      startWh: 0,
+      // Without an EV in the live view (a transaction the EVSE suspended), there is no SoC to show either.
+      ev: ev !== undefined,
+    });
+  };
+  switch (e.status) {
+    case 'Charging': {
+      const cap = liveCap(e);
+      const kwh = txKwh ?? (cap * 20) / 60;
+      session(kwh);
+      tail('Charging', cap, e.limitKw ?? null, cur, inTx);
+      const limited = e.limitKw !== undefined && e.limitKw < fullPower;
+      // The live segment already started at the limit; the step down to it came 8..14 min before.
+      if (limited) {
+        const ms = (8 + r('step') * 6) * MIN;
+        const lim = Math.min(ms, ((kwh * 0.45) / cap) * HOUR);
+        push(lim, { status: 'Charging', kw: cap, limitKw: e.limitKw ?? null, session: cur, inTx });
+        charge(kwh - (cap * lim) / HOUR, fullPower, null, cur, inTx);
+      } else {
+        charge(kwh, cap, null, cur, inTx);
+      }
+      break;
+    }
+    case 'SuspendedEV':
+    case 'SuspendedEVSE':
+    case 'Finishing': {
+      const kwh = txKwh ?? (ev ? Math.max(1, (ev.soc - 0.35) * battery) : 5);
+      session(kwh);
+      tail(e.status, 0, e.limitKw ?? null, cur, inTx);
+      // How long it has been in that state varies per EVSE, so a fleet does not change state all at once.
+      const idle =
+        (e.status === 'Finishing'
+          ? 2 + r('idle') * 5
+          : e.status === 'SuspendedEV'
+            ? 3 + r('idle') * 25
+            : 5 + r('idle') * 12) * MIN;
+      push(idle, { status: e.status, kw: 0, limitKw: e.limitKw ?? null, session: cur, inTx });
+      charge(kwh, fullPower, null, cur, inTx);
+      break;
+    }
+    case 'Preparing':
+      session(0);
+      tail('Preparing', 0, null, cur, inTx);
+      push((1 + r('prep') * 5) * MIN, { status: 'Preparing', kw: 0, limitKw: null, session: cur, inTx });
+      break;
+    case 'Available':
+      tail('Available', 0, e.limitKw ?? null, null, false);
+      break;
+    default: {
+      // Faulted, Reserved, Unavailable, or anything else: in that state for a while.
+      const dur =
+        (e.status === 'Faulted'
+          ? 5 + r('dur') * 25
+          : e.status === 'Reserved'
+            ? 10 + r('dur') * 20
+            : 20 + r('dur') * 70) * MIN;
+      tail(e.status, 0, null, null, false);
+      push(dur, { status: e.status, kw: 0, limitKw: null, session: null, inTx: false });
+    }
   }
-  return p;
+
+  // ---- earlier: idle gaps (now and then a short fault) and finished sessions ----
+  for (let k = 0; t > at - 27 * HOUR && k < 40; k++) {
+    const rk = (s: string) => r(`${k}:${s}`);
+    const gap = (25 + rk('gap') * 150) * MIN;
+    if (rk('fault') < 0.12) {
+      push(gap * 0.4, { status: 'Available', kw: 0, limitKw: null, session: null, inTx: false });
+      push(3 * MIN, { status: 'Faulted', kw: 0, limitKw: null, session: null, inTx: false });
+      push(gap * 0.6, { status: 'Available', kw: 0, limitKw: null, session: null, inTx: false });
+    } else {
+      push(gap, { status: 'Available', kw: 0, limitKw: null, session: null, inTx: false });
+    }
+    const power = Math.min(rated, [7.4, 11, 11, 16, 22][Math.floor(rk('kw') * 5)] ?? 11);
+    const minutes = 30 + rk('len') * 80;
+    const bat = 40 + Math.round(rk('bat') * 40);
+    const socStart = Math.min(0.55, 0.15 + rk('soc') * 0.35);
+    // A session stops at the EV's 80% target at the latest.
+    const kwh = Math.min((power * minutes) / 60, (0.8 - socStart) * bat);
+    const idx = sessions.length;
+    sessions.push({ battery: bat, socStart, target: 0.8, phases: phasesFor(power), startWh: 0, ev: true });
+    push(4 * MIN, { status: 'Finishing', kw: 0, limitKw: null, session: idx, inTx: false });
+    // The last tenth tapers at half power, as an EV near its target does.
+    const taper = kwh * 0.1;
+    push((taper / (power / 2)) * HOUR, { status: 'Charging', kw: power / 2, limitKw: null, session: idx, inTx: true });
+    const limit =
+      rk('limit') < 0.35 ? { kw: Math.round(power * 0.55 * 10) / 10, ms: (10 + rk('lms') * 20) * MIN } : null;
+    charge(kwh - taper, power, limit, idx, true);
+  }
+  push(Math.max(HOUR, t - (at - 28 * HOUR)), { status: 'Available', kw: 0, limitKw: null, session: null, inTx: false });
+
+  const segs = back.reverse();
+  // The register forward from zero, then shifted so it reads the live register at `at`.
+  const whAt: number[] = [];
+  const started = new Set<number>();
+  let wh = 0;
+  for (const seg of segs) {
+    whAt.push(wh);
+    if (seg.session !== null && !started.has(seg.session)) {
+      started.add(seg.session);
+      (sessions[seg.session] as Session).startWh = wh;
+    }
+    if (Number.isFinite(seg.to)) wh += (seg.kw * (seg.to - seg.from)) / HOUR;
+  }
+  const atIndex = segs.findIndex((x) => x.to > at);
+  const atSeg = segs[atIndex] as Seg;
+  const whRawAt = (whAt[atIndex] as number) + (atSeg.kw * (at - atSeg.from)) / HOUR;
+  const shift = e.energyWh - whRawAt * 1000;
+  for (let i = 0; i < whAt.length; i++) whAt[i] = (whAt[i] as number) * 1000 + shift;
+  for (const sess of sessions) sess.startWh = sess.startWh * 1000 + shift;
+  return { segs, whAt, sessions, priced: view.version === 'ocpp2.1' || r('priced') < 0.2, rated };
+}
+
+function timelineOf(view: StationView, evse: number): Timeline {
+  const key = tlKey(view.id, evse);
+  let tl = timelines.get(key);
+  if (!tl) {
+    // A station created after the page loaded: its history starts now.
+    const e = view.evses.find((x) => x.id === evse) ?? {
+      id: evse,
+      status: 'Available',
+      offeredKw: 22,
+      powerKw: 0,
+      energyWh: 0,
+    };
+    tl = buildTimeline(view, { ...e, status: 'Available' }, Date.now());
+    timelines.set(key, tl);
+  }
+  return tl;
+}
+
+/** Fixes every EVSE's history to the mock state right now; call once, after the stations are seeded. */
+export function seedHistory(views: StationView[]) {
+  anchor = Date.now();
+  for (const v of views) for (const e of v.evses) timelines.set(tlKey(v.id, e.id), buildTimeline(v, e, anchor));
+}
+
+function segAt(tl: Timeline, t: number): number {
+  let lo = 0;
+  let hi = tl.segs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if ((tl.segs[mid] as Seg).from <= t) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 /** Supply voltage: a slow drift per phase and a small sag under load, to 0.1 V. */
 const voltage = (t: number, phase: number, kw: number) =>
   Math.round(
-    (230 + 2.2 * Math.sin(t / 2_400_000 + phase) + 0.8 * Math.sin(t / 410_000 + phase * 1.7) - kw * 0.06) * 10,
+    (230 + 2.2 * Math.sin(t / 2_400_000 + phase) + 0.3 * Math.sin(t / 410_000 + phase * 1.7) - kw * 0.06) * 10,
   ) / 10;
 
-/** The historical sample of one EVSE at time `t` (closed form, no state). */
-function synth(stationId: string, evse: number, t: number, view?: StationView): SeriesPoint {
-  const p = planOf(stationId, evse, view);
-  const k = Math.floor((t - p.offset) / p.period);
-  const start = p.offset + k * p.period;
-  const into = t - start;
-  const inLimit = p.limitKw !== null && new Date(t).getHours() >= 11 && new Date(t).getHours() < 15;
-  const offeredKw = p.ratedKw;
-  const cap = Math.min(p.maxKw, inLimit ? (p.limitKw as number) : p.maxKw);
-  let kw = 0;
-  let status = 'Available';
-  let soc: number | null = null;
-  const sessionEnergy = (p.maxKw * p.length) / HOUR; // kWh, ignoring the taper and the limit
-  if (into >= 0 && into < p.length) {
-    const frac = into / p.length;
-    const taper = frac < 0.8 ? 1 : Math.max(0.1, (1 - frac) / 0.2);
-    kw = cap * taper * (0.98 + 0.02 * Math.sin(t / 47_000));
-    status = frac > 0.97 ? 'SuspendedEV' : 'Charging';
-    soc = 0.2 + 0.6 * frac;
-  } else if (into >= p.length && into < p.length + 4 * MIN) {
-    status = 'Finishing';
-    soc = 0.8;
-  }
-  if (Math.abs(t - p.faultAt) < 3 * MIN) {
-    status = 'Faulted';
-    kw = 0;
-  }
-  const amps = (kw * 1000) / (p.phases * 230);
-  const volt = (phase: number) => voltage(t, phase, kw);
-  // Sessions since two days before the page loaded, so the register reads a few thousand kWh.
-  const done = Math.max(0, k - Math.floor((START - 2 * DAY - p.offset) / p.period)) * sessionEnergy;
-  const current = into > 0 ? (p.maxKw * Math.min(into, p.length)) / HOUR : 0;
-  const wh = 1_250_000 + (done + current) * 1000;
+/** The historical sample of one EVSE at time `t`. */
+function synth(stationId: string, evse: number, t: number, view: StationView): SeriesPoint {
+  const tl = timelineOf(view, evse);
+  const i = segAt(tl, t);
+  const seg = tl.segs[i] as Seg;
+  const wh = (tl.whAt[i] as number) + (seg.kw * (Math.max(t, seg.from) - seg.from)) / 3600;
+  // A little ripple on the power while charging; energy is integrated without it.
+  const kw = seg.status === 'Charging' ? seg.kw * (1 + 0.012 * Math.sin(t / 47_000 + evse)) : seg.kw;
+  const sess = seg.session === null ? undefined : tl.sessions[seg.session];
+  const phases = sess?.phases ?? 3;
+  const amps = (kw * 1000) / (phases * 230);
+  const soc = sess?.ev ? Math.min(0.99, sess.socStart + (wh - sess.startWh) / 1000 / sess.battery) : null;
+  void stationId;
   return {
     evse,
     t,
     kw: Math.round(kw * 1000) / 1000,
-    a: [amps, p.phases === 3 ? amps : 0, p.phases === 3 ? amps : 0],
-    v: [volt(0), volt(2.1), volt(4.2)],
-    offeredKw,
-    limitKw: inLimit ? p.limitKw : null,
+    a: [amps, phases === 3 ? amps : 0, phases === 3 ? amps : 0],
+    v: [voltage(t, 0, kw), voltage(t, 2.1, kw), voltage(t, 4.2, kw)],
+    offeredKw: tl.rated,
+    limitKw: seg.limitKw,
     soc,
-    targetSoc: soc === null ? null : 0.8,
+    targetSoc: sess?.ev ? sess.target : null,
     wh,
-    cost: p.priced && status !== 'Available' ? Math.round((0.5 + current * 0.39) * 100) / 100 : null,
-    status,
+    cost: tl.priced && sess && seg.inTx ? Math.round((0.5 + ((wh - sess.startWh) / 1000) * 0.39) * 100) / 100 : null,
+    status: seg.status,
   };
+}
+
+/** The history of one EVSE as segments, for building a matching frame log. */
+export function historySegments(view: StationView, evse: number): readonly Readonly<Seg>[] {
+  return timelineOf(view, evse).segs;
+}
+
+/** The historical sample of one EVSE at `t`. */
+export const historyAt = (view: StationView, evse: number, t: number): SeriesPoint => synth(view.id, evse, t, view);
+
+/** Segment starts in (from, to): history samples there make the status band and steps exact. */
+function boundaries(view: StationView, evse: number, from: number, to: number): number[] {
+  const tl = timelineOf(view, evse);
+  return tl.segs.filter((s) => s.from > from && s.from < to).map((s) => s.from);
 }
 
 export type ChartsMockDeps = {
@@ -159,9 +354,9 @@ let lastFleet = 0;
 
 function samplesOf(view: StationView, now: number): SeriesPoint[] {
   return view.evses.map((e) => {
-    const p = planOf(view.id, e.id, view);
-    // A one-phase plan cannot carry more than 7.4 kW; the live EV decides.
-    const phases = e.powerKw > 7.4 ? 3 : p.phases;
+    const tl = timelineOf(view, e.id);
+    // The phases the plugged-in EV charges on, as the history has them.
+    const phases = phasesFor(e.ev?.maxKw);
     const amps = (e.powerKw * 1000) / (phases * 230);
     const volt = (phase: number) => voltage(now, phase, e.powerKw);
     const ev = e.ev && e.ev.state !== 'Unplugged' ? e.ev : undefined;
@@ -177,7 +372,7 @@ function samplesOf(view: StationView, now: number): SeriesPoint[] {
       targetSoc: ev ? ev.targetSoc : null,
       wh: e.energyWh,
       cost:
-        p.priced && e.txEnergyWh !== undefined ? Math.round((0.5 + (e.txEnergyWh / 1000) * 0.39) * 100) / 100 : null,
+        tl.priced && e.txEnergyWh !== undefined ? Math.round((0.5 + (e.txEnergyWh / 1000) * 0.39) * 100) / 100 : null,
       status: e.status,
     };
   });
@@ -237,20 +432,16 @@ function fleetBinOf(
   return { t, kw: Math.round(kw * 10) / 10, stations: views.length, connected, counts };
 }
 
-/** Recorded live samples when there are any for `t`, else the synthetic history. */
+/** The history up to the first live sample, then the live samples: one story, no seam. */
 function pointsOf(view: StationView, evse: number, from: number, to: number, step: number): SeriesPoint[] {
-  const out: SeriesPoint[] = [];
   const live = recorded.get(view.id)?.get(evse) ?? [];
-  const liveFrom = live[0]?.t ?? START;
+  const liveFrom = live[0]?.t ?? Number.POSITIVE_INFINITY;
   const histStep = Math.max(HISTORY_STEP, step);
-  // Shift the synthetic register so it meets the live one at the seam.
-  const seam = synth(view.id, evse, liveFrom, view);
-  const liveWh = live[0]?.wh ?? view.evses.find((e) => e.id === evse)?.energyWh ?? seam.wh;
-  const shift = liveWh - seam.wh;
-  for (let t = Math.floor((from - histStep) / histStep) * histStep; t < Math.min(to, liveFrom); t += histStep) {
-    const s = synth(view.id, evse, t, view);
-    out.push({ ...s, wh: s.wh + shift });
-  }
+  const end = Math.min(to, liveFrom);
+  const times = new Set<number>();
+  for (let t = Math.floor((from - histStep) / histStep) * histStep; t < end; t += histStep) times.add(t);
+  for (const t of boundaries(view, evse, from - histStep, end)) times.add(t);
+  const out = [...times].sort((a, b) => a - b).map((t) => synth(view.id, evse, t, view));
   for (const s of live) if (s.t <= to && s.t >= from - histStep) out.push(s);
   return out;
 }
@@ -301,11 +492,10 @@ export function stationSeries(view: StationView, from: number, to: number, step:
     from,
     to,
     step,
-    fullResolutionFrom: from < START - 6 * HOUR ? START - 6 * HOUR : null,
-    evses: view.evses.map((e) => {
-      const p = planOf(view.id, e.id, view);
-      return columns(e.id, pointsOf(view, e.id, from, to, step), p.priced ? 'EUR' : undefined);
-    }),
+    fullResolutionFrom: from < anchor - 6 * HOUR ? anchor - 6 * HOUR : null,
+    evses: view.evses.map((e) =>
+      columns(e.id, pointsOf(view, e.id, from, to, step), timelineOf(view, e.id).priced ? 'EUR' : undefined),
+    ),
   };
 }
 
@@ -358,7 +548,7 @@ export function fleetSeries(views: StationView[], from: number, to: number, step
     connected: [],
     counts: FLEET_STATUSES.map(() => []),
   };
-  const liveFrom = fleetBins[0]?.t ?? START;
+  const liveFrom = fleetBins[0]?.t ?? Number.POSITIVE_INFINITY;
   for (let t = Math.ceil(from / s) * s; t < Math.min(to, liveFrom); t += s) {
     const bin = fleetBinOf(views, t, (v) =>
       v.evses.map((e) => {
@@ -422,11 +612,7 @@ function synthOrLive(v: StationView, evse: number, t: number): SeriesPoint {
     }
     return best;
   }
-  const s = synth(v.id, evse, t, v);
-  if (!live || live.length === 0) return s;
-  // Shifted so the synthetic register meets the live one, as `pointsOf` does.
-  const first = live[0] as SeriesPoint;
-  return { ...s, wh: s.wh + first.wh - synth(v.id, evse, first.t, v).wh };
+  return synth(v.id, evse, t, v);
 }
 
 /** Server `findingsBins`, for the mock's findings. */
@@ -533,7 +719,10 @@ export function runTimeline(run: RunDetail): RunTimeline {
   };
 }
 
-/** Quiet filler stations for `?mock&fleet=N`: booted, a mix of statuses, no frames. */
+/**
+ * Quiet filler stations for `?mock&fleet=N`: booted, a deterministic mix of states (about four in ten charging, some
+ * limited, the odd fault), never ticked. `seedHistory` then gives each a history that ends in that state.
+ */
 export function fillerStations(n: number): StationView[] {
   const out: StationView[] = [];
   for (let i = 1; i <= n; i++) {
@@ -546,20 +735,45 @@ export function fillerStations(n: number): StationView[] {
       connection: rand(`${id}c`) < 0.04 ? 'reconnecting' : 'open',
       booted: true,
       chaos: [],
-      evses: Array.from({ length: evses }, (_, k) => ({
-        id: k + 1,
-        status: 'Available',
-        offeredKw: 22,
-        powerKw: 0,
-        energyWh: 0,
-      })),
+      evses: Array.from({ length: evses }, (_, k): EvseView => {
+        const r = (s: string) => rand(`${id}/${k + 1}:${s}`);
+        const e: EvseView = {
+          id: k + 1,
+          status: 'Available',
+          offeredKw: 22,
+          powerKw: 0,
+          energyWh: 400_000 + Math.round(r('wh') * 3_000_000),
+        };
+        const pick = r('state');
+        const maxKw = [7.4, 11, 11, 22][Math.floor(r('ev') * 4)] ?? 11;
+        const battery = 40 + Math.round(r('bat') * 50);
+        if (pick < 0.47) {
+          const soc = 0.25 + r('soc') * 0.5;
+          const charging = pick < 0.42;
+          e.status = charging ? 'Charging' : 'SuspendedEV';
+          e.transactionId = 9000 + i * 2 + k;
+          e.ev = {
+            state: charging ? 'Charging' : 'Suspended',
+            soc: charging ? soc : 0.79,
+            batteryKwh: battery,
+            targetSoc: 0.8,
+            maxKw,
+          };
+          e.txEnergyWh = Math.round(((charging ? soc : 0.79) - 0.12) * battery * 1000 * (0.3 + r('tx') * 0.6));
+          if (charging && r('limit') < 0.18) e.limitKw = Math.round(Math.min(22, maxKw) * 0.55 * 10) / 10;
+          if (charging) e.powerKw = liveCap(e);
+        } else if (pick < 0.5) {
+          e.status = 'Finishing';
+          e.ev = { state: 'Full', soc: 0.8, batteryKwh: battery, targetSoc: 0.8, maxKw };
+        } else if (pick < 0.508) e.status = 'Faulted';
+        else if (pick < 0.515) e.status = 'Unavailable';
+        else if (pick < 0.535) {
+          e.status = 'Preparing';
+          e.ev = { state: 'Plugged', soc: 0.3, batteryKwh: battery, targetSoc: 0.8, maxKw };
+        }
+        return e;
+      }),
     };
-    for (const e of view.evses) {
-      const s = synth(id, e.id, START, view);
-      e.status = s.status;
-      e.powerKw = s.kw;
-      e.energyWh = s.wh;
-    }
     out.push(view);
   }
   return out;

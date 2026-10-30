@@ -22,7 +22,10 @@ import {
   fillerStations,
   fleetSeries,
   fleetStations,
+  historyAt,
+  historySegments,
   schedule as mockSchedule,
+  seedHistory,
   stationSeries,
 } from './mock-charts';
 import { type MockContext, MockHttpError, seedServerMode, serverModeRoute, serverModeTick } from './mock-server-mode';
@@ -772,7 +775,6 @@ function tick() {
 }
 
 function seed() {
-  const now = Date.now();
   const mk = (id: string, version: OcppVersion, evses: number, csmsUrl = 'ws://localhost:9000/ocpp') => {
     const sim = makeStation(id, { version, csmsUrl, evses, maxCurrentA: 32, phases: 3 });
     sim.view = { ...sim.view, connection: 'open', booted: true };
@@ -813,55 +815,174 @@ function seed() {
   mk('CP-005', 'ocpp2.0.1', 2);
   const f = mk('CP-006', 'ocpp1.6', 1);
   f.view = { ...f.view, connection: 'closed', booted: false };
+}
 
-  // ~1900 frames of history on CP-001 so the log's virtualization gets exercised.
-  let t = now - 1900 * 3000;
-  exchange(
-    'CP-001',
-    'out',
-    'BootNotification',
-    { chargePointVendor: 'wattsim', chargePointModel: 'sim-1' },
-    { status: 'Accepted', currentTime: new Date(t).toISOString(), interval: 300 },
-    { silent: true, at: new Date(t) },
+/**
+ * CP-001's frame log for the last 6 h, told from the same history as its telemetry: heartbeats every 30 s (the
+ * CSMS flags them as too often), and per EVSE every status change, the authorize and transaction start and stop of
+ * each session, MeterValues while charging, and the TxProfile that set the limit. Enough frames to exercise the
+ * log's virtualization; the newest 2000 are kept.
+ */
+function seedFrames() {
+  const sim = stations.get('CP-001');
+  if (!sim) return;
+  const view = sim.view;
+  const now = Date.now();
+  const from = now - 6 * 3_600_000;
+  const events: { t: number; run: (at: Date) => void }[] = [];
+  const add = (t: number, run: (at: Date) => void) => {
+    if (t > from && t < now) events.push({ t, run });
+  };
+  const opts = (at: Date) => ({ silent: true, at });
+  add(from + 1, (at) =>
+    exchange(
+      'CP-001',
+      'out',
+      'BootNotification',
+      { chargePointVendor: 'wattsim', chargePointModel: 'sim-1' },
+      { status: 'Accepted', currentTime: at.toISOString(), interval: 300 },
+      opts(at),
+    ),
   );
-  for (let i = 0; i < 940; i++) {
-    t += 6000;
-    const at = new Date(t);
-    if (i % 10 === 0)
-      exchange('CP-001', 'out', 'Heartbeat', {}, { currentTime: at.toISOString() }, { silent: true, at });
-    else if (i % 97 === 0)
+  for (let t = from + 5000; t < now; t += 30_000) {
+    add(t, (at) => exchange('CP-001', 'out', 'Heartbeat', {}, { currentTime: at.toISOString() }, opts(at)));
+  }
+  for (let t = from + 17 * 60_000; t < now; t += 47 * 60_000) {
+    add(t, (at) =>
       exchange(
         'CP-001',
         'in',
         'DataTransfer',
         { vendorId: 'com.example' },
         { error: 'NotImplemented', description: 'Unknown vendor' },
-        { silent: true, at },
-      );
-    else
-      exchange(
-        'CP-001',
-        'out',
-        'MeterValues',
-        {
-          connectorId: 1,
-          transactionId: 4127,
-          meterValue: [
-            {
-              timestamp: at.toISOString(),
-              sampledValue: [{ value: String(1000 + i * 12), measurand: 'Energy.Active.Import.Register', unit: 'Wh' }],
-            },
-          ],
-        },
-        {},
-        { silent: true, at },
-      );
+        opts(at),
+      ),
+    );
   }
+  for (const e of view.evses) {
+    const segs = historySegments(view, e.id);
+    const txIds = new Map<number, number | string>();
+    const liveSession = segs.at(-1)?.session ?? null;
+    let prev: (typeof segs)[number] | undefined;
+    for (const seg of segs) {
+      const t = seg.from;
+      if (prev && prev.status !== seg.status) {
+        add(t, (at) =>
+          exchange(
+            'CP-001',
+            'out',
+            'StatusNotification',
+            { connectorId: e.id, errorCode: 'NoError', status: seg.status },
+            {},
+            opts(at),
+          ),
+        );
+      }
+      const session = seg.session;
+      if (session !== null && prev?.session !== session) {
+        add(t + 2000, (at) =>
+          exchange(
+            'CP-001',
+            'out',
+            'Authorize',
+            { idTag: 'TAG-0001' },
+            { idTagInfo: { status: 'Accepted' } },
+            opts(at),
+          ),
+        );
+      }
+      if (session !== null && seg.inTx && !txIds.has(session)) {
+        const id =
+          session === liveSession && e.transactionId !== undefined ? e.transactionId : 3000 + e.id * 100 + session;
+        txIds.set(session, id);
+        const meterStart = Math.round(historyAt(view, e.id, t).wh);
+        add(t + 3000, (at) =>
+          exchange(
+            'CP-001',
+            'out',
+            'StartTransaction',
+            { connectorId: e.id, idTag: 'TAG-0001', meterStart, timestamp: at.toISOString() },
+            { transactionId: id, idTagInfo: { status: 'Accepted' } },
+            opts(at),
+          ),
+        );
+      }
+      if (seg.limitKw !== null && seg.limitKw > 0 && prev?.limitKw !== seg.limitKw) {
+        const limitW = seg.limitKw * 1000;
+        add(t - 1500, (at) =>
+          exchange(
+            'CP-001',
+            'in',
+            'SetChargingProfile',
+            {
+              connectorId: e.id,
+              csChargingProfiles: {
+                chargingProfileId: 7,
+                stackLevel: 0,
+                chargingProfilePurpose: 'TxProfile',
+                chargingProfileKind: 'Absolute',
+                chargingSchedule: {
+                  chargingRateUnit: 'W',
+                  chargingSchedulePeriod: [{ startPeriod: 0, limit: limitW }],
+                },
+              },
+            },
+            { status: 'Accepted' },
+            opts(at),
+          ),
+        );
+      }
+      if (session !== null && prev?.inTx && !seg.inTx && prev.session === session) {
+        const id = txIds.get(session) ?? 0;
+        const meterStop = Math.round(historyAt(view, e.id, t).wh);
+        add(t + 1000, (at) =>
+          exchange(
+            'CP-001',
+            'out',
+            'StopTransaction',
+            { transactionId: id, meterStop, timestamp: at.toISOString(), reason: 'EVDisconnected' },
+            { idTagInfo: { status: 'Accepted' } },
+            opts(at),
+          ),
+        );
+      }
+      if (seg.status === 'Charging' && seg.inTx) {
+        const every = session === liveSession ? 10_000 : 30_000;
+        const end = Math.min(seg.to, now);
+        for (let mt = Math.ceil((seg.from + 1) / every) * every; mt < end; mt += every) {
+          add(mt, (at) => {
+            const h = historyAt(view, e.id, mt);
+            const sampled = [
+              { value: String(Math.round(h.wh)), measurand: 'Energy.Active.Import.Register', unit: 'Wh' },
+              { value: h.kw.toFixed(2), measurand: 'Power.Active.Import', unit: 'kW' },
+            ];
+            if (h.soc !== null)
+              sampled.push({ value: String(Math.round(h.soc * 100)), measurand: 'SoC', unit: 'Percent' });
+            exchange(
+              'CP-001',
+              'out',
+              'MeterValues',
+              {
+                connectorId: e.id,
+                transactionId: txIds.get(session as number),
+                meterValue: [{ timestamp: at.toISOString(), sampledValue: sampled }],
+              },
+              {},
+              opts(at),
+            );
+          });
+        }
+      }
+      prev = seg;
+    }
+  }
+  events.sort((a, b) => a.t - b.t);
+  for (const ev of events) ev.run(new Date(ev.t));
   // A response whose id matches no CALL (what chaos `wrongId` produces) and a corrupted frame.
   pushFrame(
     'CP-001',
     { dir: 'in', raw: JSON.stringify([3, '999999', { status: 'Accepted' }]), type: 3, id: '999999' },
-    new Date(t + 1000),
+    new Date(now - 2000),
   );
   pushFrame(
     'CP-001',
@@ -872,7 +993,7 @@ function seed() {
       id: '5000',
       action: 'MeterValues',
     },
-    new Date(t + 2000),
+    new Date(now - 1000),
   );
 }
 
@@ -884,6 +1005,9 @@ export function installMock() {
     stations.set(view.id, { view, meterTick: 0, nextTx: 1 });
     filler.add(view.id);
   }
+  // Every EVSE's history ends in the state just seeded, and the live mock carries on from there.
+  seedHistory([...stations.values()].map((sim) => sim.view));
+  if (!empty) seedFrames();
   seedServerMode(mockContext, empty);
   const realFetch = window.fetch.bind(window);
   window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
