@@ -1,0 +1,355 @@
+---
+title: Develop and test a DLM controller
+description: Put simulated chargers on a modelled switchboard, point your dynamic load management at it, and find out whether a breaker trips.
+---
+
+A dynamic load management (DLM) controller shares a site's limited connection between chargers. Testing one against real hardware means a real switchboard, real EVs and a real chance of tripping something. wattsim gives you the switchboard as a model instead. Twenty simulated chargers draw through fuses, breakers and cables whose protection trips on its IEC time-current curve. The building loads and PV share the same boards, and emulated meters report what flows.
+
+This guide walks through `examples/dlm-depot.ws`, a bus and van depot. You run it once with wattsim's reference controller and once with no DLM at all, read the score, and then put your own controller in the reference controller's place.
+
+## Describe the site
+
+A scenario holds at most one `site` block. Each line in it is a node kind, an id and its settings, and braces hold the nodes below it. The depot, from the grid connection down:
+
+```
+let arrival = uniform(0min, 20min)
+
+site "Depot" {
+  supply 3x400V 250A
+  time "2026-06-15T07:00:00Z"
+  tolerance seed 42
+  transformer "T1" 400kVA uk 4% {
+    fuse "F0" gG 250A {
+      // The site meter a local DLM would read: Modbus TCP, unit 1.
+      meter "M0" sdm630 port 1502 unit 1 {
+        board "MDB" 250A {
+          breaker "Q1" C 125A {
+            cable "W1" 50mm2 Cu 30m C {
+              board "SB1" 125A
+            }
+          }
+          breaker "Q2" C 125A {
+            cable "W2" 50mm2 Cu 30m C {
+              board "SB2" 125A
+            }
+          }
+          load "HVAC" profile "dlm-depot-hvac.csv" linear loop daily pf 0.9
+          load "Office" shape office 30kW pf 0.95
+          pv "Roof" 60kW sunrise 5h sunset 21h clouds 30% seed 7
+        }
+      }
+    }
+  }
+  controller reference every 10s margin 5%
+  expect no trip
+  expect "F0" current <= 250A
+  expect no violation overcurrent
+}
+```
+
+Reading it top to bottom:
+
+- `supply 3x400V 250A` is a three-phase 400 V connection rated 250 A per phase. The rating is tracked as a limit like any other node's.
+- `time` sets the instant the load models read when the run starts. Without it a virtual run starts its model time at 2026-01-01T00:00:00Z, which is midnight in winter and gives the PV nothing to do. The run prints which one it used: `site Depot: model time starts 2026-06-15T07:00:00.000Z (site time)`.
+- `tolerance seed 42` places each protective device somewhere in its standard's tolerance band, from a seed. Leave it out and every device sits at the median of its band.
+- `transformer "T1" 400kVA uk 4%` adds its impedance to the voltage drop and limits the fault current below it.
+- `fuse "F0" gG 250A` is the main fuse: a gG link, which blows per phase.
+- `breaker "Q1" C 125A` is an MCB with curve C. Write `B` or `D` for the other curves, or settings such as `ir 0.8 isd 6` for an MCCB.
+- `cable "W1" 50mm2 Cu 30m C` is a copper cable laid by installation method C. Its ampacity comes from IEC 60364-5-52. The parser refuses a cable whose ampacity is below the rating of the device protecting it.
+- `board` is a distribution board with its own rating. `meter` is a metering point, and with `port` it serves its live values over Modbus TCP.
+- `load ... profile` follows a CSV of `timestamp,power[,pf]`, `load ... shape office` follows a daily office curve, and `pv` exports on a clear-sky bell with seeded clouds. `battery` and `step` loads exist too. The [DSL reference](/docs/reference/dsl#site) lists every setting.
+
+The chargers are ordinary stations. Each one wires itself to the site with a `site ... at` line at the top of its block:
+
+```
+station "CP-{i}" for i in 1..9 {
+  site "Depot" at "SB1" phases rotate breaker C 40A cable 10mm2 Cu 25m C
+  version 1.6
+  meterInterval 5min
+  boot
+  wait arrival
+  ev plug evse 1 { battery 75kWh soc 25% target 90% }
+  call charge
+}
+```
+
+`at "SB1"` hangs the station's EVSE 1 from sub-board SB1, behind its own C 40 A breaker and 25 m of 10 mm² cable. `phases rotate` gives the k-th charger on a board the k-th cyclic rotation, so CP-1 is wired L1L2L3, CP-2 L2L3L1, CP-3 L3L1L2, and CP-4 starts again at L1L2L3. Rotation is how real installers spread single-phase EVs over the phases. Write `phases L2L3L1` to fix one rotation, or `phases L2` for a single-phase charger. CP-10 and CP-20 carry single-phase vans (`ev plug evse 1 { ... phases 1 }`); both are the tenth charger on their board, so both are wired L1L2L3 and their van draws on site phase L1 only.
+
+`wattsim check examples/dlm-depot.ws` validates the topology before anything runs. A run also prints the static checks as comments. In the depot, nothing is fully selective against the main fuse:
+
+```
+# site check: "F0" (gG 250 A) over "Q1" (C125): partial selectivity, Is 8.19 kA below the prospective fault current 14.4 kA; at Is "F0" (gG 250 A) trips in 0.01 s, "Q1" (C125) trips in 0.01 s
+# site check: "Q1" (C125) over "CP-1.Q" (C40): partial selectivity, Is 625 A below the prospective fault current 9.73 kA; at Is "Q1" (C125) trips in 0.01 s, "CP-1.Q" (C40) trips in 0.01 s
+```
+
+A short circuit above 625 A at a charger may take out its whole sub-board. That is normal for MCBs in series, and the [electrical model reference](/docs/reference/electrical-model#selectivity) explains how Is is found.
+
+## Run it with the reference controller
+
+```sh
+wattsim run examples/dlm-depot.ws --virtual --quiet
+```
+
+The site block says `controller reference`, so wattsim's own baseline DLM runs. The twenty EVs arrive within 20 minutes and charge for 100 minutes, on a virtual clock that finishes the two hours in about 1.2 s. The output, with the station table trimmed:
+
+```
+site Depot: model time starts 2026-06-15T07:00:00.000Z (site time)
+
+site Depot (reference controller): 0 trips, 228.2 kWh delivered, 689.3 kWh unmet, fairness 0.96 (min 0.86), max imbalance 57.1 A
+node      peak  over limit  A·s over  imbalance
+@supply  95.0%        0.0s         0     57.1 A
+F0       95.0%        0.0s         0     57.1 A
+MDB      95.0%        0.0s         0     57.1 A
+Q1       94.8%        0.0s         0     32.0 A
+SB1      94.8%        0.0s         0     32.0 A
+Q2       94.1%        0.0s         0     28.7 A
+SB2      94.1%        0.0s         0     28.7 A
+W1       82.3%        0.0s         0     32.0 A
+W2       81.7%        0.0s         0     28.7 A
+CP-2.Q   80.0%        0.0s         0      0.0 A
+(40 more rated nodes in --site-report)
+site asserts: 3/3 passed
+
+station  result  asserts  duration  error
+CP-1     ok      0/0      6578.0s
+...
+CP-20    ok      0/0      6250.0s
+
+20 stations, 0 failed; 9/9 asserts passed; 0 violations; 7015.0s
+```
+
+## Read the score
+
+The first line is the run in one sentence, and the table under it shows each rated node from the most loaded down:
+
+| Figure | Meaning |
+|---|---|
+| trips | Protective devices that opened during the run |
+| delivered | Energy the EVs received |
+| unmet | Energy the EVs asked for and did not get. Each EV leaves after 100 minutes, well short of its 90 % target, so this is large under any controller |
+| fairness | The Jain index of the power shared among the EVSEs charging at once, averaged over the run (1 is a perfectly even split), with its lowest value |
+| max imbalance | The largest difference between phase currents at the grid connection |
+| peak | The node's highest current against its rating |
+| over limit, A·s over | How long the node was above its rating, and by how much in total |
+
+The reference controller holds every node at 95 %, its rating less the 5 % margin. The 57 A imbalance is the two single-phase vans, both on L1. The reference controller does not limit imbalance, and the depot asserts nothing about it. Add `expect site imbalance <= 16A` to the site block and the same run fails.
+
+With `--junit junit.xml` the score goes into the report as test-suite properties, so CI can track it:
+
+```xml
+<property name="dlm.controller" value="reference"/>
+<property name="dlm.trips" value="0"/>
+<property name="dlm.energyWh" value="228241.051"/>
+<property name="dlm.unmetWh" value="689258.949"/>
+<property name="dlm.fairness.mean" value="0.956"/>
+<property name="dlm.node.F0.peakUtilisationPct" value="94.957"/>
+<property name="dlm.node.F0.secondsOverLimit" value="0"/>
+```
+
+## Run it with no DLM
+
+```sh
+wattsim run examples/dlm-depot.ws --virtual --quiet --controller none
+```
+
+`--controller none` overrides the site block. The scenario has no `csms` line, so the stations still connect to wattsim's built-in CSMS, which accepts every session and limits nothing:
+
+```
+site Depot (no controller): 2 trips, 28.9 kWh delivered, 742.3 kWh unmet, fairness 0.91 (min 0.86), max imbalance 63.9 A
+node       peak  over limit  A·s over  imbalance
+Q1       230.4%      620.5s     35063     32.0 A
+SB1      230.4%      620.5s     35063     32.0 A
+Q2       204.8%      155.8s      6748     32.0 A
+SB2      204.8%      155.8s      6748     32.0 A
+W1       200.0%      470.3s     25676     32.0 A
+@supply  192.9%      540.0s     28714     63.9 A
+F0       192.9%      540.0s     28714     63.9 A
+MDB      192.9%      540.0s     28714     63.9 A
+W2       177.8%       87.3s      4883     32.0 A
+T1        83.5%        0.0s         0     63.9 A
+(40 more rated nodes in --site-report)
+site asserts: 0/3 passed
+  ✗ expect no trip 2 trips, first Q2 at 18:23:23 (thermal, 256.0 A)
+  ✗ expect "F0" current <= 250A peak 482.2 A
+  ✗ expect no violation overcurrent 10 violations, first overcurrent at Q1 (peak 288.0, limit 125)
+
+station  result  asserts  duration  error
+CP-8     FAIL    0/0      7003.5s   EVSE 1 has no active transaction
+CP-12    FAIL    0/1      6231.0s
+...
+20 stations, 10 failed; 0/7 asserts passed; 0 violations; 7013.8s
+```
+
+Twenty 22 kW chargers on two 125 A sub-boards is about twice what the boards carry. Each EV takes 32 A per phase as it arrives, the sub-board breakers heat up on their thermal curves, and Q2 trips at 256 A, Q1 a few minutes later at 288 A. Times in the assertion messages are on the run clock, which starts when you launch the run.
+
+A trip is a power loss for every station below it. The socket dies without a close frame, the EV stops and the meter keeps its register. The stations then fail their remaining statements (`EVSE 1 has no active transaction` when `stop evse 1` finds nothing to stop). If the breaker recloses, by `reclose "Q1"` in the scenario or `reclose 30s` on the breaker line, each station boots with reason PowerUp and ends its lost transaction with reason PowerLoss, stamped at the moment the power went.
+
+The main fuse survives this run. It peaks at 482 A and spends 540 s above its rating, but the breakers below it open first and take the load off it. Don't count on that order. `expect "F0" current <= 250A` fails, and for the grid connection that is the assertion that matters.
+
+`wattsim run` exits 1 here, because assertions failed. That makes the no-DLM run a useful negative control in CI: if it ever passes, the scenario stopped testing anything.
+
+## Assert what must hold
+
+Site assertions are `expect` lines. In the site block they check the whole run when it ends. In a station block they check the run so far, at that point in the script, and count with that station's other asserts:
+
+| Statement | Fails when |
+|---|---|
+| `expect no trip` | Any device tripped. `expect no trip "Q1"` checks one device |
+| `expect "F0" current <= 250A` | The node's highest current so far, on any phase, was above the value. Add `phase L2` to check one phase |
+| `expect no violation overcurrent` | A violation of that kind happened. Kinds: `overcurrent`, `cableAmpacity`, `transformerOverload`, `undervoltage`, `overvoltage`, `imbalance`, `neutral`, or leave the kind out for any |
+| `expect site imbalance <= 16A` | The phase imbalance at the grid connection was above the value |
+
+The depot's SB2 stations end with `expect "SB2" current <= 125A`, so each of their JUnit test cases fails on its own when the sub-board was overloaded.
+
+The scenario can also act on the site while it runs: `trip "Q1"` opens a device, `reclose "Q1"` closes it, `load "HVAC" set 60kW` steps a load, and `controller none` switches the reference controller off halfway. Use these to test how your DLM reacts to a step load or a lost sub-board.
+
+## Point your own DLM at it
+
+The reference controller is the thing to beat, not the thing being tested. Your controller takes its place in one of two ways.
+
+### A DLM in your CSMS
+
+A CSMS-side DLM limits chargers with OCPP smart charging, SetChargingProfile on 1.6 and 2.0.1. Turn the reference controller off and send the stations to your CSMS:
+
+```sh
+wattsim run examples/dlm-depot.ws --controller none --csms ws://your-csms:9000/ocpp --site-report depot.json
+```
+
+The station identities are CP-1 to CP-20. CP-1 to CP-10 speak OCPP 1.6 and CP-11 to CP-20 speak 2.0.1, so the depot also checks that your DLM handles both. Configure your DLM with the depot's topology as your product expects it: a 250 A connection, sub-boards SB1 (CP-1 to CP-10) and SB2 (CP-11 to CP-20) at 125 A each, the rotations listed above, and the vans on site phase L1.
+
+Run this one on the wall clock. Your DLM measures time on its own clock, and a `--virtual` run jumps ahead whenever no station has anything to do, so the breakers see minutes of overload in what is milliseconds to your controller. `--speed 10` is fine for a DLM that only reacts to events such as a transaction starting. Keep real time for anything that tests reaction time.
+
+The stations follow your profiles the way real chargers do. The EV power is the minimum of every limit in force, a limit in A is per phase and follows the phases in use, and a profile with `numberPhases: 1` switches the EVSE to one phase.
+
+### A local controller reading Modbus meters
+
+A local controller (an energy manager in the switchboard) reads meters over Modbus TCP. Every `meter` node with a `port` serves its live values: per-phase voltage, current and power, energy integrated over the run, and the state, rating and thermal memory of the protective device at the meter point. The run prints where each meter listens:
+
+```
+# site: meter M0 (sdm630) on modbus 127.0.0.1:1502 unit 1
+```
+
+Add more meters where your controller expects them. Meters on the same port share one server and differ by unit id, so a sub-board meter fits in next to M0:
+
+```
+          breaker "Q1" C 125A {
+            cable "W1" 50mm2 Cu 30m C {
+              meter "M1" em24 port 1502 unit 2 {
+                board "SB1" 125A
+              }
+            }
+          }
+```
+
+```
+# site: meter M0 (sdm630) on modbus 127.0.0.1:1502 unit 1
+# site: meter M1 (em24) on modbus 127.0.0.1:1502 unit 2
+```
+
+Read a meter back with the Modbus CLI while a run is going. Here is the depot's main meter 30 seconds into a run at `--speed 60`, trimmed:
+
+```sh
+bun packages/modbus/src/cli.ts read --port 1502 --unit 1 --map sdm630
+```
+
+```
+0x0000  Phase 1 line to neutral volts                    229.6962 V
+0x0006  Phase 1 current                                  236.7833 A
+0x0008  Phase 2 current                                  216.8709 A
+0x000a  Phase 3 current                                  216.8709 A
+0x0034  Total system power                               153551.7188 W
+0x0046  Frequency of supply voltages                     50 Hz
+0x0048  Total Import kWh                                 1.0943 kWh
+0x00e0  Neutral current                                  20 A
+```
+
+L1 carries 20 A more than L2 and L3: those are the two vans, and the 20 A neutral current is their imbalance. Your controller reads the same registers. For the raw words, read without `--map`:
+
+```sh
+bun packages/modbus/src/cli.ts read --port 1502 --unit 2 --fc 4 --address 12 --count 2
+```
+
+```
+12	0x86a0	34464
+13	0x0001	1
+```
+
+That is the EM24 on SB1 reporting 100 A on L1: an INT32 of 100000 (milliamps) with the least significant word first. The SDM630 sends IEEE floats with the most significant word first. Getting the word order wrong is the commonest bug in a new meter driver, and the emulated meters reproduce each vendor's choice. The [Modbus meters reference](/docs/reference/modbus) has the details and the [register maps](/docs/reference/modbus-maps) list every address.
+
+A meter behind a tripped device goes silent, because real meters take their power from the lines they measure. In a no-DLM run of the depot with M1 added, the EM24 on SB1 read 320 A (`0xe200 0x0004`) every two seconds until Q1 opened, and then:
+
+```
+20:30:15 12	0xe200	57856 13	0x0004	4
+20:30:19 timeout waiting for transaction 1
+```
+
+Your controller should treat that timeout as "this board is dead", not as "this board draws nothing".
+
+A local controller still needs a way to limit the chargers. If it is an OCPP local controller that the chargers connect to, give its OCPP endpoint as `--csms` as above, with `--controller none`.
+
+Meters in a `wattsim run` listen on 127.0.0.1 only, and `run` has no flag to change that. A controller in a container can share the host's network (`docker run --network host`). To serve the meters on another interface, start the site from TypeScript with `startSite({ ..., modbus: { host: '0.0.0.0', meters } })`. `bun packages/modbus/src/cli.ts serve --host 0.0.0.0` serves a meter with fixed values on any interface, which is enough to develop a driver before you test the control loop.
+
+## Watch it on the Site page
+
+The Site page in `wattsim ui` draws the site and explains each control step. Write the run's time series with `--site-report`:
+
+```sh
+wattsim run examples/dlm-depot.ws --virtual --quiet --site-report depot.json
+```
+
+Then open **Sites**, click **Upload a site report** and pick `depot.json`. The same page follows a site live when you run the scenario from the **Scenarios** page. Profile files such as `dlm-depot-hvac.csv` must then sit in `<data>/scenarios` (default `~/.wattsim/scenarios`), the only folder a browser scenario may read from.
+
+<Screenshot name="site-live" alt="The Site page for the depot under the reference controller: a score strip, the single-line diagram from the grid connection through the transformer, main fuse and meter to two sub-boards of ten chargers each, the decision panel on the right, and timelines for Q1, the grid connection and F0 below." />
+
+**The single-line diagram** is the site's tree as an engineer draws it. Line weight follows the current, colour shows loading against the rating (amber above 80 %, red above 100 %), and dashes move along each energised conductor at a speed set by its power, upwards for PV export. Each device shows its rating, its current per phase and a heat gauge: how far it is towards tripping on its thermal curve. The **All / L1 / L2 / L3 / N** buttons show one phase at a time, which is the quickest way to see the rotation at work and where the single-phase vans land. Click a node for its time series against its rating, the limits it broke, and **Trip**, **Reclose** or a load setpoint to act on it.
+
+**The decision panel** explains one control step. It starts at a constrained node's rating, takes off the safety margin and what the other loads use (PV gives some back), and splits the remaining budget into each EVSE's allocation, with the headroom left. Below that it shows each EVSE's allocation next to what its EV really drew, and marks EVs drawing less than they were given, EVs on fewer phases than they are wired for, and paused ones. **Follow** keeps the panel on the latest step; the arrows step through the history.
+
+<Screenshot name="site-decision" alt="The decision panel at one control step: from grid connection L1, rating 250 A less a 12.5 A margin, 39 A of other loads and 16 A reserved for CP-7, which is not steered, leaves 183 A for 19 EVs. Below, each EVSE's allocation against its measured draw." />
+
+The orange "Not steered" bar is load the controller counts but cannot control. In this step CP-7 draws 16 A without a session the CSMS knows, so the controller reserves those 16 A on its phases and shares out only the rest. The reference controller's safety rule below says when that happens.
+
+**The timeline** has a row per constrained node: its rating, the current that flowed on its most loaded phase, and what the DLM planned through it, with a tick for each step that sent profiles. The gap between a tick and the current following it is your controller's reaction time; current above the dashed rating line is overshoot. Click it, or drag the scrubber, to move the replay; **×10**, **×60** and **×300** play it back.
+
+Replay the no-DLM run to see the trip:
+
+<Screenshot name="site-replay" alt="Replay of the depot with no DLM at 10:18: Q1 is drawn open and sub-board SB1 with its ten chargers is greyed out; Q2 carries 192 % of its rating with its heat gauge at 94 % of trip; the decision panel shows an inferred step with 115 A over-allocated on Q2 L1; the timelines show Q1 dropping to zero after its trip." />
+
+When no reference controller runs, the decision panel is labelled **Inferred from profiles**. The server rebuilds each step from the charging limits the stations received and the current through every node, so an external DLM gets the same panel. Here the "DLM" is the built-in CSMS, which limits nothing, and the panel shows 115 A more promised on Q2 L1 than the breaker carries. Inferred steps exist for runs and sandboxes in the UI server; a CLI `--site-report` of an external DLM carries the time series and events but no steps.
+
+**New sandbox** on the Sites page builds a site from a `site` block and binds its chargers to UI stations. Plug EVs in on their station pages and watch the breaker, with whatever CSMS those stations point at.
+
+## The site report
+
+`--site-report out.json` writes everything the Site page replays: the description, nodes and leaves, the score, a columnar time series (at most one point per 10 s plus every event instant), trips and reclosures, violations with start, end, peak and the integral over the limit, the controller's allocation log (keyframes and deltas) and the Modbus meters it served. The depot's report with the reference controller is 3.8 MB; with no controller, 1.3 MB. A violation from the no-DLM report:
+
+```json
+{
+  "nodeId": "Q1",
+  "kind": "overcurrent",
+  "start": 1793384213154,
+  "limit": 125,
+  "peak": 288,
+  "integral": 35062.87775268555,
+  "unit": "A·s",
+  "end": 1793384833668.342
+}
+```
+
+Times are epoch milliseconds on the run clock. The series and the allocation log are each capped at 6 MB of JSON. Past the cap they thin out and keep trips, steps with a node over its limit, and the points nearest a limit, so a 26-hour run of 50 chargers still fits in about 8 MB.
+
+## What the reference controller does
+
+`controller reference [every 10s] [margin 5%] [min 6A]` runs wattsim's own DLM inside its CSMS, which is why a run with it ignores `csms` and `--csms`. Every 10 s, and on every transaction start or end, trip, reclose or node nearing its rating, it:
+
+1. takes each rated node's rating less the margin as a per-phase limit;
+2. subtracts the non-EV current through it, as a phasor, so PV makes room;
+3. shares the rest max-min fairly among the charging EVSEs, on the site phases each one really draws on;
+4. pauses the newest session when a share would fall below `min`;
+5. sends the shares as TxProfiles in A, decreases first, and increases only once the decreases are answered.
+
+A station gets a 0 A TxDefaultProfile when it boots, so a new session waits for its share instead of starting at full power.
+
+Its safety rule: an EVSE counts as controlled only while its station is connected, the CSMS knows its transaction, its last profile was accepted, and it draws no more than its limit plus 1 A. Every other EVSE is load the controller does not steer. It is reserved at the larger of its measured current and the most it may draw, on the phases it uses, and only what is left goes to the controlled ones. A node measured above its limit has its budget cut to what its controlled EVSEs draw now, minus the overshoot, whatever caused it. That is the "Not steered" bar in the decision panel.
+
+It is a baseline. It does not limit phase imbalance, it caps an EV that draws well below its share and gives the capacity to others (which lowers its Jain fairness), and it has no notion of departure times or prices. On a 24-hour version of the depot it delivers 1285 kWh with 641 profiles, a mean fairness of 0.934, and no node over its limit; with no controller the same day trips twice. Beat those numbers with yours.

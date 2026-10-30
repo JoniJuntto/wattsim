@@ -1,0 +1,172 @@
+---
+title: Electrical site model
+description: How @wattsim/grid computes currents, voltages, trips and violations, which standards its curves and tables come from, and what is still unverified.
+---
+
+`@wattsim/grid` is the model behind a scenario's `site` block and the Site page. It is pure: no sockets, no timers, and time comes in as a parameter, so the same site runs on the wall clock or a virtual one. This page says what it computes and where each number comes from. To use it, start with [Develop and test a DLM controller](/docs/guides/dlm); the syntax is in the [DSL reference](/docs/reference/dsl#site).
+
+## The site
+
+A site is a tree under a supply. Inner nodes are `transformer`, `fuse`, `breaker`, `board`, `cable` and `meter`; leaves are `evse`, `load`, `pv`, `battery` and `step` loads. From TypeScript:
+
+```ts
+import { siteBuilder } from '@wattsim/grid';
+
+const site = siteBuilder({ phases: 3, voltageV: 400, ratingA: 250 })
+  .transformer('T1', { kva: 400, ukPercent: 4 }, (t) =>
+    t.fuse('F0', { ratingA: 250 }, (f) =>
+      f.board('MDB', { ratingA: 250 }, (b) =>
+        b
+          .breaker('Q1', { type: 'mcb', curve: 'C', ratingA: 40 }, (q) =>
+            q.cable('W1', { mm2: 10, lengthM: 40, method: 'C' }, (w) => w.evse('CP-1', { phases: 'L2L3L1' })),
+          )
+          .load('HVAC', { model: { type: 'shape', preset: 'office', peakW: 40_000 } }),
+      ),
+    ),
+  )
+  .build();
+
+const state = site.evaluate(t, { ...site.loadDraws(t), 'CP-1': { amps: [32, 32, 32] } });
+const next = site.nextEvent(); // { t, type: 'trip', nodeId: 'Q1', cause: 'thermal' } or null
+```
+
+`buildSite(json)` takes the same description as plain JSON, which is what the DSL and the Site page's upload produce. It reports every problem with its path: an unknown phase, an EVSE wired to a phase its supply point lacks, a cable whose ampacity is below the rating of the device protecting it.
+
+## Phases and currents
+
+Currents are per-phase phasors at each load's power factor. They add up the tree, so PV export cancels import on the same phase. The neutral current is the phasor sum of the phase currents: 0 for a balanced load, 16 A for one single-phase 16 A load.
+
+An EVSE is wired by a rotation (`L1L2L3`, `L2L3L1`, `L3L1L2`, or an anti-cyclic order) or to one phase (`L2`). Its draw is given in its own phase order and mapped through the rotation, so a one-phase EV on an `L2L3L1` charger loads site phase L2. A draw is `{ amps: [...] }` per leaf phase, or `{ watts, pf }` split over the leaf's phases at nominal voltage.
+
+## Evaluation
+
+`site.evaluate(t, draws)` returns, for every node, the current and loading per phase, the neutral current, active and apparent power, voltage, and the thermal memory of each protective device.
+
+Between two calls the leaves hold their last draws, and each protective device integrates its curve over that interval exactly. A trip inside the interval happens at its own instant and removes the subtree's current from the devices upstream from that instant on. `site.nextEvent(t, draws)` solves the same thing forward in closed form without changing the site, so a virtual clock jumps straight to a trip or an automatic reclose instead of polling.
+
+The site runtime that binds stations to a site (`@wattsim/site`) evaluates on every change of draw, load or device state, coalesced per event-loop tick, and arms one timer at the next event or load-model step (10 s by default). When twenty stations take a new limit at one instant, only the last state of that instant counts for the score.
+
+## Voltage drop
+
+Voltage falls down the tree through the transformer's impedance (`uk`, `ur`) and through the phase and neutral impedance of each cable: the IEC 60228 resistance of the conductor at 20 °C and a reactance of 0.08 Ω/km. An imbalanced load drops the neutral too, so a single-phase load sees a lower voltage than a balanced one of the same power. A station's meter samples carry the voltage its leaf really gets, and the current in them is the power divided by that voltage.
+
+## Protection curves
+
+Each device has a curve `tripTime(I / In)` in seconds from cold, through its standard's characteristic points. Between points the curve is log-log linear. Below the first point it approaches the pickup smoothly, and above the last it continues as I²t = constant.
+
+| Device | Characteristic points | Standard |
+|---|---|---|
+| MCB and RCBO, curves B, C, D | 1.13 In does not trip within 1 h (2 h above 63 A); 1.45 In trips within that time; 2.55 In trips between 1 and 60 s (120 s above 32 A); magnetic release at 3 to 5, 5 to 10 and 10 to 20 In | IEC 60898-1 Table 7 |
+| gG fuse | Conventional non-fusing and fusing currents and times per rating band; pre-arcing curve through the gates Imin(10 s), Imax(5 s), Imin(0.1 s), Imax(0.1 s) | IEC 60269-1 Tables 2 and 3 in the 2024 numbering, Tables II and III in IEC 269-1:1986 |
+| MCCB | Ir with conventional currents 1.05 and 1.30 Ir; tr at 6 Ir (I²t); short-time Isd with tsd; instantaneous Ii; pickup tolerance ±20 % | IEC 60947-2 |
+
+An MCB's overload time never drops below 0.1 s, so the standard's test at the magnetic threshold holds at every band position. Only gG fuses (no aM) and MCB curves B, C and D (no K or Z) are modelled.
+
+### Tolerance band
+
+The standards give bands, not lines. Each device sits at a position in its band between 0 (fast edge, open) and 1 (slow edge), 0.5 being the median and the default. Currents are interpolated linearly across the band and times geometrically, so a median MCB trips in √60 ≈ 7.7 s at 2.55 In. `tolerance seed 42` in the site block draws each device's position from the seed and its id, independent of declaration order. `band 0.2` on a fuse or breaker fixes it.
+
+### Thermal memory
+
+The thermal release keeps a heat value between 0 and 1 and trips at 1. With m = I / In, k the curve's pickup, τ the cooling time constant and H = 0.8:
+
+- below the pickup, heat moves towards H (m/k)² with time constant τ. It settles there, proportional to I² and below H, so no constant current below the pickup ever trips. With no current this is plain exponential cooling.
+- at or above the pickup, heat climbs at whichever is faster: the same relaxation towards H, or a crawl rate chosen so a cold device trips exactly at its curve time.
+
+From cold this reproduces the curve point for point, which is what the tests check against the standards. A warm device trips sooner: a median C16 that has carried In for 2 h has heat 0.62, and then trips at 1.45 In in 811 s instead of 1255 s, at 2.55 In in 3.0 s instead of 7.7 s. A single pulse at 2.55 In shorter than the curve does not trip; repeated pulses can. Each step and the time to trip are closed-form, so `nextEvent` stays exact.
+
+No standard gives H or the cooling constants. They are assumptions: τ is 300 s for an MCB, 120 s for a gG fuse up to 63 A and 600 s above, and 900 s for an MCCB. `cooling 10min` on a fuse or breaker line overrides τ. Magnetic, short-time and instantaneous releases have no memory.
+
+### Trips and reclosing
+
+A breaker opens all poles together. A fuse blows per link, so a leaf can lose one phase: a three-phase charger behind it keeps charging on two, and a constant-power draw on the dead phase is lost, not moved. `site.supplyOf(leafId)` gives a leaf's live phases and voltages, or `null` when it is dead.
+
+`trip "Q1"` and `reclose "Q1"` in a scenario (`site.trip`, `site.reclose` in TypeScript) operate a device by hand; reclosing a fuse replaces it. `reclose 30s attempts 2` on a breaker line recloses it automatically after a protection trip.
+
+## Selectivity
+
+Two protective devices in series are selective when the downstream one always clears a fault before the upstream one operates. `site.check()` scans every such pair. It samples currents 1 % apart, plus every release threshold, from the downstream device's setting up to the prospective fault current Ik at that device, and bisects to the lowest current at which the upstream device may operate first. That current is the selectivity limit Is of IEC 60947-2 Annex A. Selectivity is total when Is ≥ Ik and partial otherwise, and `check()` warns for each partial pair. `site.selectivity()` returns every pair with Is and Ik.
+
+Ik is the phase voltage over the impedance of the source and of every transformer and cable above the device. It is a three-phase bolted fault where the device carries three phases, a phase-to-neutral loop otherwise. The source is `supply.faultCurrentA`, 6 kA when the supply gives none. Below a transformer with no supply fault level the grid above it counts as infinite, so Ik is the transformer's own short-circuit current. There is no voltage factor c.
+
+The comparison depends on the zone:
+
+- Below the downstream device's fault threshold (its magnetic slow edge, its gG Imax(0.1 s), or its MCCB Isd or Ii + 20 %), both devices are compared at their median curves. Comparing band edges here fails nearly every real pair, because the IEC 60898-1 band covers every product and calibration ambient while two breakers in one board share theirs.
+- At and above the threshold, the upstream device's fast edge is compared with the downstream device's slow edge.
+
+Results at 6 kA:
+
+| Upstream over downstream | Result |
+|---|---|
+| C40 over B32 | partial, Is 200 A (the C40 magnetic fast edge) |
+| C40 over C32 | partial, Is 300 A |
+| C20 over C16 | partial, Is 150 A |
+| gG 63 over gG 40, gG 100 over gG 63, gG 160 over gG 100 | total |
+| gG 63 over gG 50 | partial, Is 610 A |
+| gG 63 over B16 | partial, Is 1.42 kA, where the fuse melts within 10 ms |
+
+The model compares times only, not let-through energy, so a fuse over an MCB comes out less selective than manufacturers' energy-based tables say.
+
+`check()` also reports cable coordination, Ib ≤ In and I2 ≤ 1.45 Iz (IEC 60364-4-43 §433.1), cables with no protection, a device rated above what feeds it, and connected ratings above a node's rating.
+
+## Cable ampacity
+
+Ampacity Iz comes from IEC 60364-5-52 Annex B for PVC insulation: Table B.52.2 for 2 loaded conductors, Table B.52.4 for 3, and Tables B.52.10 (copper) and B.52.11 (aluminium) for method E. Installation methods A1, B1, B2, C and E are covered, copper from 1.5 to 240 mm² and aluminium from 16 to 240 mm². There is no grouping or ambient correction; `ampacity 80A` on the cable line overrides the table, and `r` and `x` override the impedance. A cable whose Iz is below the In of the device protecting it is a validation error, not a warning.
+
+## Violations
+
+Each node tracks these violations, each with start, end, peak and the integral over the limit (A·s, or V·s for voltage):
+
+| Kind (DSL word) | When |
+|---|---|
+| overcurrent (`overcurrent`) | Current over the node's rating on any phase |
+| cable ampacity (`cableAmpacity`) | A cable over its Iz |
+| transformer overload (`transformerOverload`) | A transformer over its rated current |
+| under- and overvoltage (`undervoltage`, `overvoltage`) | Voltage outside ±10 % of nominal (EN 50160) |
+| neutral (`neutral`) | Neutral current over its rating |
+| imbalance (`imbalance`) | Phase imbalance over a threshold: 16 A at the supply by default, set with `imbalance 20A` on a board or meter |
+
+`site.on(fn)` receives `trip`, `reclose`, `violation-start` and `violation-end` events, which also arrive in each returned state.
+
+## Loads and score
+
+Non-EV leaves have models: a constant load; a CSV profile (`timestamp,power[,pf]`, step or linear, looped daily or weekly); daily shapes (`office`, `residential`, `flat`); PV on a clear-sky bell with seeded cloud noise; a battery with state of charge, power limits and a setpoint; and an on/off step load. `site.loadDraws(t)` evaluates them all. A relative profile that does not loop starts with the site.
+
+`dlmScore(samples)` scores a run: peak utilisation per node, seconds and A·s over the limit, trips, energy per EVSE, unmet energy against what the EVs requested, the Jain fairness of the allocated power across active EVSEs, and the largest phase imbalance. The runtime accumulates the same definitions sample by sample, so memory does not grow with run length.
+
+## Simplifications
+
+- The model is quasi-static per phase at the fundamental frequency. There is no power-flow iteration.
+- A `{ watts, pf }` draw is converted to current at nominal voltage, not at the voltage the load sees. The supply is an ideal source at nominal voltage.
+- Cable resistance is the 20 °C value. The neutral path through a transformer has no impedance.
+- Harmonics, so also third-harmonic neutral current, and line-to-line loads are not modelled.
+- gG fuses below 16 A reuse the 16 A gate multiples, and ratings between table rows interpolate the multiples.
+- A station's meter samples derive the current from the delivered voltage, while the site carries the current the EVSE controls at nominal voltage. Behind a cable that drops 5 %, the sampled current is about 5 % above the current the site carries for that EVSE.
+
+## Sources and what is still unverified
+
+The cable and protection tables were first written from memory, then compared value by value with published reproductions, at least two per table where two could be found. That comparison corrected the gG gate table (Imin(0.1 s) from 40 A up and every column from 315 A up), which now follows the published rule that from 25 A up each Imin(0.1 s) equals the Imax(0.1 s) two ratings lower: 1.6:1 selectivity at 0.1 s.
+
+| Table | Checked against |
+|---|---|
+| gG gates | IS 13703 (Part 1):1993 Table III, the Indian adoption of IEC 269-1:1986 and the only source with every row from 16 to 800 A; Enel GSCL004 Rev. 0 (2016) Table 7; Mersen TM-104 EduPack (2012); search-engine extracts of a Schneider Electric gate table |
+| gG conventional currents and times from 16 A | Enel GSCL004 Table 6; ETI Polam fuse-link information Table 1; BEAMA guide to LV switch and fusegear |
+| Cable ampacity, every value | ABB SACE Electrical installation handbook Vol. 2 (2006) Table 8; TiSoft ElectricalDesign Tables B.52.2, B.52.4, B.52.10; Schneider Electric Electrical Installation Guide Fig. G20; ECalPro for copper |
+| IEC 60228 resistances | The standard's own preview, Nexans conductor classification (2021), Cembre catalogue |
+| IEC 60898-1 Table 7 points | Eaton Industrial Switchgear CA08103002Z-EN (2010); Schneider Acti 9 tripping curves |
+| IEC 60947-2 1.05 / 1.30 Ir | Schneider FAQ FA369327; Eaton IZM release manual |
+
+Where sources disagreed, for copper by method E with 3 loaded conductors at 70 and 120 mm², the code keeps the ABB and BS 7671 values (196 A and 276 A) over TiSoft's.
+
+Still unverified:
+
+- gG gates below 16 A. They are in IEC 60269-2 Table 102, which could not be read, and IEC 269-1:1986 marks them "under consideration". The model scales the 16 A multiples down.
+- gG Inf = 1.5 In below 16 A, which only a secondary web page states.
+- The 20 A and 32 A gate rows, which have one source (IS 13703).
+- Imin(10 s) of 4000 A for a 1000 A fuse, which only the Schneider extract gives.
+- Aluminium with 2 loaded conductors, methods B1 and B2, at 150 to 240 mm², which only TiSoft gives.
+- The MCCB conventional time of 2 h above 63 A, and the ±20 % tolerance on Isd and Ii. Eaton gives -0/+20 % for its IZM release and Schneider ±10 % for MicroLogic X.
+- The cable reactance of 0.08 Ω/km (IEC 60364-5-52 Annex G).
+- The thermal-memory constants H and τ, which no standard gives.
+
+The reasoning behind each choice is in [DECISIONS.md](https://github.com/JoniJuntto/wattsim/blob/main/DECISIONS.md), in the entries dated 2026-10-30.

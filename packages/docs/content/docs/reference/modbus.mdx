@@ -1,0 +1,137 @@
+---
+title: Emulated Modbus meters
+description: The Modbus TCP server behind a site's meters, its SDM630, EM24 and generic register maps, word order, exceptions, and what a dead meter does.
+---
+
+Local DLM controllers read the site and sub-board meters over Modbus TCP. `@wattsim/modbus` serves emulated meters whose registers carry live values from the [electrical model](/docs/reference/electrical-model), so you can point a controller at wattsim instead of a switchboard. Every register of every map is listed in [Modbus register maps](/docs/reference/modbus-maps).
+
+## Where meters come from
+
+In a scenario, every `meter` node with a `port` is a Modbus meter:
+
+```
+meter "M0" sdm630 port 1502 unit 1 { ... }
+meter "M1" em24 port 1502 unit 2 { ... }
+```
+
+The model word picks the register map (`sdm630`, `em24` or `generic`, default `generic`), and `unit` the unit id (default 1). Meters on the same port share one server and answer by unit id. A `wattsim run` listens on 127.0.0.1 and logs each meter:
+
+```
+# site: meter M0 (sdm630) on modbus 127.0.0.1:1502 unit 1
+# site: meter M1 (em24) on modbus 127.0.0.1:1502 unit 2
+```
+
+Runs started from the UI put their meters on free ports, so two runs of one scenario can go at once. Setting `WATTSIM_MODBUS_FREE_PORTS=1` does the same for `wattsim run`; the tests use it to run `examples/dlm-depot.ws`, which pins port 1502.
+
+A meter reads the node it sits on: per-phase line-to-neutral and line-to-line voltage, current, neutral current, active, apparent and reactive power, power factor, frequency, import and export energy in total and per phase (integrated from the evaluated states over the run), kvarh, and the protective device at the meter point (the nearest one upstream, else the first downstream): whether it is closed, its rating, and its heat as a fraction of the trip threshold. Power is positive for import. The vendor maps have no registers for the device state; the generic map has all of it.
+
+## Without a site
+
+The meter CLI serves fixed values, which is enough to write and test a meter driver:
+
+```sh
+# a demo meter: everything not given is derived (230 V, 50 Hz, P = V·I·pf, ...)
+bun packages/modbus/src/cli.ts serve --map sdm630 --unit 1 --port 1502 --const currentL1=12.5,currentL2=8,importKwh=1234.5
+# read it back, decoded with the same map, or as raw registers
+bun packages/modbus/src/cli.ts read --port 1502 --unit 1 --map sdm630
+bun packages/modbus/src/cli.ts read --port 1502 --unit 1 --fc 4 --address 6 --count 2
+# print a register map
+bun packages/modbus/src/cli.ts map em24
+```
+
+`--unit 1,2,3` serves several unit ids on one port, and `--per-port` starts one server per unit id on consecutive ports, since controllers differ in which they expect. `--host 0.0.0.0` listens on every interface. The full usage is in the [CLI reference](/docs/reference/cli#modbus-meter-cli).
+
+From TypeScript:
+
+```ts
+import { liveDevice, type MeterReading, sdm630, startModbus } from '@wattsim/modbus';
+
+let main: Partial<MeterReading> = { currentL1: 16 }; // update it from your own model
+const server = startModbus({ port: 502, devices: { 1: liveDevice(sdm630, () => main) } });
+// server.port, server.stop()
+```
+
+A device is a register map plus `read(quantity)`, called while a request is answered. The quantities (`voltageL1`, `currentL2`, `powerTotal`, `importKwh`, `breakerClosed`, ...) are the `MeterReading` type, the contract with the electrical model. `liveDevice` fills what you leave out consistently: 230 V, 50 Hz and pf 1 by default, line-to-line voltages and the neutral current from a symmetric 120° system. A throwing `read` answers exception 04.
+
+## The maps
+
+| Map | Meter | Encoding | Function codes | Source |
+|---|---|---|---|---|
+| `sdm630` | Eastron SDM630-Modbus V2 | IEEE float32, most significant register first. A request may not split a float (exception 02) and reads at most 80 registers | 03, 04, 16 | Eastron "SDM630Modbus Smart Meter Modbus Protocol Implementation V1.8" (2019) |
+| `em24` | Carlo Gavazzi EM24-DIN E1 (Ethernet), EM24DINAV23XE1X | INT32, least significant word first, scaled: V×10, A×1000, W×10, kWh×10; PF and Hz as INT16 / UINT16 | 03 (same as 04), 06 | Carlo Gavazzi "EM24_E1 (Ethernet) Communication Protocol" v0 rev 1.2 (2018) |
+| `generic` | wattsim's own | float32, most significant register first | 03 (same as 04), 06, 16 | This page |
+
+The SDM630's own user manual (2016, V1.3) has no register table, so the map comes from the protocol document. The serial EM24 has a different map; the Ethernet E1 is the one a Modbus TCP controller reads.
+
+Word order is where meter drivers usually break, so here is the same 100 A read from each kind of meter, raw:
+
+| Meter | Registers | Words | Decoded |
+|---|---|---|---|
+| SDM630, Phase 1 current | 0x0006, 0x0007 | `0x42C8 0x0000` | float32 0x42C80000 = 100.0 A |
+| EM24, A L1 | 0x000C, 0x000D | `0x86A0 0x0001` | INT32 0x000186A0 = 100000, ÷1000 = 100.000 A |
+
+The EM24 row is a real read from a depot run (`bun packages/modbus/src/cli.ts read --port 1502 --unit 2 --fc 4 --address 12 --count 2`).
+
+The vendor maps cover the documented live values, the energy registers and the holding registers: for the SDM630 the demand period, system type, network node and the rest; for the EM24 the password, measuring system, interval, tariff, reset commands, serial number and identification code. Their ranges and defaults are the documents'. Demand, THD, hour counters and tariff meters read 0, since wattsim does not model them.
+
+The generic map has every `MeterReading` quantity as a float32 at two registers each, in this order from address 0, so one 80-register read gets everything:
+
+| Address | Quantities |
+|---|---|
+| 0x00-0x0A | `voltageL1`, `voltageL2`, `voltageL3`, `voltageL1L2`, `voltageL2L3`, `voltageL3L1` (V) |
+| 0x0C-0x12 | `currentL1`, `currentL2`, `currentL3`, `currentN` (A) |
+| 0x14-0x1A | `powerL1`, `powerL2`, `powerL3`, `powerTotal` (W, import positive) |
+| 0x1C-0x22 | `apparentPowerL1` ... `apparentPowerTotal` (VA) |
+| 0x24-0x2A | `reactivePowerL1` ... `reactivePowerTotal` (var, inductive positive) |
+| 0x2C-0x32 | `powerFactorL1` ... `powerFactorTotal` |
+| 0x34 | `frequency` (Hz) |
+| 0x36-0x44 | `importKwh`, `exportKwh`, `importKwhL1`-`L3`, `exportKwhL1`-`L3` (kWh) |
+| 0x46-0x48 | `importKvarh`, `exportKvarh` |
+| 0x4A-0x4E | `breakerClosed` (1 closed, 0 open), `breakerRatingA` (A), `breakerThermal` (fraction of the trip threshold) |
+| 0xFE | map version (uint16, 1) |
+| 0x100, 0x102 | scratch registers for write tests: uint16 (FC 06 / 16) and float32 (FC 16) |
+
+New quantities go at the end of the generic map, and the version register at 0xFE changes when they do.
+
+## Protocol behaviour
+
+The server is written from the Modbus Application Protocol v1.1b3 and Messaging on TCP/IP v1.0b specifications, on `Bun.listen`, with no Modbus dependency. It handles many concurrent clients, pipelined requests and requests split across TCP segments.
+
+| Situation | Answer |
+|---|---|
+| A function code the meter does not support | Exception 01 (Illegal Function) |
+| An address outside the documented ranges | Exception 02 (Illegal Data Address) |
+| Part of a 32-bit value on an SDM630, or a one-register read of a float | Exception 02 |
+| A quantity outside the limits, or a malformed PDU | Exception 03 (Illegal Data Value) |
+| A value source or write handler that throws | Exception 04 (Server Device Failure) |
+| A register inside a documented table that no parameter fills | 0, as meters do for parameters that do not apply to the wiring |
+| A write | All or nothing: the whole request is checked before anything is stored |
+| An unknown unit id | Exception 0Bh (Gateway Target Device Failed to Respond), as a TCP gateway answers for a missing serial device; nothing at all with `unknownUnit: 'ignore'` |
+| Unit id 0 or 255 with a single device on the port | That device, since TCP clients use either to mean "the device at this address" |
+| An MBAP length outside 2 to 254 | The connection closes, because the byte stream cannot be resynchronised |
+| A non-zero protocol id | Dropped without an answer |
+| A client whose unread answers pass 1 MB | Disconnected |
+
+Emulator choices where the documents are silent:
+
+- The SDM630 phase angle is atan2(Q, P) in degrees. The EM24 PF sign is the reactive sign (lead negative), as its document defines it.
+- The SDM630's single-register "instrument type specific value" is not emulated, since the document does not give it. Its password lock is not modelled, so protected settings are writable without the password. Its default pulse divisor is undocumented and reads 0.
+- The EM24 identification code at 000Bh answers only a one-register read. CT and VT ratios are read-only, as on the AV2 model.
+- Serial numbers are made up from the unit id: SDM630 26000000 + unit, EM24 `WATTSIM` + six digits. EM24 firmware registers read the document's example, 101Eh.
+
+## A dead meter
+
+Site meters take their power from the lines they measure. When a device upstream trips and the meter's node loses its supply, the meter goes dark and answers nothing, so a controller reading it times out. From a depot run with no DLM, polling the sub-board EM24 every two seconds:
+
+```
+20:30:15 12	0xe200	57856 13	0x0004	4
+20:30:19 timeout waiting for transaction 1
+```
+
+The meter read 320 A on L1 until breaker Q1 opened, and nothing after. A controller has to treat that silence as a dead board, not as zero load.
+
+From TypeScript, `startSite({ ..., modbus: { meters, deadMeter: 'zero' } })` keeps a dead meter answering instead, with 0 V, 0 A, 0 Hz and power factor 0. Scenarios always use the silent behaviour.
+
+## Interoperability
+
+`bun test packages/modbus` includes a test that reads and writes every map with [pymodbus](https://github.com/pymodbus-dev/pymodbus). It runs when `$WATTSIM_PYTHON` (default `python3`) can import pymodbus, and is skipped otherwise.

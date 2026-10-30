@@ -17,6 +17,9 @@ The packages are Bun workspaces under `packages/`. They are not published to npm
 | `@wattsim/csms` | The [CSMS simulator](/docs/reference/csms) and conformance checker |
 | `@wattsim/pki` | The [test certificate authority](/docs/reference/security): certificates, CSR signing, OCSP |
 | `@wattsim/trace` | [Open OCPP Trace](/docs/reference/trace) reading and writing, the recording proxy, replay, trace-to-scenario |
+| `@wattsim/grid` | The [electrical site model](/docs/reference/electrical-model): the site tree, protection curves, thermal memory, selectivity, violations, load models and the DLM score. Pure, with time passed in |
+| `@wattsim/site` | Binds a grid site to stations on a clock: supply and power loss, the reference DLM controller, Modbus meters, the score and the site report (`startSite`) |
+| `@wattsim/modbus` | [Emulated Modbus TCP meters](/docs/reference/modbus): the server, a client, and the SDM630, EM24 and generic register maps |
 | `@wattsim/server` | The local UI server: HTTP API and browser stream over the core, the built-in test CSMS, session export |
 | `@wattsim/mcp` | The [MCP server](/docs/guides/mcp) |
 | `wattsim` | The CLI |

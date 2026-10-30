@@ -6,6 +6,7 @@
  * - `reference/cli.md` from the citty command definitions in `packages/cli/src/commands`
  * - `reference/conformance-rules.md` from `RULES` in `@wattsim/csms`
  * - `reference/mcp-tools.md` from the tools the wattsim MCP server registers
+ * - `reference/modbus-maps.md` from the register maps in `@wattsim/modbus`
  *
  * The outputs are gitignored (`packages/docs/.gitignore`) and rewritten on every `dev` and `build`.
  */
@@ -30,10 +31,13 @@ function cell(text: string): string {
   return text.replace(/\s*\n\s*/g, ' ').replace(/\|/g, '\\|');
 }
 
-/** `text` ending in a full stop, so appended notes read as separate sentences. */
+/**
+ * `text` ending in a full stop, so appended notes read as separate sentences. A closing parenthesis ends a sentence
+ * only when a full stop precedes it: "URL (overrides the csms line)" still gets one.
+ */
 function sentence(text: string): string {
   const t = text.trim();
-  return t === '' || /[.!?)]$/.test(t) ? t : `${t}.`;
+  return t === '' || /[.!?]\)?$/.test(t) ? t : `${t}.`;
 }
 
 async function write(name: string, body: string): Promise<void> {
@@ -182,6 +186,7 @@ async function generateCli(): Promise<void> {
   );
   const sections: string[] = [];
   for (const name of names) sections.push(await renderCommand([name], commands.get(name) as CommandDef, 2));
+  sections.push(await modbusCliSection());
   const md = [
     frontmatter('CLI reference', 'Every wattsim command and flag, generated from the CLI’s own definitions.'),
     '<!-- Generated from packages/cli/src/commands by packages/docs/scripts/generate.ts. -->',
@@ -193,6 +198,117 @@ async function generateCli(): Promise<void> {
     ...sections,
   ].join('\n');
   await write('cli.md', md);
+}
+
+/**
+ * The emulated-meter CLI (`packages/modbus/src/cli.ts`) parses its own flags with `node:util` and runs on import, so
+ * its usage text is read from the source, as the entry point's subcommand order is above.
+ */
+async function modbusCliSection(): Promise<string> {
+  const file = 'packages/modbus/src/cli.ts';
+  const text = await Bun.file(join(REPO_ROOT, file)).text();
+  const usage = /const USAGE = `([^`]*)`/.exec(text)?.[1];
+  if (!usage) throw new Error(`generate: no USAGE text in ${file}`);
+  return [
+    '## Modbus meter CLI',
+    '',
+    `Emulated Modbus TCP meters without a site, for trying a controller against fixed values or reading a meter back. It is not a \`wattsim\` subcommand yet: run it as \`bun ${file} <command>\`. Its usage text:`,
+    '',
+    '```text',
+    usage.replaceAll('cli.ts', `bun ${file}`).trim(),
+    '```',
+    '',
+    'See [Emulated Modbus meters](/docs/reference/modbus) for what the meters do and [Modbus register maps](/docs/reference/modbus-maps) for every register.',
+    '',
+  ].join('\n');
+}
+
+// ---- Modbus register maps ------------------------------------------------------------------------------------
+
+type ModbusEntry = {
+  address: number;
+  type: string;
+  name: string;
+  unit?: string;
+  scale?: number;
+  value?: unknown;
+  key?: string;
+  writable?: { initial: unknown; command?: boolean };
+  alone?: boolean;
+};
+type ModbusMap = {
+  id: string;
+  title: string;
+  source: string;
+  wordOrder: 'msw' | 'lsw';
+  functions: readonly number[];
+  input: readonly ModbusEntry[];
+  holding: readonly ModbusEntry[];
+  maxRead?: number;
+  aligned?: boolean;
+};
+
+const hex = (n: number) => `0x${n.toString(16).toUpperCase().padStart(4, '0')}`;
+
+/** Where a register's value comes from, in words. */
+function registerSource(e: ModbusEntry): string {
+  if (e.writable) {
+    const initial = typeof e.writable.initial === 'number' ? `, default ${e.writable.initial}` : '';
+    return e.writable.command ? `command \`${e.key}\`` : `writable \`${e.key}\`${initial}`;
+  }
+  if (typeof e.value === 'string') return `\`${e.value}\``;
+  if (typeof e.value === 'number') return `constant ${e.value}`;
+  if (typeof e.value === 'function') return 'derived';
+  return '0';
+}
+
+function registerTable(entries: readonly ModbusEntry[]): string[] {
+  const rows = [...entries]
+    .sort((a, b) => a.address - b.address)
+    .map(
+      (e) =>
+        `| ${hex(e.address)} | ${e.address} | ${e.type} | ${e.scale ? `×${e.scale}` : ''} | ${cell(e.name)}${e.alone ? ' (one-register read only)' : ''} | ${cell(e.unit ?? '')} | ${registerSource(e)} |`,
+    );
+  return ['| Address | Dec | Type | Scale | Name | Unit | Value |', '|---|---|---|---|---|---|---|', ...rows, ''];
+}
+
+async function generateModbusMaps(): Promise<void> {
+  // Imported by path: the docs package does not depend on @wattsim/modbus, which has no dependencies of its own.
+  const mod: { MAPS: Record<string, ModbusMap> } = await import(join(REPO_ROOT, 'packages/modbus/src/index.ts'));
+  const maps = Object.values(mod.MAPS);
+  const out: string[] = [
+    frontmatter(
+      'Modbus register maps',
+      'Every register of the emulated SDM630, EM24 and generic meters, generated from @wattsim/modbus.',
+    ),
+    '<!-- Generated from the maps in packages/modbus/src/maps by packages/docs/scripts/generate.ts. -->',
+    '',
+    `The ${maps.length} register maps the emulated meters serve, generated from the same tables the server answers from. \`bun packages/modbus/src/cli.ts map <id>\` prints one in the terminal. [Emulated Modbus meters](/docs/reference/modbus) explains how the meters behave.`,
+    '',
+    'Addresses are protocol (0-based) addresses, as the vendor documents print them in hex. **Value** says where a register reads from: a `MeterReading` quantity from the electrical model, a constant, a value derived from several quantities, or a holding register you can write (with its value before any write). A register that a documented table covers but no parameter fills reads 0.',
+    '',
+    '| Map | Meter | Word order | Function codes | Most registers per read | Source |',
+    '|---|---|---|---|---|---|',
+  ];
+  for (const m of maps) {
+    const order = m.wordOrder === 'msw' ? 'most significant first' : 'least significant first';
+    const fcs = m.functions.map((f) => String(f).padStart(2, '0')).join(', ');
+    out.push(`| \`${m.id}\` | ${cell(m.title)} | ${order} | ${fcs} | ${m.maxRead ?? 125} | ${cell(m.source)} |`);
+  }
+  out.push('');
+  for (const m of maps) {
+    out.push(`## \`${m.id}\``, '', `${sentence(m.title)} ${sentence(`Source: ${m.source}`)}`);
+    if (m.aligned)
+      out.push('', 'A read or write that covers part of a 32-bit value answers exception 02 (Illegal Data Address).');
+    out.push('');
+    if (m.input === m.holding) {
+      out.push('FC 03 and FC 04 read the same registers.', '', ...registerTable(m.input));
+    } else {
+      out.push('### Input registers (FC 04)', '', ...registerTable(m.input));
+      out.push('### Holding registers (FC 03, written with FC 06 / 16)', '', ...registerTable(m.holding));
+    }
+  }
+  await write('modbus-maps.md', out.join('\n'));
 }
 
 // ---- Conformance rules ---------------------------------------------------------------------------------------
@@ -290,6 +406,6 @@ async function generateMcpTools(): Promise<void> {
   await write('mcp-tools.md', out.join('\n'));
 }
 
-await Promise.all([generateDsl(), generateCli(), generateRules(), generateMcpTools()]);
+await Promise.all([generateDsl(), generateCli(), generateRules(), generateMcpTools(), generateModbusMaps()]);
 // Command modules may leave handles open (servers are only imported, never started); end explicitly.
 process.exit(0);

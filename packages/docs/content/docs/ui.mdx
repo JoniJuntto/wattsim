@@ -1,21 +1,34 @@
 ---
 title: UI tour
-description: The local browser UI for clicking through charging sessions, reading the message log and exporting what you did as a scenario.
+description: The local browser UI for clicking through charging sessions, charting telemetry, running scenarios, reading CSMS findings and watching an electrical site.
 ---
 
 ```sh
 wattsim ui
 ```
 
-One local process serves the UI on `http://127.0.0.1:7700` and opens a browser. There is no login: it binds to the loopback interface by default (`--host` changes that, `--port` the port, `--no-open` skips the browser). Everything you do drives real simulated stations over real WebSockets, the same ones a scenario uses.
+One local process serves the UI on `http://127.0.0.1:7700` and opens a browser. There is no login: it binds to the loopback interface by default (`--host` changes that, `--port` the port, `--no-open` skips the browser). Everything you do drives real simulated stations over real WebSockets, the same ones a scenario uses. Run history, saved scenarios, recordings and CSMS reports go into SQLite under `--data`, default `~/.wattsim`.
 
-The screenshots on this page follow the site's light or dark theme; the UI has both, plus a "follow the system" setting in the top bar.
+The screenshots on this page follow the site's light or dark theme; the UI has both, plus a "follow the system" setting in the top bar. The top bar has four pages: **Fleet**, **Scenarios**, **Sites** and **CSMS**.
+
+Every chart in the UI has a table icon in its corner that shows the same numbers as a table, for reading exact values or copying them.
 
 ## Fleet
 
-<Screenshot name="fleet" alt="The fleet page: six stations with their EVSE status chips, power, connection state and CSMS host, above a bar showing how many connectors are in each status." />
+<Screenshot name="fleet" alt="The fleet page: a count of stations, connections, EVSEs and kilowatts, a bar of connectors by status, the Fleet over time charts, and a card per station with its EVSE status chips, power, connection state and CSMS host." />
 
-The fleet page lists every station. The bar at the top counts connectors by status across the fleet, with the legend under it. Each card shows the station's OCPP version, one chip per EVSE colored by status, the power it is delivering, its connection state, the CSMS host and, when there are any, its chaos rules and violations.
+The fleet page lists every station. The bar at the top counts connectors by status across the fleet, with the legend under it. Each card shows the station's OCPP version, one chip per EVSE coloured by status, the power it is delivering, its connection state, the CSMS host and, when there are any, its chaos rules and violations.
+
+**Fleet over time** charts the same fleet over the last 5 minutes, hour, 6 hours, or since the server started:
+
+<Screenshot name="fleet-charts" alt="Fleet over time: a fleet power line, a stacked area of EVSEs by status as a share of the fleet, a bar chart of the stations that delivered the most energy, and a heatmap with one row per station and one column per time bin coloured by power." />
+
+- **Fleet power** is the total power delivered.
+- **EVSEs by status** stacks the share of EVSEs in each connector status, so a wave of Faulted or SuspendedEVSE stands out at once.
+- **Stations over time** is a heatmap with a row per station and a column per time bin. **Power** colours each cell by the mean power in the bin, **Status** by the connector status. It draws only the visible rows, so it stays fast with a thousand stations.
+- **Most energy delivered** ranks the stations by energy in the window.
+
+Hovering one time chart moves the crosshair in the others.
 
 **Add station** opens a form for one station or a numbered range (`CP-{i}` from 1 to 50, say), with the CSMS URL, OCPP version, number of EVSEs, vendor and model, heartbeat and meter intervals, voltage, phases, maximum current and Basic auth credentials. Switch on the built-in test CSMS to try everything with no CSMS of your own: it accepts every request.
 
@@ -27,10 +40,26 @@ A station page has the controls on the left and the message log on the right.
 
 Each EVSE card shows the connector status and transaction id, the power being delivered against what is offered and the smart-charging limit in force, the energy of the session and a power sparkline. Below it is the EV: plug one in with a battery size, state of charge, target and maximum power, then authorize a tag and start a transaction. **Ready to charge**, **Suspend** and **Resume** drive the EV side (IEC 61851 states), so you can produce SuspendedEV while the CSMS thinks the session is running. **Set status** forces a connector status, Faulted for example, and sends the StatusNotification.
 
-The header has **Disconnect**, **Boot** and **Heartbeat** for the connection itself. Further down the page:
+The header has **Disconnect**, **Boot** and **Heartbeat** for the connection itself, and **Faults** for behavioural faults: a boot loop, a soft or hard reset, a faulted EVSE, a meter that runs backwards or resets. Further down the page:
 
 - **Send message** sends any OCPP CALL. Pick the action, edit the JSON payload, and it is checked against the schema for the station's version as you type.
 - **Chaos rules** adds fault injection rules: drop, delay, duplicate or corrupt frames, answer with a wrong message id or a CALLERROR, or swallow a CALL so it is never answered. A rule can match every frame, only the n-th, every n-th or a random share, in one direction or both, for one action or all.
+
+## Telemetry
+
+**Telemetry** in the station header swaps the controls for charts, one panel per EVSE:
+
+<Screenshot name="telemetry" alt="The Telemetry tab for EVSE 1: power against the offered power and the smart-charging limit under a connector status band, current and voltage per phase, state of charge against an 80 % target, energy delivered in the window, and the composite charging schedule for the next 24 hours; the message log with its analytics strip is on the right." />
+
+The panels share one time axis and one crosshair, so hovering the power step at 19:55 shows the current, voltage and state of charge at that moment too:
+
+- **Power** against the power on offer and the smart-charging limit, under a band of connector statuses.
+- **Current per phase** and **Voltage per phase**. On an electrical site the voltage is what the station's leaf really gets, so a long cable or an imbalanced board shows here.
+- **State of charge** with the EV's target.
+- **Energy delivered** in the window, and the running cost on a 2.1 station with a tariff.
+- **Charging schedule, next 24 h**: the composite limit of the installed profiles against the EVSE's rating, the answer GetCompositeSchedule would give.
+
+The window buttons pick 5 minutes, an hour, 6 hours or everything. The charts sample at every meter value and every state change.
 
 ## Message log
 
@@ -40,10 +69,65 @@ The log is drawn as a sequence diagram. Each row is one exchange: the gutter has
 
 Next to the gutter are the action, the request payload, the reply (when it says something worth reading, such as `{"status":"Rejected"}`) and the round-trip time. Rows with a problem are highlighted: a CALLERROR such as `NotImplemented`, a schema violation in either payload, a malformed frame, or a reply that answers no CALL. **Problems** filters the log down to those rows. The search box matches action names, message ids and payload text, and the direction buttons show only what the station sent or only what the CSMS sent. Click a row to see both frames in full, with violations pointing at the offending field.
 
+**Analytics** above the log charts the whole log:
+
+<Screenshot name="log-analytics" alt="The analytics strip above a message log: messages per 10 minutes as stacked columns by action, mostly Heartbeat and MeterValues, with a burst at 20:00." />
+
+- **Rate**: messages per time bin, stacked by action.
+- **Response time**: the CSMS's latency per action as a dot and whisker on a log axis, so one slow action among fast ones is visible.
+- **Problems**: CALLERRORs and violations over time.
+
+Clicking a column, a latency row or a problem bar filters the log below to those messages.
+
+## Scenarios
+
+<Screenshot name="scenarios" alt="The Scenarios page: run history on the left, a .ws scenario in the editor in the middle, and on the right a passed run of 20 stations with its counts, download buttons and a timeline of each station's connector status and transaction." />
+
+The **Scenarios** page is a `.ws` editor with highlighting, completion and the checker's diagnostics as you type; the line under the editor shows the checker's verdict, or what is wrong and where. **Format** rewrites it as `wattsim fmt` would, and **Save** keeps it under **Saved**.
+
+**Run** executes the scenario in the server process. Pick the built-in test CSMS or a URL, and a virtual clock (a 30 minute charge takes milliseconds) or real time (cancellable, with a speed factor). Per-station results, asserts and events appear on the right while it runs. Every run stays in **History** with its counts, and the run panel offers its trace (`.oot.jsonl`), its JUnit XML and, against the test CSMS, the CSMS conformance report. **Timeline** draws each station as a swimlane on the run's own clock: connector status per EVSE, transactions, and marks for failed asserts, violations and failures.
+
+A scenario from the browser may `import` quirk files and read load profiles from `<data>/scenarios` and nowhere else, and may not `use plugin`. The server also caps fleet size and concurrent runs; see [server mode](/docs/guides/load-test#run-it-as-a-shared-server).
+
+## CSMS
+
+<Screenshot name="csms" alt="The CSMS page: counts of connected stations, findings, errors and warnings; findings per 10 minutes stacked by rule; a heatmap of findings by station and rule; the error and warning split; the findings grouped by rule with spec references; and the sessions table." />
+
+The **CSMS** page shows what the built-in test CSMS sees. Point real chargers at it to check them, or let simulated stations use it.
+
+- **Findings over time** stacks the conformance findings per time bin, by rule or by severity.
+- **Findings by station and rule** is a heatmap of counts, so a rule that only one station breaks stands out from a rule they all break.
+- **Severity in this window** splits errors from warnings.
+
+Clicking a column, a cell or a rule filters the finding list below. **Findings by rule** groups findings with the rule's text and spec references for 1.6, 2.0.1 and 2.1, and each finding links to the frame it is about, on the station's page or, for stations the UI did not create, in the CSMS-side log. **Sessions** lists each connected station with its version, boot state, connectors, transactions and error and warning counts.
+
+**JSON** and **JUnit** download the report; **Save report** keeps it in the data directory. The report is also saved when the CSMS stops.
+
+## Sites
+
+The **Sites** page lists electrical sites: a scenario run's site while it runs and afterwards, sandboxes, and uploaded `--site-report` files. **Upload a site report** opens a report from `wattsim run --site-report` for replay. **New sandbox** builds a site from a `site` block and binds its chargers to UI stations, creating them if needed, so you can plug EVs in by hand and watch the breaker.
+
+A site page shows how electricity flows through the site and how its DLM decided:
+
+<Screenshot name="site-live" alt="A live site under the reference DLM: the score strip, the single-line diagram, the decision panel and per-node timelines." />
+
+- The **score strip** reads the run in one sentence, then the figures: the main device's peak, trips, time over a limit, energy delivered and still to deliver, fairness and imbalance.
+- The **single-line diagram** draws the tree from the grid connection to the chargers. Line weight is current, colour is loading against the rating, and moving dashes show power, upwards for export. Each device has a heat gauge towards its trip. **All**, **L1**, **L2**, **L3** and **N** show one phase. Click a node for its history against its rating, its violations, and **Trip**, **Reclose** or a setpoint.
+- The **decision panel** explains each control step as a waterfall from a node's rating to the EVSE allocations, then compares each allocation with what the EV drew. For an external DLM it says **Inferred from profiles** and rebuilds the step from the limits the stations received.
+- The **timelines** show each constrained node's rating, the current that flowed and what the DLM planned, with a tick per step that sent profiles.
+
+<Screenshot name="site-decision" alt="The decision panel for grid connection L1: rating, margin, other loads, a not-steered reservation for CP-7, the budget for EVs, the allocation per EVSE and the measured current." />
+
+A finished run replays: the scrubber, or a click on a timeline, moves the diagram, the decision panel and the timelines together, and **×10**, **×60** and **×300** play it.
+
+<Screenshot name="site-replay" alt="Replay of a run with no DLM: breaker Q1 is open and its sub-board greyed out, Q2 is at 192 % of its rating with its heat gauge at 94 %." />
+
+[Develop and test a DLM controller](/docs/guides/dlm) walks through all of this with the depot example.
+
 ## Export session
 
-**Export session** in the top bar downloads everything you clicked, across all stations, as a `session.ws` scenario. Run it with `wattsim run session.ws` to repeat the session, or use it as the starting point of a test: add `expect` lines, multiply a station into a fleet, add chaos rules.
+**Export** in the top bar downloads everything you clicked, across all stations, as a `session.ws` scenario. Run it with `wattsim run session.ws` to repeat the session, or use it as the starting point of a test: add `expect` lines, multiply a station into a fleet, add chaos rules. The same menu exports the frames as an Open OCPP Trace.
 
 ## Same server, other clients
 
-The UI talks to a local HTTP API and one WebSocket that streams station state. The [MCP server](/docs/guides/mcp) drives the same API, so stations an agent creates show up in the UI while it works, and you can click along.
+The UI talks to a local HTTP API and one WebSocket that streams station, CSMS and site state. The [MCP server](/docs/guides/mcp) drives the same API, so stations an agent creates show up in the UI while it works, and you can click along.

@@ -112,4 +112,74 @@ Keep the seed fixed in CI so a failure reproduces locally with the same command.
 
 ## Larger fleets
 
-The design target is around ten thousand idle stations per process. There is no coordinator: to go beyond one process, split the range (`1..5000` in one scenario file, `5001..10000` in another) and run the instances side by side, on one machine or several.
+One process holds 10 000 idle stations. Past that, run the same scenario file in several processes and give each one part of the fleet. There is no coordinator, so the processes can run on one machine or several:
+
+```sh
+# four processes, each runs a quarter of the fleet and serves its own /metrics on 9100..9103
+for i in 0 1 2 3; do
+  wattsim run fleet.ws --csms ws://your-csms:9000/ocpp --quiet --connect-rate 500 --shard $i/4 --metrics-port-base 9100 &
+done
+wait
+```
+
+- `--shard i/n` keeps the stations whose position in the expanded fleet, counted from 0 in file order across every station block, is i modulo n.
+- `--ids a..b` keeps the template stations whose loop variable is in a..b, so `--ids 1..5000` and `--ids 5001..10000` split `station "CP-{i}" for i in 1..10000` by identity. A station block without `for` has no loop variable and is skipped. Given both flags, a process keeps what both select.
+- `--metrics-port-base 9100` serves `/metrics` on 9100 plus the shard index, one port per process. It replaces `--metrics`.
+- `--connect-rate 500` opens at most 500 connections per second. Unpaced, 10 000 sockets open in under a second but stall the event loop for about 250 ms, and a CSMS with a small listen backlog may refuse some of them. On a `--virtual` run the pacing uses the virtual clock, so the run stays deterministic.
+
+Every process expands the whole fleet and checks it for duplicate names before it keeps its part, so each one reports the same scenario errors. Random draws are keyed by station name and `--seed`, never by position, so a station takes the same `choose` branch and session length whichever process runs it. A `barrier` counts the stations of its own process only. A shard that selects nothing exits 0 at once, so a fixed process count works for any fleet size.
+
+### Measured
+
+`bun scripts/perf.ts matrix --md` produced this table on an Apple M4 Pro (14 cores, 24 GB), macOS 27.0.1, Bun 1.4.4. Each row is a fresh process running real stations with real WebSockets against `@wattsim/csms` in a second process, so the numbers are the simulator's alone. The 1.6 stations use a 60 s heartbeat and a 60 s meter interval and connect at 1000 per second. Wall-clock rows wait 60 s after boot and then measure for 120 s.
+
+| stations | driver | clock | charging | RSS | RSS/station | heap/station | connect + boot | lag p50 / p99 | heartbeat jitter p50 / p99 / max | msgs/s |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1000 | Station | wall | 0 | 69 MB | 9.7 KB | 3.9 KB | 1.0 s | 2.0 / 2.4 ms | 0.1 / 1.8 / 1.8 ms | 33 |
+| 3000 | Station | wall | 0 | 90 MB | 10.3 KB | 4.3 KB | 3.0 s | 2.0 / 2.4 ms | 0.1 / 1.3 / 3.0 ms | 100 |
+| 5000 | Station | wall | 0 | 109 MB | 10.2 KB | 4.4 KB | 5.0 s | 2.0 / 2.5 ms | 0.1 / 2.4 / 7.8 ms | 167 |
+| 10000 | Station | wall | 0 | 168 MB | 11.1 KB | 4.5 KB | 10.0 s | 1.9 / 3.3 ms | 0.1 / 3.9 / 7.2 ms | 333 |
+| 10000 | Station | wall | 1000 | 174 MB | 11.9 KB | 4.6 KB | 10.0 s | 1.8 / 2.9 ms | 0.1 / 3.9 / 12 ms | 367 |
+| 10000 | scenario | wall | 1000 | 295 MB | 24.1 KB | 13.2 KB | 10.0 s | 1.7 / 3.6 ms | 0.1 / 4.0 / 21 ms | 367 |
+| 10000 | Station | virtual 1 h in 11.2 s | 0 | 198 MB | 14.2 KB | 5.0 KB | 10.0 s | 0.0 / 1.2 ms | n/a | 107018 |
+| 10000 | Station | virtual 1 h in 11.8 s | 1000 | 213 MB | 15.7 KB | 6.2 KB | 10.0 s | 0.0 / 1.4 ms | n/a | 111686 |
+
+- **Lag** is how late a 10 ms interval timer fires: the event loop's responsiveness.
+- **Heartbeat jitter** is the difference between the actual and the nominal gap between a station's consecutive Heartbeats.
+- **Per-station** figures are (after − before) / stations, where before is the process with the CSMS up and no stations.
+- The **scenario** row is the same fleet driven through the scenario interpreter, as `wattsim run` drives it.
+
+`bun scripts/perf.ts run --stations 10000 [--charging 0.1] [--mode virtual] [--via scenario] [--connect-rate 0]` measures one row on your machine; the comment at the top of `scripts/perf.ts` lists every flag.
+
+The interpreter keeps the last 2048 frames of each station whose script contains an `expect`, because `expect` matches against them. A fleet without assertions keeps none: 2000 scenario-driven stations after 6 virtual hours hold 17 KB of heap each, against 205 KB each when every station kept its window. A fleet that asserts on every station grows towards that window, which is another reason to shard it.
+
+### What the machine needs
+
+- **File descriptors.** One per station in the simulator, and one more per station in a CSMS on the same machine. Bun raises the soft limit to the hard limit at start; `scripts/perf.ts` checks the limit and prints the `ulimit -n` to run when it is too low. macOS caps a process at `kern.maxfilesperproc` (92160 on the machine above).
+- **Ephemeral ports.** One per station towards one CSMS address. macOS has 16384 (49152 to 65535); `sudo sysctl net.inet.ip.portrange.first=10000` widens the range. A closed socket's port waits 2 × MSL (30 s on macOS) before reuse, so repeated runs back to back can run out.
+- **Listen backlog.** `kern.ipc.somaxconn` is 128 on macOS. A CSMS that cannot accept a burst of connects refuses some; `--connect-rate` avoids the burst.
+
+## Run it as a shared server
+
+`wattsim ui` can run where a whole team, or a CI job, reaches it. Anyone who can reach it can run scenarios on that machine, so it sets limits that `wattsim run` does not:
+
+| Flag | Default | Limits |
+|---|---|---|
+| `--max-stations <n>` | 10000 | Stations a scenario from the browser may expand to. The editor flags a bigger fleet at its `for` range. Shard bigger fleets with `wattsim run --shard` |
+| `--max-runs <n>` | 4 | Scenario runs at once. One more gets HTTP 429 |
+| `--max-run-time <duration>` | `1h` | How long a real-time run may take, e.g. `30m` or `8h`; `0` for no limit. A virtual run stops after 24 h of virtual time anyway |
+
+Browser scenarios may `import` quirk files and read load profiles from `<data>/scenarios` only. An import that leaves that folder, through `..`, an absolute path or a symlink, is an error and the file is not read. `use plugin` is refused, because it would execute a module from the server's disk; run those scenarios with `wattsim run`.
+
+The API refuses requests that a web page on another origin could send. A POST, PUT, PATCH or DELETE, or the stream's WebSocket upgrade, whose `Origin` header is not the server's own gets 403, and a request body must be `content-type: application/json` (else 415). Scripts that send no `Origin`, such as curl or `wattsim mcp --attach`, are unaffected, but curl needs `-H 'content-type: application/json'` with `-d`. To use the API from a page on another origin, list it with `--allow-origin http://host:port`, comma-separated for several. On a loopback address (the default) the server also refuses any request whose `Host` is not a loopback name, which stops DNS rebinding.
+
+### Docker
+
+```sh
+docker build -t wattsim .
+docker run -p 7700:7700 -p 7701:7701 -v wattsim-data:/data wattsim
+```
+
+The image runs `wattsim ui --host 0.0.0.0 --no-open --data /data --csms-port 7701` as the unprivileged `bun` user, with a health check on `/api/health`. Point external charge points at `ws://<host>:7701/<id>` and the test CSMS checks them; the findings appear on the CSMS page.
+
+There is no authentication. Bound to 0.0.0.0 the server cannot know the names it is reached under, so the loopback `Host` check is off in the container. Before you expose it beyond your machine, put it behind a reverse proxy that adds authentication and keeps the `Host` header, so the server's own-origin check still matches. The origin check compares host and port, not the scheme, so a proxy that terminates TLS works.
