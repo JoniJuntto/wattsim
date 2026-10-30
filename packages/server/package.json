@@ -1,0 +1,24 @@
+{
+  "name": "@wattsim/server",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@wattsim/core": "workspace:*",
+    "@wattsim/protocol": "workspace:*",
+    "@wattsim/scenario": "workspace:*",
+    "elysia": "1.4.30",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "@types/bun": "catalog:"
+  }
+}
