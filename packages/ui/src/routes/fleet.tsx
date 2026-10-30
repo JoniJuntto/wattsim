@@ -163,7 +163,7 @@ function EmptyFleet({ onAdd }: { onAdd: () => void }) {
         <EmptyDescription>
           Add a station and point it at your CSMS's OCPP WebSocket URL. No CSMS at hand? Switch on "Use built-in test
           CSMS" in the dialog: wattsim starts one in this process that accepts every request, so you can try plugging
-          in, charging and fault injection right away.
+          in, charging and fault injection right away. Its conformance findings are on the CSMS page.
         </EmptyDescription>
       </EmptyHeader>
       <EmptyContent>

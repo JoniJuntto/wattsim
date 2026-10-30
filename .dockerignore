@@ -1,0 +1,15 @@
+# Build context for the wattsim image: sources and lockfile only. Installs and builds happen inside the image.
+**/node_modules
+**/dist
+**/generated
+**/.turbo
+**/.next
+**/.source
+**/*.log
+**/.DS_Store
+**/*.vsix
+.git
+.github
+.claude
+interop
+docs

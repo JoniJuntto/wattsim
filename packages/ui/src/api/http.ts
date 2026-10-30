@@ -2,11 +2,21 @@ import type {
   ActionResult,
   ChaosRuleBody,
   ChaosRuleView,
+  ConformanceViolation,
   CreateStationBody,
   CreateStationsBulkBody,
+  CsmsReportSummary,
+  CsmsView,
   FrameEvent,
   Health,
   Meta,
+  RecordingView,
+  RunDetail,
+  RunSummary,
+  SavedScenario,
+  SavedScenarioSummary,
+  ScenarioCheck,
+  StartRunBody,
   StationAction,
   StationView,
   ValidateBody,
@@ -18,6 +28,8 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    /** The parsed error body, e.g. `{ error, diagnostics }` for a scenario that does not parse. */
+    readonly body?: unknown,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -46,13 +58,14 @@ async function requestWithStatus<T>(
   }
   if (!res.ok) {
     let message = `${method} ${path} failed with HTTP ${res.status}`;
+    let data: { error?: unknown } | undefined;
     try {
-      const data = (await res.json()) as { error?: unknown };
+      data = (await res.json()) as { error?: unknown };
       if (typeof data.error === 'string') message = data.error;
     } catch {
       // Not JSON: keep the generic message.
     }
-    throw new ApiError(res.status, message);
+    throw new ApiError(res.status, message, data);
   }
   if (res.status === 204) return { status: 204, data: undefined as T };
   const type = res.headers.get('content-type') ?? '';
@@ -84,4 +97,45 @@ export const api = {
   startLoopback: () => request<{ url: string }>('POST', '/api/loopback'),
   stopLoopback: () => request<void>('DELETE', '/api/loopback'),
   session: () => request<string>('GET', '/api/session'),
+
+  checkScenario: (source: string) => request<ScenarioCheck>('POST', '/api/scenario/check', { source }),
+  formatScenario: (source: string) => request<{ source: string }>('POST', '/api/scenario/format', { source }),
+  scenarios: () => request<SavedScenarioSummary[]>('GET', '/api/scenarios'),
+  scenario: (id: string) => request<SavedScenario>('GET', `/api/scenarios/${encodeURIComponent(id)}`),
+  createScenario: (body: { name: string; source: string }) => request<SavedScenario>('POST', '/api/scenarios', body),
+  updateScenario: (id: string, body: { name: string; source: string }) =>
+    request<SavedScenario>('PUT', `/api/scenarios/${encodeURIComponent(id)}`, body),
+  deleteScenario: (id: string) => request<void>('DELETE', `/api/scenarios/${encodeURIComponent(id)}`),
+
+  runs: () => request<RunSummary[]>('GET', '/api/runs'),
+  run: (id: string) => request<RunDetail>('GET', `/api/runs/${encodeURIComponent(id)}`),
+  startRun: (body: StartRunBody) => request<RunSummary>('POST', '/api/runs', body),
+  cancelRun: (id: string) => request<RunDetail>('POST', `/api/runs/${encodeURIComponent(id)}/cancel`),
+  deleteRun: (id: string) => request<void>('DELETE', `/api/runs/${encodeURIComponent(id)}`),
+
+  recordings: () => request<RecordingView[]>('GET', '/api/recordings'),
+  saveRecording: (body: { name?: string; stationId?: string }) =>
+    request<RecordingView>('POST', '/api/recordings', body),
+  deleteRecording: (id: string) => request<void>('DELETE', `/api/recordings/${encodeURIComponent(id)}`),
+
+  csms: () => request<CsmsView>('GET', '/api/csms'),
+  csmsViolations: (limit = 2000) => request<ConformanceViolation[]>('GET', `/api/csms/violations?limit=${limit}`),
+  csmsFrames: (identity: string) =>
+    request<FrameEvent[]>('GET', `/api/csms/sessions/${encodeURIComponent(identity)}/frames?limit=500`),
+  csmsReports: () => request<CsmsReportSummary[]>('GET', '/api/csms/reports'),
+  saveCsmsReport: (name?: string) =>
+    request<CsmsReportSummary>('POST', '/api/csms/reports', name === undefined ? {} : { name }),
+  deleteCsmsReport: (id: string) => request<void>('DELETE', `/api/csms/reports/${encodeURIComponent(id)}`),
+};
+
+/** Plain links for downloads (the server sets `content-disposition`). */
+export const downloads = {
+  stationTrace: (id: string) => `${station(id)}/trace`,
+  sessionTrace: '/api/session/trace',
+  runTrace: (id: string) => `/api/runs/${encodeURIComponent(id)}/trace`,
+  runJUnit: (id: string) => `/api/runs/${encodeURIComponent(id)}/junit`,
+  recording: (id: string) => `/api/recordings/${encodeURIComponent(id)}`,
+  csmsReport: (format: 'json' | 'junit') => `/api/csms/report?format=${format}`,
+  savedCsmsReport: (id: string, format: 'json' | 'junit') =>
+    `/api/csms/reports/${encodeURIComponent(id)}?format=${format}`,
 };

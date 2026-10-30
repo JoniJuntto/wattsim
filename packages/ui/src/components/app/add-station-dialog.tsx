@@ -293,7 +293,7 @@ export function AddStationDialog({ open, onOpenChange }: { open: boolean; onOpen
                 onCheckedChange={(v) => setPrefs({ ...prefs, loopback: v })}
               />
               <FieldLabel htmlFor={f('loopback')} className="font-normal">
-                Use built-in test CSMS (accepts every request)
+                Use built-in test CSMS (answers every request, checks conformance)
               </FieldLabel>
             </Field>
 

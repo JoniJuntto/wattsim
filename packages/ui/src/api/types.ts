@@ -66,7 +66,8 @@ export type Violation = {
 
 // HTTP
 
-export type Health = { ok: true; version: string };
+/** `persistent`: server mode with a data directory (history survives a restart). */
+export type Health = { ok: true; version: string; persistent?: boolean };
 export type Meta = {
   versions: OcppVersion[];
   actions: Record<OcppVersion, { stationSends: string[]; csmsSends: string[] }>;
@@ -134,4 +135,139 @@ export type StreamMessage =
   | { type: 'removed'; id: string }
   | { type: 'frame'; frame: FrameEvent }
   | { type: 'violation'; stationId: string; violation: Violation }
-  | { type: 'error'; stationId: string; message: string };
+  | { type: 'error'; stationId: string; message: string }
+  | { type: 'run'; run: RunSummary }
+  | { type: 'run.event'; runId: string; event: RunEventView }
+  | { type: 'csms'; csms: CsmsSummary }
+  | { type: 'csms.session'; session: CsmsSessionView }
+  | { type: 'csms.violation'; violation: ConformanceViolation };
+
+// ---- server mode (milestone 4), mirrors packages/server/src/types.ts ---------------------------------------------
+
+export type ScenarioDiagnostic = {
+  severity: 'error' | 'warning';
+  message: string;
+  /** 1-based; `endCol` exclusive. */
+  line: number;
+  col: number;
+  endLine: number;
+  endCol: number;
+};
+export type ScenarioCheck = { ok: boolean; stations: number; diagnostics: ScenarioDiagnostic[] };
+export type SavedScenario = { id: string; name: string; source: string; createdAt: string; updatedAt: string };
+export type SavedScenarioSummary = Omit<SavedScenario, 'source'>;
+
+export type RunStatus = 'running' | 'passed' | 'failed' | 'cancelled' | 'error';
+export type RunSummary = {
+  id: string;
+  name: string;
+  scenarioId?: string;
+  status: RunStatus;
+  target: 'loopback' | 'url';
+  csmsUrl: string;
+  virtual: boolean;
+  speed?: number;
+  seed?: number;
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  stations: { started: number; passed: number; failed: number };
+  asserts: { passed: number; failed: number };
+  violations: number;
+  frames: number;
+  error?: string;
+  recordingId?: string;
+};
+export type RunEventView =
+  | { type: 'log'; at: string; station?: string; message: string }
+  | { type: 'assert'; at: string; station: string; ok: boolean; expect: string; message?: string }
+  | { type: 'violation'; at: string; station: string; violation: Violation }
+  | { type: 'station'; at: string; station: string; status: 'started' | 'finished' | 'failed'; error?: string };
+export type RunStationResult = {
+  name: string;
+  ok: boolean;
+  asserts: { ok: boolean; expect: string; message?: string }[];
+  error?: string;
+  durationMs: number;
+};
+export type RunResultView = { ok: boolean; stations: RunStationResult[]; violations: Violation[]; durationMs: number };
+export type RunDetail = RunSummary & {
+  source: string;
+  result?: RunResultView;
+  events: RunEventView[];
+  eventsDropped: number;
+};
+export type StartRunBody = {
+  source: string;
+  name?: string;
+  scenarioId?: string;
+  target?: 'loopback' | 'url';
+  csmsUrl?: string;
+  virtual?: boolean;
+  speed?: number;
+  seed?: number;
+};
+
+export type RecordingView = {
+  id: string;
+  kind: 'session' | 'run';
+  name: string;
+  runId?: string;
+  createdAt: string;
+  entries: number;
+  skipped: number;
+  bytes: number;
+};
+
+/** `@wattsim/csms` types, copied so the UI has no runtime dependency on it. */
+export type Severity = 'error' | 'warning';
+export type Tally = { total: number; errors: number; warnings: number };
+export type ConformanceViolation = {
+  identity: string;
+  version: OcppVersion;
+  rule: string;
+  severity: Severity;
+  message: string;
+  specRef: string;
+  /** OCPP-J message id of the offending frame. */
+  frameId?: string;
+  action?: string;
+  /** Epoch ms on the CSMS clock. */
+  at: number;
+};
+export type CsmsSessionView = {
+  identity: string;
+  version: OcppVersion;
+  connected: boolean;
+  connectedAt?: string;
+  disconnectedAt?: string;
+  connections: number;
+  boot: 'None' | 'Accepted' | 'Pending' | 'Rejected';
+  heartbeatIntervalMs?: number;
+  lastHeartbeatAt?: string;
+  statuses: Record<string, string>;
+  activeTransactions: string[];
+  findings: Tally;
+  uiStation: boolean;
+};
+export type CsmsRuleTally = Tally & { summary: string; severity: Severity };
+export type CsmsSummary = {
+  running: boolean;
+  url?: string;
+  startedAt?: string;
+  sessions: number;
+  connected: number;
+  totals: Tally;
+  byRule: Record<string, CsmsRuleTally>;
+};
+export type CsmsView = { summary: CsmsSummary; sessions: CsmsSessionView[] };
+export type CsmsReportSummary = {
+  id: string;
+  name: string;
+  createdAt: string;
+  csmsUrl: string;
+  stations: number;
+  total: number;
+  errors: number;
+  warnings: number;
+};

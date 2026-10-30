@@ -1,9 +1,18 @@
-import { createRootRoute, createRoute, createRouter, Link, Outlet } from '@tanstack/react-router';
+import { createRootRoute, createRoute, createRouter, Link, lazyRouteComponent, Outlet } from '@tanstack/react-router';
 import { TopBar } from '@/components/app/top-bar';
 import { Button } from '@/components/ui/button';
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty';
+import { CsmsPage } from '@/routes/csms';
+import { CsmsSessionPage } from '@/routes/csms-session';
 import { FleetPage } from '@/routes/fleet';
 import { StationPage } from '@/routes/station';
+
+const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
+/** `?frame=<OCPP message id>`: open the exchange with that frame in the log. */
+const frameSearch = (s: Record<string, unknown>): { frame?: string } => {
+  const frame = str(s.frame);
+  return frame === undefined ? {} : { frame };
+};
 
 const rootRoute = createRootRoute({
   component: () => (
@@ -32,10 +41,36 @@ const fleetRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', com
 export const stationRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: 'stations/$stationId',
+  validateSearch: frameSearch,
   component: StationPage,
 });
 
-const routeTree = rootRoute.addChildren([fleetRoute, stationRoute]);
+export const scenariosRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: 'scenarios',
+  /** `scenario`: the saved scenario in the editor; `run`: the run shown on the right. */
+  validateSearch: (s: Record<string, unknown>): { scenario?: string; run?: string } => {
+    const out: { scenario?: string; run?: string } = {};
+    const scenario = str(s.scenario);
+    const run = str(s.run);
+    if (scenario !== undefined) out.scenario = scenario;
+    if (run !== undefined) out.run = run;
+    return out;
+  },
+  // CodeMirror lives in its own chunk, loaded with the page.
+  component: lazyRouteComponent(() => import('@/routes/scenarios'), 'ScenariosPage'),
+});
+
+export const csmsRoute = createRoute({ getParentRoute: () => rootRoute, path: 'csms', component: CsmsPage });
+
+export const csmsSessionRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: 'csms/sessions/$identity',
+  validateSearch: frameSearch,
+  component: CsmsSessionPage,
+});
+
+const routeTree = rootRoute.addChildren([fleetRoute, stationRoute, scenariosRoute, csmsRoute, csmsSessionRoute]);
 
 export const router = createRouter({ routeTree, defaultPreload: 'intent' });
 

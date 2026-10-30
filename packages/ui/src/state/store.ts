@@ -1,4 +1,15 @@
-import type { FrameEvent, StationView, StreamMessage, Violation } from '../api/types';
+import type {
+  ConformanceViolation,
+  CsmsSessionView,
+  CsmsSummary,
+  CsmsView,
+  FrameEvent,
+  RunEventView,
+  RunSummary,
+  StationView,
+  StreamMessage,
+  Violation,
+} from '../api/types';
 
 /** Per-station frame list cap; matches the server's ring buffer. */
 export const FRAME_CAP = 2000;
@@ -15,6 +26,10 @@ export const POWER_WINDOW_MS = 5 * 60_000;
 export const POWER_SAMPLE_MS = 1000;
 export const VIOLATION_CAP = 500;
 export const ERROR_CAP = 50;
+/** `run.event` messages kept per run; the server streams at most 200 per run. */
+export const RUN_EVENT_CAP = 200;
+/** Test-CSMS findings kept in the browser. */
+export const CSMS_VIOLATION_CAP = 2000;
 /** How many recent frames a new violation is matched against. */
 const VIOLATION_LOOKBACK = 50;
 
@@ -35,12 +50,24 @@ export type State = {
   /** Incremented on every snapshot, so views can refetch history after a reconnect. */
   snapshots: number;
   nextKey: number;
+  /** Scenario runs by id: from `GET /api/runs` and `run` messages. */
+  runs: Record<string, RunSummary>;
+  /** Streamed events of runs started while this page was open, oldest first. */
+  runEvents: Record<string, RunEventView[]>;
+  /** The built-in test CSMS; null until loaded. */
+  csms: CsmsSummary | null;
+  csmsSessions: Record<string, CsmsSessionView>;
+  /** Its findings, oldest first. */
+  csmsViolations: ConformanceViolation[];
 };
 
 export type StoreAction =
   | StreamMessage
   | { type: 'frames-loaded'; stationId: string; frames: FrameEvent[] }
-  | { type: 'errors-cleared'; stationId: string };
+  | { type: 'errors-cleared'; stationId: string }
+  | { type: 'runs-loaded'; runs: RunSummary[] }
+  | { type: 'run-removed'; id: string }
+  | { type: 'csms-loaded'; view: CsmsView; violations?: ConformanceViolation[] };
 
 export const initialState: State = {
   stations: {},
@@ -51,7 +78,21 @@ export const initialState: State = {
   errors: {},
   snapshots: 0,
   nextKey: 1,
+  runs: {},
+  runEvents: {},
+  csms: null,
+  csmsSessions: {},
+  csmsViolations: [],
 };
+
+/**
+ * A different test CSMS instance (restarted, or stopped): its sessions and findings are not ours any more. The first
+ * summary keeps findings streamed before it.
+ */
+function csmsSummary(state: State, csms: CsmsSummary): State {
+  if (state.csms === null || (state.csms.startedAt === csms.startedAt && csms.running)) return { ...state, csms };
+  return { ...state, csms, csmsSessions: {}, csmsViolations: [] };
+}
 
 function without<T>(record: Record<string, T>, key: string): Record<string, T> {
   if (!(key in record)) return record;
@@ -180,6 +221,42 @@ export function reduce(state: State, action: StoreAction, now: number): State {
       };
     case 'errors-cleared':
       return { ...state, errors: without(state.errors, action.stationId) };
+    case 'runs-loaded': {
+      const runs: Record<string, RunSummary> = {};
+      // A run that ended while the list was in flight keeps its newer streamed state.
+      for (const r of action.runs) runs[r.id] = state.runs[r.id]?.status !== 'running' ? (state.runs[r.id] ?? r) : r;
+      for (const r of Object.values(state.runs)) if (!(r.id in runs) && r.status === 'running') runs[r.id] = r;
+      return { ...state, runs };
+    }
+    case 'run-removed':
+      return { ...state, runs: without(state.runs, action.id), runEvents: without(state.runEvents, action.id) };
+    case 'run':
+      return { ...state, runs: { ...state.runs, [action.run.id]: action.run } };
+    case 'run.event': {
+      const list = [...(state.runEvents[action.runId] ?? []), action.event].slice(-RUN_EVENT_CAP);
+      return { ...state, runEvents: { ...state.runEvents, [action.runId]: list } };
+    }
+    case 'csms':
+      return csmsSummary(state, action.csms);
+    case 'csms.session': {
+      if (!state.csms?.running) return state;
+      return { ...state, csmsSessions: { ...state.csmsSessions, [action.session.identity]: action.session } };
+    }
+    case 'csms.violation':
+      return {
+        ...state,
+        csmsViolations: [...state.csmsViolations, action.violation].slice(-CSMS_VIOLATION_CAP),
+      };
+    case 'csms-loaded': {
+      const next = csmsSummary(state, action.view.summary);
+      const sessions: Record<string, CsmsSessionView> = {};
+      for (const s of action.view.sessions) sessions[s.identity] = s;
+      return {
+        ...next,
+        csmsSessions: sessions,
+        csmsViolations: action.violations ? action.violations.slice(-CSMS_VIOLATION_CAP) : next.csmsViolations,
+      };
+    }
     case 'violation':
       return addViolation(state, action.stationId, action.violation, now);
     case 'error': {

@@ -35,7 +35,11 @@ async function act(id: string, body: unknown): Promise<{ status: number; json: R
 
 describe('meta', () => {
   test('health and meta', async () => {
-    expect(await (await api.get('/api/health')).json()).toEqual({ ok: true, version: expect.any(String) });
+    expect(await (await api.get('/api/health')).json()).toEqual({
+      ok: true,
+      version: expect.any(String),
+      persistent: false,
+    });
     const meta = (await (await api.get('/api/meta')).json()) as {
       versions: string[];
       actions: Record<string, { stationSends: string[]; csmsSends: string[] }>;

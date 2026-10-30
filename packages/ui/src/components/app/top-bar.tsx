@@ -1,22 +1,36 @@
 import { Link, useMatchRoute } from '@tanstack/react-router';
-import { DownloadIcon, MonitorIcon, MoonIcon, SunIcon } from 'lucide-react';
+import {
+  ChevronDownIcon,
+  DownloadIcon,
+  FileCodeIcon,
+  FileDownIcon,
+  ListIcon,
+  MonitorIcon,
+  MoonIcon,
+  SaveIcon,
+  SunIcon,
+} from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { downloads } from '@/api/http';
 import { useExportSession } from '@/api/queries';
+import { useSaveRecording } from '@/api/server-mode';
+import { RecordingsDialog } from '@/components/app/recordings-dialog';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
+  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Spinner } from '@/components/ui/spinner';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { type ThemePreference, useTheme } from '@/hooks/use-theme';
 import { statusStyle } from '@/lib/status';
-import { cn } from '@/lib/utils';
 import { useStreamStatus } from '@/state/live';
 
 function Wordmark() {
@@ -104,30 +118,77 @@ function ThemeMenu() {
   );
 }
 
-export function TopBar() {
+const NAV = [
+  { to: '/', label: 'Fleet', exact: true },
+  { to: '/scenarios', label: 'Scenarios', exact: false },
+  { to: '/csms', label: 'CSMS', exact: false },
+] as const;
+
+function ExportMenu() {
   const exportSession = useExportSession();
+  const saveRecording = useSaveRecording();
+  const [recordingsOpen, setRecordingsOpen] = useState(false);
+  const busy = exportSession.isPending || saveRecording.isPending;
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="outline" size="sm" aria-label="Export">
+            {busy ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
+            <span className="hidden sm:inline">Export</span>
+            <ChevronDownIcon data-icon="inline-end" className="hidden sm:block" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-64">
+          <DropdownMenuGroup>
+            <DropdownMenuLabel>This session</DropdownMenuLabel>
+            <DropdownMenuItem onSelect={() => exportSession.mutate()}>
+              <FileCodeIcon />
+              Scenario (session.ws)
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <a href={downloads.sessionTrace} download>
+                <FileDownIcon />
+                Trace (session.oot.jsonl)
+              </a>
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => saveRecording.mutate({})}>
+              <SaveIcon />
+              Save as recording
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => setRecordingsOpen(true)}>
+            <ListIcon />
+            Recordings…
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <RecordingsDialog open={recordingsOpen} onOpenChange={setRecordingsOpen} />
+    </>
+  );
+}
+
+export function TopBar() {
   const matchRoute = useMatchRoute();
   const station = matchRoute({ to: '/stations/$stationId' });
   return (
     <header className="sticky top-0 z-20 flex h-11 shrink-0 items-center gap-3 border-b bg-panel px-3 sm:px-4">
       <Wordmark />
-      <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-sm">
-        <span aria-hidden="true" className="text-muted-foreground">
-          /
-        </span>
-        <Link
-          to="/"
-          className={cn(
-            'rounded-sm px-1 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring',
-            station ? 'text-muted-foreground' : 'font-medium text-foreground',
-          )}
-          activeOptions={{ exact: true }}
-        >
-          Fleet
-        </Link>
+      <nav aria-label="Sections" className="flex min-w-0 items-center gap-0.5 text-sm">
+        {NAV.map((n) => (
+          <Link
+            key={n.to}
+            to={n.to}
+            activeOptions={{ exact: n.exact, includeSearch: false }}
+            className="rounded-sm px-2 py-1 text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring data-[status=active]:bg-accent data-[status=active]:font-medium data-[status=active]:text-foreground"
+          >
+            {n.label}
+          </Link>
+        ))}
         {station && (
           <>
-            <span aria-hidden="true" className="text-muted-foreground">
+            <span aria-hidden="true" className="px-0.5 text-muted-foreground">
               /
             </span>
             <span className="truncate font-medium">{station.stationId}</span>
@@ -136,25 +197,7 @@ export function TopBar() {
       </nav>
       <div className="ml-auto flex items-center gap-2">
         <StreamIndicator />
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => exportSession.mutate()}
-              disabled={exportSession.isPending}
-            >
-              {exportSession.isPending ? (
-                <Spinner data-icon="inline-start" />
-              ) : (
-                <DownloadIcon data-icon="inline-start" />
-              )}
-              <span className="hidden sm:inline">Export session</span>
-              <span className="sm:hidden">Export</span>
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>Download everything done in this UI as a session.ws scenario</TooltipContent>
-        </Tooltip>
+        <ExportMenu />
         <ThemeMenu />
       </div>
     </header>

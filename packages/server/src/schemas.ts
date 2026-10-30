@@ -134,3 +134,44 @@ export function parseAction(body: unknown): ActionBody {
   const schema = ACTION_SCHEMAS[type as ActionType] as z.ZodType<unknown>;
   return { type, ...(parseBody(schema, body) as object) } as ActionBody;
 }
+
+// ---- server mode ------------------------------------------------------------------------------------------------
+
+const MAX_SOURCE = 1_000_000;
+const source = z.string().max(MAX_SOURCE, `must be at most ${MAX_SOURCE} characters`);
+const wsUrl = z.string().regex(/^wss?:\/\/\S+$/, 'must be a ws:// or wss:// URL');
+
+export const scenarioSource = z.object({ source });
+
+export const saveScenario = z.object({ name: z.string().trim().min(1).max(200), source });
+
+export const startRun = z
+  .object({
+    source,
+    name: z.string().trim().min(1).max(200).optional(),
+    scenarioId: z.string().min(1).optional(),
+    /** Default `loopback`: the built-in test CSMS. */
+    target: z.enum(['loopback', 'url']).default('loopback'),
+    /** For `url`; without it the scenario's own `csms` line is used. */
+    csmsUrl: wsUrl.optional(),
+    /** Default true. */
+    virtual: z.boolean().default(true),
+    speed: z.number().positive().max(1000).optional(),
+    seed: z.number().int().optional(),
+  })
+  .refine((r) => r.target === 'url' || r.csmsUrl === undefined, {
+    message: "csmsUrl is only allowed with target 'url'",
+    path: ['csmsUrl'],
+  })
+  .refine((r) => !r.virtual || r.speed === undefined, {
+    message: 'speed applies to real-time runs only',
+    path: ['speed'],
+  });
+
+export const saveRecording = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  /** One station's frames; default every station. */
+  stationId: z.string().min(1).optional(),
+});
+
+export const saveReport = z.object({ name: z.string().trim().min(1).max(200).optional() });

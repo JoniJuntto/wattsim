@@ -1,5 +1,14 @@
-import { Link, useNavigate, useParams } from '@tanstack/react-router';
-import { HeartPulseIcon, PlugIcon, PowerIcon, PowerOffIcon, Trash2Icon, TriangleAlertIcon } from 'lucide-react';
+import { Link, useNavigate, useParams, useSearch } from '@tanstack/react-router';
+import {
+  FileDownIcon,
+  HeartPulseIcon,
+  PlugIcon,
+  PowerIcon,
+  PowerOffIcon,
+  Trash2Icon,
+  TriangleAlertIcon,
+} from 'lucide-react';
+import { downloads } from '@/api/http';
 import { useDeleteStation, useFrameHistory, useStationAction } from '@/api/queries';
 import type { StationAction, StationView } from '@/api/types';
 import { ChaosPanel } from '@/components/app/chaos-panel';
@@ -24,6 +33,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from '
 import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useLive, useStore } from '@/state/live';
 import type { StationError } from '@/state/store';
 
@@ -69,6 +79,16 @@ function Header({ station }: { station: StationView }) {
         {linkUp ? btn('disconnect', 'Disconnect', PowerOffIcon, false) : btn('connect', 'Connect', PowerIcon, false)}
         {btn('boot', 'Boot', PlugIcon, !online)}
         {btn('heartbeat', 'Heartbeat', HeartPulseIcon, !online || !station.booted)}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button asChild variant="ghost" size="icon-sm">
+              <a href={downloads.stationTrace(station.id)} download aria-label="Download trace">
+                <FileDownIcon />
+              </a>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Download this station's frames as an Open OCPP Trace (.oot.jsonl)</TooltipContent>
+        </Tooltip>
         <AlertDialog>
           <AlertDialogTrigger asChild>
             <Button variant="ghost" size="icon-sm" aria-label={`Remove ${station.id}`}>
@@ -131,7 +151,7 @@ function StationErrors({ stationId }: { stationId: string }) {
   );
 }
 
-function StationBody({ station }: { station: StationView }) {
+function StationBody({ station, focusFrameId }: { station: StationView; focusFrameId?: string }) {
   useFrameHistory(station.id);
   const action = useStationAction(station.id);
   const run = (a: StationAction) => action.mutate(a);
@@ -164,13 +184,14 @@ function StationBody({ station }: { station: StationView }) {
           </TabsContent>
         </Tabs>
       </div>
-      <MessageLog stationId={station.id} className="h-[70dvh] lg:h-auto lg:min-h-0" />
+      <MessageLog stationId={station.id} focusFrameId={focusFrameId} className="h-[70dvh] lg:h-auto lg:min-h-0" />
     </div>
   );
 }
 
 export function StationPage() {
   const { stationId } = useParams({ from: '/stations/$stationId' });
+  const { frame } = useSearch({ from: '/stations/$stationId' });
   const station = useLive((s) => s.stations[stationId]);
   const snapshots = useLive((s) => s.snapshots);
 
@@ -202,7 +223,7 @@ export function StationPage() {
     <main className="flex min-h-0 flex-1 flex-col lg:h-[calc(100dvh-2.75rem)] lg:flex-none">
       <Header station={station} />
       <StationErrors stationId={station.id} />
-      <StationBody station={station} />
+      <StationBody station={station} focusFrameId={frame} />
     </main>
   );
 }

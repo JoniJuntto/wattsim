@@ -5,11 +5,16 @@ export type Api = {
   url: string;
   get(path: string): Promise<Response>;
   post(path: string, body?: unknown): Promise<Response>;
+  put(path: string, body?: unknown): Promise<Response>;
   del(path: string): Promise<Response>;
 };
 
-export async function boot(opts: { uiDir?: string } = {}): Promise<Api> {
-  const server = await startServer({ port: 0, uiDir: opts.uiDir ?? '/nonexistent-wattsim-ui' });
+export async function boot(opts: { uiDir?: string; dataDir?: string } = {}): Promise<Api> {
+  const server = await startServer({
+    port: 0,
+    uiDir: opts.uiDir ?? '/nonexistent-wattsim-ui',
+    dataDir: opts.dataDir,
+  });
   const url = server.url;
   return {
     server,
@@ -20,6 +25,12 @@ export async function boot(opts: { uiDir?: string } = {}): Promise<Api> {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
+      }),
+    put: (path, body) =>
+      fetch(url + path, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
       }),
     del: (path) => fetch(url + path, { method: 'DELETE' }),
   };

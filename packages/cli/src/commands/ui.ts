@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { DEFAULT_HOST, DEFAULT_PORT, startServer } from '@wattsim/server';
 import { defineCommand } from 'citty';
 import { err, out } from '../load';
@@ -22,6 +24,14 @@ export const ui = defineCommand({
   args: {
     port: { type: 'string', description: `Port to listen on (default ${DEFAULT_PORT})` },
     host: { type: 'string', description: `Interface to bind (default ${DEFAULT_HOST}, local only)` },
+    data: {
+      type: 'string',
+      description: 'Directory for run history, saved scenarios, recordings and CSMS reports (default ~/.wattsim)',
+    },
+    'csms-port': {
+      type: 'string',
+      description: 'Port of the built-in test CSMS (default: a free port)',
+    },
     open: {
       type: 'boolean',
       default: true,
@@ -35,14 +45,20 @@ export const ui = defineCommand({
       await err(`invalid --port ${args.port}\n`);
       process.exit(2);
     }
+    const csmsPort = args['csms-port'] === undefined ? 0 : Number(args['csms-port']);
+    if (!Number.isInteger(csmsPort) || csmsPort < 0 || csmsPort > 65535) {
+      await err(`invalid --csms-port ${args['csms-port']}\n`);
+      process.exit(2);
+    }
+    const dataDir = args.data || join(homedir(), '.wattsim');
     let server: Awaited<ReturnType<typeof startServer>>;
     try {
-      server = await startServer({ port, host: args.host ?? DEFAULT_HOST });
+      server = await startServer({ port, host: args.host ?? DEFAULT_HOST, dataDir, csmsPort });
     } catch (e) {
       await err(`cannot start the UI server: ${e instanceof Error ? e.message : String(e)}\n`);
       process.exit(1);
     }
-    await out(`wattsim ui listening on ${server.url}\n`);
+    await out(`wattsim ui listening on ${server.url} (data in ${dataDir})\n`);
     if (args.open) openBrowser(server.url);
     const shutdown = async () => {
       await server.stop();

@@ -19,7 +19,21 @@ export function backoffDelay(
   return Math.round(base * (0.8 + 0.4 * random()));
 }
 
-const TYPES = new Set(['snapshot', 'station', 'removed', 'frame', 'violation', 'error']);
+const TYPES = new Set([
+  'snapshot',
+  'station',
+  'removed',
+  'frame',
+  'violation',
+  'error',
+  'run',
+  'run.event',
+  'csms',
+  'csms.session',
+  'csms.violation',
+]);
+
+const isObject = (v: unknown) => typeof v === 'object' && v !== null;
 
 /** Parses one text message from `/api/stream`; null for anything that is not a known message. */
 export function parseStreamMessage(data: unknown): StreamMessage | null {
@@ -46,6 +60,16 @@ export function parseStreamMessage(data: unknown): StreamMessage | null {
       return typeof m.stationId === 'string' && typeof m.violation === 'object' ? (m as StreamMessage) : null;
     case 'error':
       return typeof m.stationId === 'string' && typeof m.message === 'string' ? (m as StreamMessage) : null;
+    case 'run':
+      return isObject(m.run) ? (m as StreamMessage) : null;
+    case 'run.event':
+      return typeof m.runId === 'string' && isObject(m.event) ? (m as StreamMessage) : null;
+    case 'csms':
+      return isObject(m.csms) ? (m as StreamMessage) : null;
+    case 'csms.session':
+      return isObject(m.session) ? (m as StreamMessage) : null;
+    case 'csms.violation':
+      return isObject(m.violation) ? (m as StreamMessage) : null;
     default:
       return null;
   }

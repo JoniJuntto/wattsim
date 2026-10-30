@@ -200,12 +200,15 @@ const Row = memo(function Row({
   pairing,
   violationsBySeq,
   expanded,
+  focused,
   onToggle,
 }: {
   ex: Exchange;
   pairing: Pairing;
   violationsBySeq: Map<number, Violation[]>;
   expanded: boolean;
+  /** The exchange a finding links to. */
+  focused: boolean;
   onToggle: (key: number) => void;
 }) {
   const problems = exchangeProblems(ex, pairing, violationsBySeq);
@@ -224,7 +227,9 @@ const Row = memo(function Row({
         fromCsms && !bad && 'bg-[color-mix(in_oklab,var(--in)_7%,transparent)]',
         bad && 'bg-violation-bg',
         expanded && !bad && 'bg-accent/40',
+        focused && 'outline-2 outline-ring -outline-offset-2',
       )}
+      data-focused={focused || undefined}
     >
       <Lanes />
       {bad && <span aria-hidden="true" className="absolute inset-y-0 left-0 w-[3px] bg-violation" />}
@@ -313,9 +318,41 @@ const Row = memo(function Row({
   );
 });
 
-export function MessageLog({ stationId, className }: { stationId: string; className?: string }) {
+/** A UI station's live log. `focusFrameId` opens and scrolls to the exchange with that OCPP message id. */
+export function MessageLog({
+  stationId,
+  focusFrameId,
+  className,
+}: {
+  stationId: string;
+  focusFrameId?: string;
+  className?: string;
+}) {
   const frames = useLive((s) => s.frames[stationId]) ?? NO_FRAMES;
   const violationEntries = useLive((s) => s.violations[stationId]) ?? NO_VIOLATIONS;
+  return (
+    <MessageLogView
+      frames={frames}
+      violationEntries={violationEntries}
+      focusFrameId={focusFrameId}
+      className={className}
+    />
+  );
+}
+
+export function MessageLogView({
+  frames,
+  violationEntries = NO_VIOLATIONS,
+  focusFrameId,
+  title = 'Message log',
+  className,
+}: {
+  frames: FrameEvent[];
+  violationEntries?: ViolationEntry[];
+  focusFrameId?: string;
+  title?: string;
+  className?: string;
+}) {
   const [text, setText] = useState('');
   const [side, setSide] = useState<'' | Initiator>('');
   const [action, setAction] = useState(ALL);
@@ -414,16 +451,33 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
     });
   };
 
+  // Open the exchange a link points at once it is in the log, and keep it marked.
+  const [focusedKey, setFocusedKey] = useState<number | null>(null);
+  const sectionRef = useRef<HTMLElement>(null);
+  const focusDone = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!focusFrameId || focusDone.current === focusFrameId) return;
+    const index = visible.findIndex((ex) => ex.frames.some((f) => f.id === focusFrameId));
+    if (index < 0) return;
+    const ex = visible[index] as Exchange;
+    focusDone.current = focusFrameId;
+    setFocusedKey(ex.key);
+    setPausedAt((p) => p ?? exchanges[exchanges.length - 1]?.key ?? 0);
+    setExpanded((prev) => new Set(prev).add(ex.key));
+    // After the expanded row has been measured. On narrow screens the log may be below the fold.
+    requestAnimationFrame(() => {
+      sectionRef.current?.scrollIntoView({ block: 'nearest' });
+      virtualizer.scrollToIndex(index, { align: 'center' });
+    });
+  }, [focusFrameId, visible, exchanges, virtualizer]);
+
   const filtered = visible.length !== exchanges.length;
 
   return (
-    <section
-      aria-label="Message log"
-      className={cn('@container flex min-h-0 flex-col rounded-md border bg-card', className)}
-    >
+    <section aria-label={title} className={cn('@container flex min-h-0 flex-col rounded-md border bg-card', className)}>
       <div className="flex flex-col gap-2 border-b p-2">
         <div className="flex items-center gap-2">
-          <h2 className="font-semibold text-sm">Message log</h2>
+          <h2 className="font-semibold text-sm">{title}</h2>
           <span className="text-muted-foreground text-xs">
             {filtered ? `${visible.length} of ${exchanges.length}` : exchanges.length}{' '}
             {exchanges.length === 1 ? 'exchange' : 'exchanges'}, {frames.length} frames
@@ -570,6 +624,7 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
                       pairing={pairing}
                       violationsBySeq={violationsBySeq}
                       expanded={expanded.has(ex.key)}
+                      focused={focusedKey === ex.key}
                       onToggle={toggle}
                     />
                   </div>
