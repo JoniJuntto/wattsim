@@ -1,13 +1,15 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { ArrowDownToLineIcon, PauseIcon, PlayIcon, SearchIcon, TriangleAlertIcon } from 'lucide-react';
+import { ArrowDownToLineIcon, PauseIcon, PlayIcon, SearchIcon, TriangleAlertIcon, XIcon } from 'lucide-react';
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { FrameEvent, Violation } from '@/api/types';
+import { LogAnalytics, type LogFilter } from '@/components/app/log-analytics';
 import { Button } from '@/components/ui/button';
 import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Toggle } from '@/components/ui/toggle';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { useDebounced } from '@/hooks/use-debounced';
+import { formatTime } from '@/lib/chart';
 import { clockTime, duration, prettyJson } from '@/lib/format';
 import {
   actionsIn,
@@ -22,6 +24,7 @@ import {
   parseFrame,
   previewOf,
 } from '@/lib/frames';
+import { exchangeIn } from '@/lib/log-analytics';
 import { cn } from '@/lib/utils';
 import { useLive } from '@/state/live';
 import { isTrimmed, type ViolationEntry } from '@/state/store';
@@ -357,6 +360,8 @@ export function MessageLogView({
   const [side, setSide] = useState<'' | Initiator>('');
   const [action, setAction] = useState(ALL);
   const [problemsOnly, setProblemsOnly] = useState(false);
+  /** A time slice picked in the analytics strip. */
+  const [range, setRange] = useState<{ from: number; to: number } | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
   const debouncedText = useDebounced(text, 150);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -387,11 +392,25 @@ export function MessageLogView({
       if (side && ex.initiator !== side) return false;
       if (action !== ALL && ex.action !== action) return false;
       if (problemsOnly && !problemKeys.has(ex.key)) return false;
+      if (range && !exchangeIn(ex, range.from, range.to)) return false;
       if (!needle) return true;
       if ((ex.action ?? '').toLowerCase().includes(needle)) return true;
       return ex.frames.some((f) => f.raw.toLowerCase().includes(needle));
     });
-  }, [exchanges, side, action, problemsOnly, problemKeys, debouncedText]);
+  }, [exchanges, side, action, problemsOnly, problemKeys, debouncedText, range]);
+
+  const violationTimes = useMemo(() => {
+    const bySeq = new Map(frames.map((f) => [f.seq, f]));
+    return violationEntries.map((v) => {
+      const f = v.seq === undefined ? undefined : bySeq.get(v.seq);
+      return f ? Date.parse(f.at) : v.at;
+    });
+  }, [frames, violationEntries]);
+  const applyFilter = (f: LogFilter) => {
+    setAction(f.action ?? ALL);
+    setRange(f.range ?? null);
+    setProblemsOnly(f.problems ?? false);
+  };
 
   const virtualizer = useVirtualizer({
     count: visible.length,
@@ -560,8 +579,28 @@ export function MessageLogView({
             <TriangleAlertIcon className={problemKeys.size > 0 ? 'text-violation' : undefined} />
             Problems {problemKeys.size}
           </Toggle>
+          {range && (
+            <Button
+              variant="secondary"
+              size="xs"
+              onClick={() => setRange(null)}
+              title="Clear the time filter set from the analytics"
+            >
+              {formatTime(range.from)}–{formatTime(range.to)}
+              <XIcon data-icon="inline-end" />
+            </Button>
+          )}
         </div>
       </div>
+
+      <LogAnalytics
+        frames={frames}
+        exchanges={exchanges}
+        pairing={pairing}
+        violationTimes={violationTimes}
+        filter={{ action: action === ALL ? undefined : action, range: range ?? undefined, problems: problemsOnly }}
+        onFilter={applyFilter}
+      />
 
       <div className="relative h-6 shrink-0 border-b bg-panel text-[10px] text-muted-foreground">
         <span className="absolute top-1 font-medium" style={{ left: laneLeft(LANE_CP), transform: 'translateX(-50%)' }}>

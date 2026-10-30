@@ -94,6 +94,27 @@
   --st-reserved-on: #ffffff;
   --st-unknown: #5f676d;
   --st-unknown-on: #ffffff;
+
+  /*
+   * Charts. Single series and references are ink, never a hue: color carries state (the --st-* fills) or, where a
+   * chart's series are nominal categories (OCPP actions, rules, phases), identity from --cat-* in this fixed order,
+   * validated for color-vision deficiency against --card (light: CVD dE >= 9.1; aqua, yellow and magenta sit below
+   * 3:1, so those charts carry a legend and a table view).
+   */
+  --chart-ink: #24313b;
+  --chart-ref: #7d878d;
+  --chart-grid: #e3e7e3;
+  --chart-axis: #b9c2bc;
+  --chart-label: #5a656d;
+  --chart-cross: #172027;
+  --cat-1: #2a78d6;
+  --cat-2: #eb6834;
+  --cat-3: #1baf7a;
+  --cat-4: #eda100;
+  --cat-5: #e87ba4;
+  --cat-other: #a7afb3;
+  /* Sequential ramps mix one hue into --card: --seq-power for kW, --violation for finding counts. */
+  --seq-power: #1f55b0;
 }
 
 .dark {
@@ -143,6 +164,21 @@
   --st-reserved-on: #22103a;
   --st-unknown: #8c969d;
   --st-unknown-on: #12171b;
+
+  /* Same hues, stepped for the anthracite card (every --cat-* >= 3:1 on #272c2f, CVD dE >= 8.4). */
+  --chart-ink: #dfe3e1;
+  --chart-ref: #8c969d;
+  --chart-grid: #343b3f;
+  --chart-axis: #4d575b;
+  --chart-label: #a3aaad;
+  --chart-cross: #e6e8e6;
+  --cat-1: #3987e5;
+  --cat-2: #d95926;
+  --cat-3: #199e70;
+  --cat-4: #c98500;
+  --cat-5: #d55181;
+  --cat-other: #6b7479;
+  --seq-power: #6a9ff2;
 }
 
 @layer base {

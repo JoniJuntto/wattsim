@@ -8,6 +8,7 @@ import {
   Trash2Icon,
   TriangleAlertIcon,
 } from 'lucide-react';
+import type { TimeWindow } from '@/api/charts';
 import { downloads } from '@/api/http';
 import { useDeleteStation, useFrameHistory, useStationAction } from '@/api/queries';
 import type { StationAction, StationView } from '@/api/types';
@@ -17,6 +18,7 @@ import { StationFaultsMenu } from '@/components/app/fault-actions';
 import { MessageLog } from '@/components/app/message-log';
 import { SendMessagePanel } from '@/components/app/send-message';
 import { ConnectionPill, VersionBadge } from '@/components/app/status';
+import { Telemetry } from '@/components/app/telemetry';
 import { Alert, AlertAction, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import {
   AlertDialog,
@@ -34,6 +36,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from '
 import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useLive, useStore } from '@/state/live';
 import type { StationError } from '@/state/store';
@@ -153,39 +156,79 @@ function StationErrors({ stationId }: { stationId: string }) {
   );
 }
 
-function StationBody({ station, focusFrameId }: { station: StationView; focusFrameId?: string }) {
+function StationBody({
+  station,
+  focusFrameId,
+  view,
+  window,
+}: {
+  station: StationView;
+  focusFrameId?: string;
+  view: 'controls' | 'telemetry';
+  window: TimeWindow;
+}) {
   useFrameHistory(station.id);
   const action = useStationAction(station.id);
+  const navigate = useNavigate({ from: '/stations/$stationId' });
   const run = (a: StationAction) => action.mutate(a);
   const pendingEvse = action.isPending ? evseOf(action.variables) : undefined;
   return (
     <div className="grid min-h-0 flex-1 gap-3 p-3 sm:p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] lg:grid-rows-[minmax(0,1fr)] lg:gap-4">
       <div className="relative flex min-w-0 flex-col gap-3 *:shrink-0 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
-        {station.evses.map((evse) => (
-          <EvseCard
-            key={evse.id}
-            stationId={station.id}
-            version={station.version}
-            evse={evse}
-            run={run}
-            pendingType={pendingEvse === evse.id ? action.variables?.type : undefined}
+        <ToggleGroup
+          type="single"
+          variant="outline"
+          size="sm"
+          value={view}
+          onValueChange={(v) => {
+            if (v === 'controls' || v === 'telemetry') {
+              navigate({ search: (s) => ({ ...s, view: v === 'telemetry' ? 'telemetry' : undefined }), replace: true });
+            }
+          }}
+          aria-label="Left pane"
+        >
+          <ToggleGroupItem value="controls" className="px-3">
+            Controls
+          </ToggleGroupItem>
+          <ToggleGroupItem value="telemetry" className="px-3">
+            Telemetry
+          </ToggleGroupItem>
+        </ToggleGroup>
+        {view === 'telemetry' ? (
+          <Telemetry
+            station={station}
+            window={window}
+            onWindow={(w) => navigate({ search: (s) => ({ ...s, window: w === '1h' ? undefined : w }), replace: true })}
           />
-        ))}
-        <Tabs defaultValue="send" className="rounded-md border bg-card p-3">
-          <TabsList>
-            <TabsTrigger value="send">Send message</TabsTrigger>
-            <TabsTrigger value="chaos">
-              Chaos rules
-              {station.chaos.length > 0 && <span className="text-muted-foreground">{station.chaos.length}</span>}
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="send" className="pt-3">
-            <SendMessagePanel station={station} />
-          </TabsContent>
-          <TabsContent value="chaos" className="pt-3">
-            <ChaosPanel station={station} />
-          </TabsContent>
-        </Tabs>
+        ) : (
+          <>
+            {station.evses.map((evse) => (
+              <EvseCard
+                key={evse.id}
+                stationId={station.id}
+                version={station.version}
+                evse={evse}
+                run={run}
+                pendingType={pendingEvse === evse.id ? action.variables?.type : undefined}
+              />
+            ))}
+            <Tabs defaultValue="send" className="rounded-md border bg-card p-3">
+              <TabsList>
+                <TabsTrigger value="send">Send message</TabsTrigger>
+                <TabsTrigger value="chaos">
+                  Chaos rules
+                  {station.chaos.length > 0 && <span className="text-muted-foreground">{station.chaos.length}</span>}
+                </TabsTrigger>
+              </TabsList>
+              <TabsContent value="send" className="pt-3">
+                <SendMessagePanel station={station} />
+              </TabsContent>
+              <TabsContent value="chaos" className="pt-3">
+                <ChaosPanel station={station} />
+              </TabsContent>
+            </Tabs>
+          </>
+        )}
       </div>
       <MessageLog stationId={station.id} focusFrameId={focusFrameId} className="h-[70dvh] lg:h-auto lg:min-h-0" />
     </div>
@@ -194,7 +237,7 @@ function StationBody({ station, focusFrameId }: { station: StationView; focusFra
 
 export function StationPage() {
   const { stationId } = useParams({ from: '/stations/$stationId' });
-  const { frame } = useSearch({ from: '/stations/$stationId' });
+  const { frame, view, window } = useSearch({ from: '/stations/$stationId' });
   const station = useLive((s) => s.stations[stationId]);
   const snapshots = useLive((s) => s.snapshots);
 
@@ -226,7 +269,12 @@ export function StationPage() {
     <main className="flex min-h-0 flex-1 flex-col lg:h-[calc(100dvh-2.75rem)] lg:flex-none">
       <Header station={station} />
       <StationErrors stationId={station.id} />
-      <StationBody station={station} focusFrameId={frame} />
+      <StationBody
+        station={station}
+        focusFrameId={frame}
+        view={view === 'telemetry' ? 'telemetry' : 'controls'}
+        window={window ?? '1h'}
+      />
     </main>
   );
 }

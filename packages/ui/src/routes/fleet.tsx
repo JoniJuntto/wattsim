@@ -3,6 +3,7 @@ import { PlusIcon, SearchIcon, ZapIcon } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { StationView } from '@/api/types';
 import { AddStationDialog } from '@/components/app/add-station-dialog';
+import { FleetCharts } from '@/components/app/fleet-charts';
 import { ConnectionPill, EvseChip, VersionBadge } from '@/components/app/status';
 import { Button } from '@/components/ui/button';
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
@@ -231,6 +232,7 @@ export function FleetPage() {
       ) : (
         <>
           <FleetStrip stations={list} />
+          <FleetCharts />
           <div className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3">
             {shown.map((s) => (
               <StationCard

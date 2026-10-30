@@ -1,4 +1,5 @@
 import { createRootRoute, createRoute, createRouter, Link, lazyRouteComponent, Outlet } from '@tanstack/react-router';
+import { isWindow, type TimeWindow } from '@/api/charts';
 import { TopBar } from '@/components/app/top-bar';
 import { Button } from '@/components/ui/button';
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty';
@@ -38,10 +39,18 @@ const rootRoute = createRootRoute({
 
 const fleetRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', component: FleetPage });
 
+export type StationSearch = { frame?: string; view?: 'telemetry'; window?: TimeWindow };
+
 export const stationRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: 'stations/$stationId',
-  validateSearch: frameSearch,
+  /** `view=telemetry` shows the charts instead of the controls; `window` their time range. */
+  validateSearch: (s: Record<string, unknown>): StationSearch => {
+    const out: StationSearch = frameSearch(s);
+    if (s.view === 'telemetry') out.view = 'telemetry';
+    if (isWindow(s.window)) out.window = s.window;
+    return out;
+  },
   component: StationPage,
 });
 
@@ -61,7 +70,28 @@ export const scenariosRoute = createRoute({
   component: lazyRouteComponent(() => import('@/routes/scenarios'), 'ScenariosPage'),
 });
 
-export const csmsRoute = createRoute({ getParentRoute: () => rootRoute, path: 'csms', component: CsmsPage });
+export type CsmsSearch = { rule?: string; station?: string; from?: number; to?: number };
+
+export const csmsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: 'csms',
+  /** A filter on the finding list, set by clicking the findings charts. */
+  validateSearch: (s: Record<string, unknown>): CsmsSearch => {
+    const out: CsmsSearch = {};
+    const rule = str(s.rule);
+    const station = str(s.station);
+    if (rule !== undefined) out.rule = rule;
+    if (station !== undefined) out.station = station;
+    const from = Number(s.from);
+    const to = Number(s.to);
+    if (Number.isFinite(from) && Number.isFinite(to) && to > from) {
+      out.from = from;
+      out.to = to;
+    }
+    return out;
+  },
+  component: CsmsPage,
+});
 
 export const csmsSessionRoute = createRoute({
   getParentRoute: () => rootRoute,

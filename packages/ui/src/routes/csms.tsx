@@ -1,5 +1,14 @@
-import { Link } from '@tanstack/react-router';
-import { ChevronRightIcon, CopyIcon, FileDownIcon, PlayIcon, SaveIcon, SquareIcon, Trash2Icon } from 'lucide-react';
+import { Link, useNavigate, useSearch } from '@tanstack/react-router';
+import {
+  ChevronRightIcon,
+  CopyIcon,
+  FileDownIcon,
+  PlayIcon,
+  SaveIcon,
+  SquareIcon,
+  Trash2Icon,
+  XIcon,
+} from 'lucide-react';
 import { type ReactNode, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import { downloads } from '@/api/http';
@@ -13,10 +22,12 @@ import {
 } from '@/api/server-mode';
 import type { ConformanceViolation, CsmsRuleTally, CsmsSessionView, Severity } from '@/api/types';
 import { Confirm } from '@/components/app/confirm-button';
+import { CsmsCharts, type FindingsFilter } from '@/components/app/csms-charts';
 import { EvseChip, VersionBadge } from '@/components/app/status';
 import { Button } from '@/components/ui/button';
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty';
 import { Spinner } from '@/components/ui/spinner';
+import { formatTime } from '@/lib/chart';
 import { clockTime } from '@/lib/format';
 import { statusStyle } from '@/lib/status';
 import { cn } from '@/lib/utils';
@@ -289,8 +300,100 @@ function SavedReports() {
   );
 }
 
+/** The finding list narrowed by a click on the charts: rule, station and time range, newest first. */
+function FilteredFindings({
+  filter,
+  findings,
+  uiStations,
+  onClear,
+}: {
+  filter: FindingsFilter;
+  findings: ConformanceViolation[];
+  uiStations: ReadonlySet<string>;
+  onClear: () => void;
+}) {
+  const shown = useMemo(
+    () =>
+      findings
+        .filter(
+          (v) =>
+            (filter.rule === undefined || v.rule === filter.rule) &&
+            (filter.station === undefined || v.identity === filter.station) &&
+            (filter.from === undefined || v.at >= filter.from) &&
+            (filter.to === undefined || v.at < filter.to),
+        )
+        .reverse(),
+    [findings, filter],
+  );
+  const parts = [
+    filter.rule && <span className="font-mono">{filter.rule}</span>,
+    filter.station && <span className="font-mono">{filter.station}</span>,
+    filter.from !== undefined && filter.to !== undefined && `${formatTime(filter.from)}–${formatTime(filter.to)}`,
+  ].filter(Boolean);
+  return (
+    <section className="flex flex-col rounded-md border bg-card" aria-label="Filtered findings">
+      <h2 className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-2 font-semibold text-sm">
+        {shown.length} {shown.length === 1 ? 'finding' : 'findings'}
+        <span className="flex flex-wrap items-center gap-1.5 font-normal text-muted-foreground text-xs">
+          {parts.map((p, i) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: a fixed list of filter parts
+            <span key={i} className="rounded-sm border px-1.5 py-0.5">
+              {p}
+            </span>
+          ))}
+        </span>
+        <Button variant="ghost" size="xs" className="ml-auto" onClick={onClear}>
+          <XIcon data-icon="inline-start" />
+          Clear filter
+        </Button>
+      </h2>
+      {shown.length === 0 ? (
+        <p className="p-3 text-muted-foreground text-sm">
+          None of the findings kept in this view match. Older ones are in the report.
+        </p>
+      ) : (
+        <ul className="flex max-h-[28rem] flex-col overflow-y-auto py-1">
+          {shown.slice(0, 500).map((v, i) => (
+            <li
+              // biome-ignore lint/suspicious/noArrayIndexKey: findings have no id
+              key={`${v.at}:${v.identity}:${i}`}
+              className="grid grid-cols-[4.5rem_minmax(0,7rem)_minmax(0,1fr)_auto] items-baseline gap-2 px-3 py-1 text-xs"
+            >
+              <span className="font-mono text-[11px] text-muted-foreground">{formatTime(v.at)}</span>
+              <span className="truncate font-mono">
+                <FrameLink v={{ ...v, frameId: undefined }} uiStation={uiStations.has(v.identity)}>
+                  {v.identity}
+                </FrameLink>
+              </span>
+              <span className="min-w-0">
+                <span className="mr-1.5 font-mono text-[11px] text-muted-foreground">{v.rule}</span>
+                {v.action && <span className="font-medium">{v.action}: </span>}
+                {v.message}
+              </span>
+              {v.frameId ? (
+                <span className="font-mono text-[11px]">
+                  <FrameLink v={v} uiStation={uiStations.has(v.identity)}>
+                    frame
+                  </FrameLink>
+                </span>
+              ) : (
+                <span />
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 export function CsmsPage() {
   const q = useCsmsSync();
+  const search = useSearch({ from: '/csms' });
+  const navigate = useNavigate({ from: '/csms' });
+  const filter: FindingsFilter = search;
+  const filtered = filter.rule !== undefined || filter.station !== undefined || filter.from !== undefined;
+  const setFilter = (f: FindingsFilter) => navigate({ search: f, replace: true });
   const csms = useLive((s) => s.csms);
   const sessionsById = useLive((s) => s.csmsSessions);
   const violations = useLive((s) => s.csmsViolations);
@@ -440,30 +543,40 @@ export function CsmsPage() {
             <Tile label="Errors" value={csms.totals.errors} tone={csms.totals.errors > 0 ? 'bad' : undefined} />
             <Tile label="Warnings" value={csms.totals.warnings} tone={csms.totals.warnings > 0 ? 'warn' : undefined} />
           </div>
+          <CsmsCharts running={csms.running} filter={filter} onFilter={setFilter} />
           <div className="grid gap-3 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)] lg:gap-4">
-            <section className="flex flex-col rounded-md border bg-card" aria-label="Findings by rule">
-              <h2 className="flex items-baseline gap-2 border-b px-3 py-2 font-semibold text-sm">
-                Findings by rule
-                <span className="font-normal text-muted-foreground text-xs">live; click a rule for its findings</span>
-              </h2>
-              {rules.length === 0 ? (
-                <p className="p-3 text-muted-foreground text-sm">
-                  No findings. Everything the stations sent so far follows the spec.
-                </p>
-              ) : (
-                <ul>
-                  {rules.map(([rule, tally]) => (
-                    <RuleGroup
-                      key={rule}
-                      rule={rule}
-                      tally={tally}
-                      findings={byRule.get(rule) ?? []}
-                      uiStations={uiStations}
-                    />
-                  ))}
-                </ul>
-              )}
-            </section>
+            {filtered ? (
+              <FilteredFindings
+                filter={filter}
+                findings={violations}
+                uiStations={uiStations}
+                onClear={() => setFilter({})}
+              />
+            ) : (
+              <section className="flex flex-col rounded-md border bg-card" aria-label="Findings by rule">
+                <h2 className="flex items-baseline gap-2 border-b px-3 py-2 font-semibold text-sm">
+                  Findings by rule
+                  <span className="font-normal text-muted-foreground text-xs">live; click a rule for its findings</span>
+                </h2>
+                {rules.length === 0 ? (
+                  <p className="p-3 text-muted-foreground text-sm">
+                    No findings. Everything the stations sent so far follows the spec.
+                  </p>
+                ) : (
+                  <ul>
+                    {rules.map(([rule, tally]) => (
+                      <RuleGroup
+                        key={rule}
+                        rule={rule}
+                        tally={tally}
+                        findings={byRule.get(rule) ?? []}
+                        uiStations={uiStations}
+                      />
+                    ))}
+                  </ul>
+                )}
+              </section>
+            )}
             <section className="flex flex-col rounded-md border bg-card" aria-label="Sessions">
               <h2 className="border-b px-3 py-2 font-semibold text-sm">Sessions</h2>
               {sessions.length === 0 ? (

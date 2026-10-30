@@ -167,7 +167,9 @@ export type StreamMessage =
   | { type: 'run.event'; runId: string; event: RunEventView }
   | { type: 'csms'; csms: CsmsSummary }
   | { type: 'csms.session'; session: CsmsSessionView }
-  | { type: 'csms.violation'; violation: ConformanceViolation };
+  | { type: 'csms.violation'; violation: ConformanceViolation }
+  | { type: 'series'; stationId: string; points: SeriesPoint[] }
+  | { type: 'fleet'; bin: FleetBin };
 
 // ---- server mode (milestone 4), mirrors packages/server/src/types.ts ---------------------------------------------
 
@@ -300,4 +302,165 @@ export type CsmsReportSummary = {
   total: number;
   errors: number;
   warnings: number;
+};
+
+// ---- charts, mirrors packages/server/src/types.ts ------------------------------------------------------------------
+
+/** One sample of one EVSE. `null`: not applicable (no EV, no limit, phase not wired, no tariff). */
+export type SeriesSample = {
+  /** Epoch ms. */
+  t: number;
+  /** Total active power, kW; negative while discharging. */
+  kw: number;
+  /** Current per phase L1..L3, A (0 on a phase not carrying current). */
+  a: [number, number, number];
+  /** Voltage per phase L1..L3, V; null on a phase the station is not wired for. */
+  v: [number | null, number | null, number | null];
+  offeredKw: number;
+  /** Smart-charging limit in force, kW. */
+  limitKw: number | null;
+  /** 0..1 */
+  soc: number | null;
+  targetSoc: number | null;
+  /** Energy import register, Wh. */
+  wh: number;
+  /** Running cost of the transaction under its tariff (2.1 local cost, else what the CSMS sent). */
+  cost: number | null;
+  status: string;
+};
+
+/** A sample on the stream, tagged with its EVSE. */
+export type SeriesPoint = SeriesSample & { evse: number };
+
+/** Column-oriented series as the HTTP API returns it; per-phase power is `a × v / 1000`. */
+export type EvseSeriesView = {
+  evse: number;
+  /** Currency of `cost`, when a tariff priced the transaction. */
+  currency?: string;
+  t: number[];
+  kw: number[];
+  a1: number[];
+  a2: number[];
+  a3: number[];
+  v1: (number | null)[];
+  v2: (number | null)[];
+  v3: (number | null)[];
+  offeredKw: number[];
+  limitKw: (number | null)[];
+  soc: (number | null)[];
+  targetSoc: (number | null)[];
+  wh: number[];
+  cost: (number | null)[];
+  status: string[];
+};
+
+export type StationSeriesView = {
+  stationId: string;
+  from: number;
+  to: number;
+  /** Bucket width the samples were downsampled to (ms); 0: every sample. */
+  step: number;
+  /** Before this time some EVSE's samples were downsampled (min/max per 5 min); null: every sample is kept. */
+  fullResolutionFrom: number | null;
+  evses: EvseSeriesView[];
+};
+
+/** GetCompositeSchedule of one EVSE (0: the grid connection) from `from`, in kW. */
+export type ScheduleView = {
+  stationId: string;
+  evse: number;
+  /** Epoch ms. */
+  from: number;
+  durationMs: number;
+  /** What the EVSE (or the station, for 0) delivers with no profile in force. */
+  ratedKw: number;
+  /** Charging profiles installed on the station. */
+  profiles: number;
+  periods: { startS: number; kw: number; phases?: number }[];
+};
+
+/** One bin as the stream sends it. */
+export type FleetBin = {
+  /** Epoch ms at the end of the bin, when it was sampled. */
+  t: number;
+  kw: number;
+  stations: number;
+  connected: number;
+  /** EVSEs per status, in `FLEET_STATUSES` order. */
+  counts: number[];
+};
+
+/** Bins merged to `step`: mean, min and max power, mean counts. Columns, oldest first. */
+export type FleetSeriesView = {
+  from: number;
+  to: number;
+  step: number;
+  binMs: number;
+  statuses: string[];
+  t: number[];
+  kw: number[];
+  kwMin: number[];
+  kwMax: number[];
+  stations: number[];
+  connected: number[];
+  /** `counts[s][i]`: mean EVSEs in status `statuses[s]` over bucket `i`. */
+  counts: number[][];
+};
+
+export type FleetStationsView = {
+  from: number;
+  to: number;
+  step: number;
+  metric: 'power' | 'status';
+  statuses: string[];
+  /** Per station: energy delivered in the window, and per bin mean kW or a `statuses` index (-1/null: no data). */
+  rows: { id: string; energyWh: number; values: (number | null)[] }[];
+};
+
+export type TimelineSegment = { evse: number; from: number; to: number; status: string };
+export type TimelineTransaction = { evse: number; id: string; from: number; to: number; open: boolean };
+export type TimelineMark = {
+  at: number;
+  kind: 'assert' | 'violation' | 'failed' | 'error';
+  text: string;
+};
+export type TimelineLane = {
+  station: string;
+  /** First and last frame or event of the station, epoch ms on the run's clock. */
+  from: number;
+  to: number;
+  result: 'passed' | 'failed' | 'running';
+  statuses: TimelineSegment[];
+  transactions: TimelineTransaction[];
+  marks: TimelineMark[];
+};
+export type RunTimeline = {
+  runId: string;
+  /** Epoch ms on the run's clock (virtual time on a virtual run). */
+  from: number;
+  to: number;
+  lanes: TimelineLane[];
+  /** Stations left out past `TIMELINE_STATIONS`. */
+  truncated: number;
+};
+
+export type FindingsBinsView = {
+  from: number;
+  to: number;
+  step: number;
+  /** Bucket starts. */
+  t: number[];
+  /** Rules by total in the window, most first. */
+  rules: string[];
+  /** `byRule[r][i]`: findings of `rules[r]` in bucket `i`. */
+  byRule: number[][];
+  errors: number[];
+  warnings: number[];
+  /** Stations by total in the window, most first. */
+  stations: string[];
+  /** `matrix[s][r]`: findings of `stations[s]` under `rules[r]` in the window. */
+  matrix: number[][];
+  /** Severity of each rule. */
+  severity: Record<string, 'error' | 'warning'>;
+  total: number;
 };

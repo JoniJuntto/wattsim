@@ -16,6 +16,7 @@ import { toJUnit as runJUnit } from '@wattsim/scenario';
 import { Elysia } from 'elysia';
 import pkg from '../package.json' with { type: 'json' };
 import { Store } from './db/store';
+import { FLEET_BIN_MS, FleetAggregate } from './fleet';
 import { buildMeta } from './meta';
 import { fileName, sessionTrace } from './recording';
 import { Conflict, FRAMES_PER_STATION, NotFound, Registry } from './registry';
@@ -88,6 +89,8 @@ export type ServerOptions = {
    * one. The server's own origin is the request's `Host`, so every name it is reached under works.
    */
   allowOrigins?: string[];
+  /** Width of a fleet aggregate bin; default `FLEET_BIN_MS` (10 s). For tests. */
+  fleetBinMs?: number;
 };
 
 export type RunningServer = { url: string; stop(): Promise<void> };
@@ -117,6 +120,34 @@ class InvalidScenario extends BadRequest {
   constructor(readonly diagnostics: ScenarioDiagnostic[]) {
     super(diagnostics.map((d) => `${d.line}:${d.col}: ${d.message}`).join('; '));
   }
+}
+
+const HOUR_MS = 3_600_000;
+const MAX_SCHEDULE_S = 7 * 24 * 3600;
+const MAX_HEATMAP_BINS = 500;
+
+/** A time query parameter: epoch ms, or an ISO date. */
+function timeOf(raw: string | undefined, name: string, fallback: number): number {
+  if (raw === undefined || raw === '') return fallback;
+  const n = /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw) : Date.parse(raw);
+  if (!Number.isFinite(n)) throw new BadRequest(`${name}: expected epoch milliseconds or an ISO date`);
+  return n;
+}
+
+/** `from`, `to` (default: the last hour up to now) and `step` (ms, default 0) of a series query. */
+function windowOf(query: Record<string, string | undefined>, defaultSpanMs = HOUR_MS) {
+  const to = timeOf(query.to, 'to', Date.now());
+  const from = timeOf(query.from, 'from', to - defaultSpanMs);
+  if (from >= to) throw new BadRequest('from: must be before to');
+  const step = query.step === undefined ? 0 : Number(query.step);
+  if (!Number.isFinite(step) || step < 0) throw new BadRequest('step: expected milliseconds >= 0');
+  return { from, to, step };
+}
+
+function intOf(raw: string | undefined, name: string, fallback: number, min: number, max: number): number {
+  const n = raw === undefined ? fallback : Number(raw);
+  if (!Number.isInteger(n) || n < min || n > max) throw new BadRequest(`${name}: expected an integer ${min}..${max}`);
+  return n;
 }
 
 function limitOf(raw: string | undefined, fallback: number, max: number): number {
@@ -212,6 +243,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
   const meta = buildMeta();
   const hub: StreamHub = new StreamHub((id): StationView | undefined => reg.view(id));
   const reg: Registry = new Registry(hub);
+  const fleet = new FleetAggregate(opts.fleetBinMs ?? FLEET_BIN_MS);
+  const fleetTimer = setInterval(() => hub.fleet(fleet.sample(Date.now(), reg.fleetStates())), fleet.binMs);
   const store = new Store(opts.dataDir);
   const scenarioDir = opts.dataDir ? resolve(opts.dataDir, SCENARIO_DIR) : process.cwd();
   if (opts.dataDir) mkdirSync(scenarioDir, { recursive: true });
@@ -276,6 +309,26 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     .get('/api/stations/:id/frames', ({ params, query }) =>
       reg.frames(params.id, limitOf(query.limit, DEFAULT_FRAME_LIMIT, FRAMES_PER_STATION)),
     )
+    .get('/api/stations/:id/series', ({ params, query }) => {
+      const { from, to, step } = windowOf(query);
+      return reg.series(params.id, from, to, step);
+    })
+    .get('/api/stations/:id/schedule', ({ params, query }) => {
+      const evse = intOf(query.evse, 'evse', 1, 0, 1000);
+      const durationS = intOf(query.duration, 'duration', 86_400, 1, MAX_SCHEDULE_S);
+      return reg.schedule(params.id, evse, durationS * 1000);
+    })
+    .get('/api/fleet/series', ({ query }) => {
+      const { from, to, step } = windowOf(query);
+      return fleet.query(from, to, Math.max(step, Math.ceil((to - from) / 2000)));
+    })
+    .get('/api/fleet/stations', ({ query }) => {
+      const { from, to } = windowOf(query);
+      const bins = intOf(query.bins, 'bins', 120, 1, MAX_HEATMAP_BINS);
+      const metric = query.metric ?? 'power';
+      if (metric !== 'power' && metric !== 'status') throw new BadRequest('metric: expected power or status');
+      return reg.fleetStations(from, to, bins, metric, Date.now());
+    })
     .get('/api/stations/:id/trace', ({ params }) => {
       if (!reg.has(params.id)) throw new NotFound(`no station ${params.id}`);
       return download(sessionTrace(reg, params.id).text, fileName(params.id, '.oot.jsonl'), OOT_TYPE);
@@ -367,6 +420,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       if (!store.deleteRun(params.id)) throw new NotFound(`no run ${params.id}`);
       return noContent();
     })
+    .get('/api/runs/:id/timeline', ({ params }) => {
+      const t = runs.timeline(params.id);
+      if (!t) throw new NotFound(`no run ${params.id}`);
+      return t;
+    })
     .get('/api/runs/:id/trace', ({ params }) => {
       const r = runs.detail(params.id);
       if (!r) throw new NotFound(`no run ${params.id}`);
@@ -405,6 +463,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     // ---- the built-in test CSMS ----
     .get('/api/csms', () => testCsms.view())
     .get('/api/csms/violations', ({ query }) => testCsms.violations(limitOf(query.limit, 1000, 10_000)))
+    .get('/api/csms/findings/bins', ({ query }) => {
+      const { from, to, step } = windowOf(query);
+      return testCsms.findingsBins(from, to, step > 0 ? step : 60_000);
+    })
     .get('/api/csms/sessions/:identity/frames', ({ params, query }) => {
       const frames = testCsms.frames(params.identity, limitOf(query.limit, 500, 500));
       if (!frames) throw new NotFound(`the test CSMS has no session ${params.identity}`);
@@ -454,6 +516,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     url: `http://${urlHost}:${port}`,
     stop: () => {
       stopping ??= (async () => {
+        clearInterval(fleetTimer);
         await runs.cancelAll();
         await reg.closeAll();
         await testCsms.stop();

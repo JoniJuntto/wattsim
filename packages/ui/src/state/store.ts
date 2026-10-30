@@ -3,9 +3,11 @@ import type {
   CsmsSessionView,
   CsmsSummary,
   CsmsView,
+  FleetBin,
   FrameEvent,
   RunEventView,
   RunSummary,
+  SeriesPoint,
   StationView,
   StreamMessage,
   Violation,
@@ -30,6 +32,12 @@ export const ERROR_CAP = 50;
 export const RUN_EVENT_CAP = 200;
 /** Test-CSMS findings kept in the browser. */
 export const CSMS_VIOLATION_CAP = 2000;
+/** Streamed series points kept per EVSE (history beyond this comes from `/api/stations/:id/series`). */
+export const SERIES_CAP = 3000;
+/** A point within this of the previous one with the same status replaces its values (not its time), as on the server. */
+export const SERIES_MERGE_MS = 250;
+/** Streamed fleet bins kept: 6 h of 10 s bins. */
+export const FLEET_BIN_CAP = 2160;
 /** How many recent frames a new violation is matched against. */
 const VIOLATION_LOOKBACK = 50;
 
@@ -59,6 +67,12 @@ export type State = {
   csmsSessions: Record<string, CsmsSessionView>;
   /** Its findings, oldest first. */
   csmsViolations: ConformanceViolation[];
+  /** stationId → evseId → streamed time-series points, oldest first; only for watched stations. */
+  series: Record<string, Record<number, SeriesPoint[]>>;
+  /** Stations whose series a view is showing (mounted views per station): the only ones whose points are kept. */
+  seriesWatch: Record<string, number>;
+  /** Streamed fleet aggregate bins, oldest first. */
+  fleetBins: FleetBin[];
 };
 
 export type StoreAction =
@@ -67,7 +81,9 @@ export type StoreAction =
   | { type: 'errors-cleared'; stationId: string }
   | { type: 'runs-loaded'; runs: RunSummary[] }
   | { type: 'run-removed'; id: string }
-  | { type: 'csms-loaded'; view: CsmsView; violations?: ConformanceViolation[] };
+  | { type: 'csms-loaded'; view: CsmsView; violations?: ConformanceViolation[] }
+  /** A view starts (+1) or stops (-1) showing a station's series; points of unwatched stations are not kept. */
+  | { type: 'series-watch'; stationId: string; delta: 1 | -1 };
 
 export const initialState: State = {
   stations: {},
@@ -83,6 +99,9 @@ export const initialState: State = {
   csms: null,
   csmsSessions: {},
   csmsViolations: [],
+  series: {},
+  seriesWatch: {},
+  fleetBins: [],
 };
 
 /**
@@ -128,6 +147,25 @@ function samplePower(prev: Record<number, PowerSample[]> | undefined, station: S
 function frameMatches(frame: FrameEvent, v: Violation): boolean {
   if (frame.dir !== 'in' || frame.action !== v.action) return false;
   return v.direction === 'request' ? frame.type === 2 || frame.type === 6 : frame.type === 3;
+}
+
+function appendSeries(state: State, stationId: string, points: readonly SeriesPoint[]): State {
+  const prev = state.series[stationId] ?? {};
+  const next: Record<number, SeriesPoint[]> = { ...prev };
+  const touched = new Set<number>();
+  for (const p of points) {
+    if (!touched.has(p.evse)) {
+      next[p.evse] = [...(prev[p.evse] ?? [])];
+      touched.add(p.evse);
+    }
+    const list = next[p.evse] as SeriesPoint[];
+    const last = list[list.length - 1];
+    if (last && p.t < last.t) continue;
+    if (last && p.t - last.t < SERIES_MERGE_MS && p.status === last.status) list[list.length - 1] = { ...p, t: last.t };
+    else list.push(p);
+    if (list.length > SERIES_CAP) list.splice(0, list.length - SERIES_CAP);
+  }
+  return { ...state, series: { ...state.series, [stationId]: next } };
 }
 
 function upsertStation(state: State, station: StationView, now: number): State {
@@ -192,6 +230,7 @@ export function reduce(state: State, action: StoreAction, now: number): State {
         violations: pick(state.violations, keep),
         power: pick(state.power, keep),
         errors: pick(state.errors, keep),
+        series: pick(state.series, keep),
         snapshots: state.snapshots + 1,
       };
       for (const station of action.stations) next = upsertStation(next, station, now);
@@ -208,9 +247,28 @@ export function reduce(state: State, action: StoreAction, now: number): State {
         violations: without(state.violations, action.id),
         power: without(state.power, action.id),
         errors: without(state.errors, action.id),
+        series: without(state.series, action.id),
       };
     case 'frame':
       return appendFrame(state, action.frame);
+    case 'series':
+      return (state.seriesWatch[action.stationId] ?? 0) > 0 && action.stationId in state.stations
+        ? appendSeries(state, action.stationId, action.points)
+        : state;
+    case 'series-watch': {
+      const n = (state.seriesWatch[action.stationId] ?? 0) + action.delta;
+      if (n > 0) return { ...state, seriesWatch: { ...state.seriesWatch, [action.stationId]: n } };
+      return {
+        ...state,
+        seriesWatch: without(state.seriesWatch, action.stationId),
+        series: without(state.series, action.stationId),
+      };
+    }
+    case 'fleet': {
+      const last = state.fleetBins[state.fleetBins.length - 1];
+      if (last && action.bin.t <= last.t) return state;
+      return { ...state, fleetBins: [...state.fleetBins, action.bin].slice(-FLEET_BIN_CAP) };
+    }
     case 'frames-loaded':
       return {
         ...state,

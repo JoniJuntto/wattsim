@@ -1,16 +1,21 @@
 import { CheckIcon, FileCodeIcon, FileDownIcon, SquareIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useMemo } from 'react';
+import { useRunTimeline } from '@/api/charts';
 import { downloads } from '@/api/http';
 import { useCancelRun, useDeleteRun, useRunDetail } from '@/api/server-mode';
 import type { RunDetail, RunEventView, RunStationResult, RunSummary } from '@/api/types';
 import { Confirm } from '@/components/app/confirm-button';
 import { RunStatusBadge } from '@/components/app/run-status';
+import { ChartFrame, type LegendItem } from '@/components/charts/frame';
+import { Swimlanes } from '@/components/charts/swimlanes';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
+import { formatOffset } from '@/lib/chart';
 import { clockTime, duration } from '@/lib/format';
+import { STATUS_LABEL } from '@/lib/status';
 import { cn } from '@/lib/utils';
 import { useLive } from '@/state/live';
 
@@ -128,6 +133,55 @@ function Events({ events, dropped }: { events: RunEventView[]; dropped: number }
       })}
       {dropped > 0 && <li className="py-1 text-muted-foreground">… {dropped} more events not kept</li>}
     </ol>
+  );
+}
+
+/** The run's swimlanes, refetched while it runs. */
+function RunTimelineSection({ run }: { run: RunSummary }) {
+  const q = useRunTimeline(run.id, run.status);
+  const t = q.data;
+  if (!t || t.lanes.length === 0) return null;
+  const statuses = [...new Set(t.lanes.flatMap((l) => l.statuses.map((s) => s.status)))];
+  const legend: LegendItem[] = [
+    ...statuses.map((s) => ({
+      label: STATUS_LABEL[s as keyof typeof STATUS_LABEL] ?? s,
+      color: `var(--st-${s.toLowerCase()}, var(--st-unknown))`,
+      shape: 'rect' as const,
+    })),
+    { label: 'Transaction', color: 'var(--chart-ink)', shape: 'line' },
+  ];
+  if (t.lanes.some((l) => l.marks.some((m) => m.kind !== 'violation'))) {
+    legend.push({ label: 'Failed', color: 'var(--st-faulted)', shape: 'dot' });
+  }
+  if (t.lanes.some((l) => l.marks.some((m) => m.kind === 'violation'))) {
+    legend.push({ label: 'Violation', color: 'var(--violation)', shape: 'dot' });
+  }
+  return (
+    <div className="border-b px-3 py-2">
+      <ChartFrame
+        dense
+        title={
+          <span className="font-semibold text-muted-foreground text-xs uppercase tracking-wide">
+            Timeline{run.virtual ? ' (virtual time)' : ''}
+          </span>
+        }
+        legend={legend}
+        table={() => ({
+          columns: ['Station', 'At', 'What'],
+          rows: t.lanes.flatMap((l) => [
+            ...l.statuses.map((s) => [l.station, formatOffset(s.from - t.from), `EVSE ${s.evse} ${s.status}`]),
+            ...l.transactions.map((x) => [
+              l.station,
+              formatOffset(x.from - t.from),
+              `transaction ${x.id} on EVSE ${x.evse}, ${x.open ? 'open' : `until ${formatOffset(x.to - t.from)}`}`,
+            ]),
+            ...l.marks.map((m) => [l.station, formatOffset(m.at - t.from), `${m.kind}: ${m.text}`]),
+          ]),
+        })}
+      >
+        <Swimlanes timeline={t} />
+      </ChartFrame>
+    </div>
   );
 }
 
@@ -297,6 +351,7 @@ export function RunPanel({
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
+        <RunTimelineSection run={run} />
         <div className="border-b px-3 py-2">
           <h3 className="font-semibold text-muted-foreground text-xs uppercase tracking-wide">Stations</h3>
           {stations.length === 0 ? (

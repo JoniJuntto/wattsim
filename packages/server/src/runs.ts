@@ -13,12 +13,14 @@ import { Station, VirtualClock, WallClock } from '@wattsim/core';
 import type { Csms } from '@wattsim/csms';
 import type { Linked, RunEvent, RunResult, Scenario } from '@wattsim/scenario';
 import { driveVirtual, formatDuration, isIdle, run as runScenario } from '@wattsim/scenario';
-import { formatTrace, Recorder } from '@wattsim/trace';
+import type { TraceEntry } from '@wattsim/trace';
+import { formatTrace, parseTrace, Recorder } from '@wattsim/trace';
+import { runTimeline } from './analytics';
 import type { RunRow, Store } from './db/store';
 import { runDetail, runSummary } from './db/store';
 import type { StreamHub } from './stream';
 import { STATE_INTERVAL_MS } from './stream';
-import type { RunCsmsView, RunDetail, RunEventView, RunResultView, RunStatus, RunSummary } from './types';
+import type { RunCsmsView, RunDetail, RunEventView, RunResultView, RunStatus, RunSummary, RunTimeline } from './types';
 
 /** Events kept with a run (oldest first); later ones are counted in `eventsDropped`. */
 export const RUN_EVENTS_KEPT = 2000;
@@ -236,6 +238,24 @@ export class Runs {
     if (live) return { ...runDetail(live.row), ...this.summary(live) };
     const row = this.store.run(id);
     return row && runDetail(row);
+  }
+
+  /** Per-station swimlanes of a run, from its frames (live, or its saved recording) and its events. */
+  timeline(id: string): RunTimeline | undefined {
+    const live = this.live.get(id);
+    if (live) return runTimeline(id, live.recorder.entries, live.row.events, live.clock.now());
+    const row = this.store.run(id);
+    if (!row) return undefined;
+    const rec = row.recordingId === null ? undefined : this.store.recordingTrace(row.recordingId);
+    let entries: TraceEntry[] = [];
+    if (rec) {
+      try {
+        entries = parseTrace(rec.trace);
+      } catch {
+        // A recording that does not parse: the events alone still give the lanes.
+      }
+    }
+    return runTimeline(id, entries, row.events, undefined);
   }
 
   private summary(l: Live): RunSummary {

@@ -18,10 +18,24 @@ import type { Frame, Violation } from '@wattsim/protocol';
 import { isKnownAction, MessageType, validatePayload } from '@wattsim/protocol';
 import { buildChaos } from './chaos';
 import { TrackedClock } from './clock';
+import type { FleetStationState } from './fleet';
 import type { ActionBody, ChaosBody, CreateStation } from './schemas';
 import { BadRequest } from './schemas';
+import { effectiveStep, STATUS_ORDER, StationSeries } from './series';
 import { dslJson, dslNumber, dslString, SessionRecorder } from './session';
-import type { ChaosRuleView, ConnectionView, EvseView, FrameEvent, OcppVersion, StationView } from './types';
+import type {
+  ChaosRuleView,
+  ConnectionView,
+  EvseSeriesView,
+  EvseView,
+  FleetStationsView,
+  FrameEvent,
+  OcppVersion,
+  ScheduleView,
+  SeriesSample,
+  StationSeriesView,
+  StationView,
+} from './types';
 
 export const FRAMES_PER_STATION = 2000;
 /** How long an action request waits for the station before answering 202 and letting the stream report the rest. */
@@ -39,6 +53,8 @@ export interface Sink {
   frame(frame: FrameEvent): void;
   violation(stationId: string, violation: Violation): void;
   error(stationId: string, message: string): void;
+  /** A sample was added to (or replaced the newest one of) an EVSE's time series. */
+  series?(stationId: string, evse: number, sample: SeriesSample): void;
 }
 
 /** Errors already forwarded from a station's `error` event, so a late action failure is not streamed twice. */
@@ -59,6 +75,7 @@ type Entry = {
   wantConnected: boolean;
   everOpen: boolean;
   unsubscribe: Array<() => void>;
+  series: StationSeries;
 };
 
 /** What an action answers: `pending` when the station had not finished within `ACTION_WAIT_MS`. */
@@ -137,6 +154,7 @@ export class Registry {
       wantConnected: false,
       everOpen: false,
       unsubscribe: [],
+      series: new StationSeries(station.evses.length),
     };
     this.entries.set(s.id, entry);
     this.wire(entry);
@@ -155,7 +173,11 @@ export class Registry {
 
   private wire(e: Entry): void {
     const { station, id } = e;
-    const changed = () => this.sink.stationChanged(id);
+    const changed = () => {
+      this.sample(e);
+      this.sink.stationChanged(id);
+    };
+    this.sample(e);
     e.unsubscribe.push(
       station.on('state', changed),
       station.on('status', changed),
@@ -176,6 +198,20 @@ export class Registry {
         if (rule.once && rule.id && e.chaosViews.delete(rule.id)) changed();
       }),
     );
+  }
+
+  /** Sample every EVSE into its time series; unchanged EVSEs store nothing. */
+  private sample(e: Entry): void {
+    const s = e.station;
+    const now = e.clock.now();
+    for (const evse of s.evses) {
+      const series = e.series.evse(evse.id);
+      if (!series) continue;
+      const sample = seriesSample(evse, now, s.cfg.voltageV);
+      const currency = evse.tx?.cost?.currency;
+      if (currency !== undefined) series.currency = currency;
+      if (series.record(sample)) this.sink.series?.(e.id, evse.id, sample);
+    }
   }
 
   private onFrame(e: Entry, dir: 'in' | 'out', frame: Frame, raw: string): void {
@@ -451,6 +487,98 @@ export class Registry {
     this.sink.stationChanged(id);
   }
 
+  // ---- time series --------------------------------------------------------------------------------------------
+
+  /** Every EVSE's samples in [from, to], downsampled to `step` (see `EvseSeries.query`). */
+  series(id: string, from: number, to: number, step: number): StationSeriesView {
+    const e = this.get(id);
+    const eff = effectiveStep(from, to, step);
+    const evses: EvseSeriesView[] = e.series.evses.map((s) => s.query(from, to, eff));
+    const rawFroms = e.series.evses.map((s) => s.rawFrom).filter((t): t is number => t !== null);
+    return {
+      stationId: id,
+      from,
+      to,
+      step: eff,
+      fullResolutionFrom: rawFroms.length > 0 ? Math.max(...rawFroms) : null,
+      evses,
+    };
+  }
+
+  /** Bytes the time series of a station hold. */
+  seriesBytes(id: string): number {
+    return this.get(id).series.bytes();
+  }
+
+  /**
+   * The composite charging schedule of an EVSE (0: the grid connection) from now over `durationMs`, in kW: what the
+   * station would answer GetCompositeSchedule with.
+   */
+  schedule(id: string, evseId: number, durationMs: number): ScheduleView {
+    const e = this.get(id);
+    const s = e.station;
+    if (evseId !== 0 && s.evse(evseId) === undefined) {
+      throw new BadRequest(`evse: no EVSE ${evseId} on ${id} (have 0..${s.evses.length})`);
+    }
+    const from = e.clock.now();
+    const periods = s.charging.composite(evseId, from, durationMs, 'W').map((p) => {
+      const out: ScheduleView['periods'][number] = { startS: p.startPeriod, kw: Math.round(p.limit) / 1000 };
+      if (p.numberPhases !== undefined) out.phases = p.numberPhases;
+      return out;
+    });
+    const ratedKw = (s.cfg.maxCurrentA * s.cfg.phases * s.cfg.voltageV) / 1000;
+    return {
+      stationId: id,
+      evse: evseId,
+      from,
+      durationMs,
+      ratedKw: evseId === 0 ? ratedKw * s.evses.length : ratedKw,
+      profiles: s.charging.size,
+      periods,
+    };
+  }
+
+  /** Each station's connection and EVSE power/status right now, for the fleet aggregate. */
+  *fleetStates(): Iterable<FleetStationState> {
+    for (const e of this.entries.values()) {
+      yield {
+        connected: e.station.state.connection === 'Connected',
+        evses: e.station.evses.map((evse) => ({ status: evse.status, powerKw: evse.meter.power })),
+      };
+    }
+  }
+
+  /**
+   * One row per station: the energy it delivered in [from, to) and, per bin, its time-weighted mean power (all EVSEs
+   * together) or its most severe connector status (an index into `statuses`, -1 without data).
+   */
+  fleetStations(from: number, to: number, bins: number, metric: 'power' | 'status', now: number): FleetStationsView {
+    const rows: FleetStationsView['rows'] = [];
+    for (const e of this.entries.values()) {
+      const values = new Array<number | null>(bins).fill(null);
+      let energyWh = 0;
+      const kw = new Float64Array(bins);
+      const covered = new Float64Array(bins);
+      const worst = new Int16Array(bins).fill(-1);
+      for (const s of e.series.evses) {
+        const b = s.binned(from, to, bins, now);
+        energyWh += b.energyWh;
+        for (let i = 0; i < bins; i++) {
+          if ((b.covered[i] as number) <= 0) continue;
+          kw[i] = (kw[i] as number) + (b.kw[i] as number);
+          covered[i] = Math.max(covered[i] as number, b.covered[i] as number);
+          if ((b.status[i] as number) > (worst[i] as number)) worst[i] = b.status[i] as number;
+        }
+      }
+      for (let i = 0; i < bins; i++) {
+        if ((covered[i] as number) <= 0) continue;
+        values[i] = metric === 'power' ? Math.round((kw[i] as number) * 10) / 10 : (worst[i] as number);
+      }
+      rows.push({ id: e.id, energyWh: Math.round(energyWh), values });
+    }
+    return { from, to, step: (to - from) / bins, metric, statuses: [...STATUS_ORDER], rows };
+  }
+
   // ---- views ------------------------------------------------------------------------------------------------
 
   private get(id: string): Entry {
@@ -525,4 +653,30 @@ function evseView(evse: EvseState, now: number, voltageV: number): EvseView {
     };
   }
   return view;
+}
+
+/** One time-series sample of an EVSE as the model holds it now (energy and SoC extrapolated like `evseView`). */
+export function seriesSample(evse: EvseState, now: number, voltageV: number): SeriesSample {
+  const view = evseView(evse, now, voltageV);
+  const meter = evse.meter;
+  const current = meter.currentA;
+  const inUse = meter.phasesInUse;
+  const volts = meter.voltageV;
+  const wired = meter.phases;
+  const tx = evse.tx;
+  const cost = tx?.cost ? tx.cost.total : (tx?.csmsTotalCost ?? null);
+  const ev = view.ev && view.ev.state !== 'Unplugged' ? view.ev : undefined;
+  return {
+    t: now,
+    kw: view.powerKw,
+    a: [current, inUse >= 2 ? current : 0, inUse >= 3 ? current : 0],
+    v: [volts, wired === 3 ? volts : null, wired === 3 ? volts : null],
+    offeredKw: view.offeredKw,
+    limitKw: view.limitKw ?? null,
+    soc: ev ? ev.soc : null,
+    targetSoc: ev ? ev.targetSoc : null,
+    wh: view.energyWh,
+    cost,
+    status: view.status,
+  };
 }

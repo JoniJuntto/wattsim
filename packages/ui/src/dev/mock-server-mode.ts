@@ -25,6 +25,8 @@ import type {
   Tally,
 } from '../api/types';
 
+import { findingsBins as binFindings, runTimeline } from './mock-charts';
+
 export type MockContext = {
   emit(msg: StreamMessage): void;
   /** Frames of a UI station (the station page's log), if it exists. */
@@ -762,6 +764,21 @@ function seedCsms(ctx: MockContext) {
   // fleet-07's log (`externalFrames`) sends seqNo 12 again at its 14th update, 50 min ago.
   v('fleet-07', 'tx.seqno', 'TransactionEvent seqNo 12 after 13: a duplicate', 49 * MIN, 'TransactionEvent');
   v('fleet-07', 'tx.seqno', 'TransactionEvent seqNo 16 after 12: a gap of 3', 39 * MIN, 'TransactionEvent');
+  // A background of findings over the last 6 h, in bursts, so the findings charts have a shape.
+  const ids = [...csms.sessions.keys()];
+  const rules = Object.keys(RULES);
+  let seed = 7;
+  const rnd = () => {
+    seed = (seed * 16807) % 2147483647;
+    return (seed - 1) / 2147483646;
+  };
+  for (let i = 0; i < 260; i++) {
+    const burst =
+      rnd() < 0.5 ? 2.2 * HOUR + rnd() * 20 * MIN : rnd() < 0.5 ? 4.6 * HOUR + rnd() * 35 * MIN : rnd() * 6 * HOUR;
+    const id = ids[Math.floor(rnd() ** 1.6 * ids.length)] as string;
+    const rule = rules[Math.floor(rnd() ** 1.4 * rules.length)] as string;
+    v(id, rule, `${RULES[rule]?.summary ?? rule} (seeded)`, burst);
+  }
   csms.violations.sort((a, b) => a.at - b.at);
   refreshFindings();
   const yesterday = now0 - 21 * HOUR;
@@ -884,6 +901,7 @@ export function serverModeRoute(
     const r = b ? runs.get(b) : undefined;
     if (!r) throw new MockHttpError(404, `no run ${b}`);
     if (!c && method === 'GET') return json(r);
+    if (c === 'timeline' && method === 'GET') return json(runTimeline(r));
     if (c === 'cancel' && method === 'POST') return json(cancelRun(ctx, r.id));
     if (!c && method === 'DELETE') {
       if (r.status === 'running') throw new MockHttpError(409, `run ${r.id} is running; cancel it first`);
@@ -925,6 +943,12 @@ export function serverModeRoute(
   }
   if (a === 'csms') {
     if (!b) return json({ summary: summary(), sessions: csms.running ? [...csms.sessions.values()] : [] });
+    if (b === 'findings' && c === 'bins') {
+      const to = Number(url.searchParams.get('to') ?? Date.now());
+      const from = Number(url.searchParams.get('from') ?? to - HOUR);
+      const step = Math.max(Number(url.searchParams.get('step') ?? MIN), Math.ceil((to - from) / 500));
+      return json(binFindings(csms.running ? csms.violations : [], from, to, step));
+    }
     if (b === 'violations') {
       const limit = Number(url.searchParams.get('limit') ?? 1000);
       return json(csms.running ? csms.violations.slice(-limit) : []);

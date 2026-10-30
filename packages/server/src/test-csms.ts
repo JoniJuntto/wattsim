@@ -8,9 +8,10 @@ import type { Clock, ConformanceReport, ConformanceViolation, Csms, Session } fr
 import { addToReport, emptyReport, RULES, startCsms } from '@wattsim/csms';
 import { createTestCa, signCsr } from '@wattsim/pki';
 import { MessageType } from '@wattsim/protocol';
+import { FINDINGS_BUCKETS, findingsBins } from './analytics';
 import type { StreamHub } from './stream';
 import { STATE_INTERVAL_MS } from './stream';
-import type { CsmsRuleTally, CsmsSessionView, CsmsSummary, CsmsView, FrameEvent } from './types';
+import type { CsmsRuleTally, CsmsSessionView, CsmsSummary, CsmsView, FindingsBinsView, FrameEvent } from './types';
 
 /** CSMS-side frames kept per station. */
 export const CSMS_FRAMES_PER_STATION = 500;
@@ -165,6 +166,12 @@ export class TestCsms {
 
   violations(limit: number): ConformanceViolation[] {
     return this.current?.csms.violations.slice(-limit) ?? [];
+  }
+
+  /** Kept findings in [from, to) binned by `step` (raised so at most `FINDINGS_BUCKETS` buckets). */
+  findingsBins(from: number, to: number, step: number): FindingsBinsView {
+    const eff = Math.max(step, Math.ceil((to - from) / FINDINGS_BUCKETS), 1);
+    return findingsBins(this.current?.csms.violations ?? [], from, to, eff);
   }
 
   summary(): CsmsSummary {

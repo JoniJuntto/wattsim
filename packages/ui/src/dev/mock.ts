@@ -17,6 +17,14 @@ import type {
   ValidateBody,
   Violation,
 } from '../api/types';
+import {
+  chartsTick,
+  fillerStations,
+  fleetSeries,
+  fleetStations,
+  schedule as mockSchedule,
+  stationSeries,
+} from './mock-charts';
 import { type MockContext, MockHttpError, seedServerMode, serverModeRoute, serverModeTick } from './mock-server-mode';
 
 const FRAME_CAP = 2000;
@@ -538,9 +546,30 @@ async function route(method: string, url: URL, body: unknown): Promise<Response>
       for (const s of created) emit({ type: 'station', station: s });
       return json(o.template !== undefined ? created : created[0]);
     }
+    if (a === 'fleet') {
+      const q = url.searchParams;
+      const to = Number(q.get('to') ?? Date.now());
+      const from = Number(q.get('from') ?? to - 3_600_000);
+      const views = [...stations.values()].map((s) => s.view);
+      if (b === 'series') return json(fleetSeries(views, from, to, Number(q.get('step') ?? 10_000)));
+      if (b === 'stations') {
+        const metric = q.get('metric') === 'status' ? 'status' : 'power';
+        return json(fleetStations(views, from, to, Number(q.get('bins') ?? 120), metric));
+      }
+    }
     const sim = b ? stations.get(b) : undefined;
     if (a === 'stations' && b) {
       if (!sim) throw new HttpError(404, `No station ${b}`);
+      if (c === 'series') {
+        const q = url.searchParams;
+        const to = Number(q.get('to') ?? Date.now());
+        const from = Number(q.get('from') ?? to - 3_600_000);
+        return json(stationSeries(sim.view, from, to, Number(q.get('step') ?? 0)));
+      }
+      if (c === 'schedule') {
+        const q = url.searchParams;
+        return json(mockSchedule(sim.view, Number(q.get('evse') ?? 1), Number(q.get('duration') ?? 86_400)));
+      }
       if (!c && method === 'DELETE') {
         stations.delete(b);
         frames.delete(b);
@@ -641,9 +670,12 @@ const mockContext: MockContext = {
   },
 };
 
+/** Stations added by `?mock&fleet=N`: static, never ticked. */
+const filler = new Set<string>();
+
 function tick() {
   for (const sim of stations.values()) {
-    if (sim.view.connection !== 'open') continue;
+    if (sim.view.connection !== 'open' || filler.has(sim.view.id)) continue;
     let changed = false;
     sim.meterTick++;
     for (const e of sim.view.evses) {
@@ -847,6 +879,11 @@ function seed() {
 export function installMock() {
   const empty = new URLSearchParams(window.location.search).get('mock') === 'empty';
   if (!empty) seed();
+  const fleetSize = Number(new URLSearchParams(window.location.search).get('fleet') ?? 0);
+  for (const view of fillerStations(Number.isInteger(fleetSize) ? Math.min(fleetSize, 5000) : 0)) {
+    stations.set(view.id, { view, meterTick: 0, nextTx: 1 });
+    filler.add(view.id);
+  }
   seedServerMode(mockContext, empty);
   const realFetch = window.fetch.bind(window);
   window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -862,9 +899,15 @@ export function installMock() {
     if (String(url).endsWith('/api/stream')) return new FakeSocket(String(url));
     return new RealWebSocket(url, protocols);
   } as unknown as typeof WebSocket;
+  const chartDeps = {
+    stations: () => [...stations.values()].map((s) => s.view),
+    live: (id: string) => !filler.has(id),
+    emit,
+  };
   setInterval(() => {
     tick();
     serverModeTick(mockContext);
+    chartsTick(chartDeps);
   }, 1000);
   // Console hooks for checking reconnect behaviour by hand.
   Object.assign(window, {

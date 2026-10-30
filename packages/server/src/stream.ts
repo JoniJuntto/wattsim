@@ -6,13 +6,23 @@
 import type { ConformanceViolation } from '@wattsim/csms';
 import type { Violation } from '@wattsim/protocol';
 import type { Sink } from './registry';
-import type { FrameEvent, RunEventView, StationView, StreamMessage } from './types';
+import type {
+  FleetBin,
+  FrameEvent,
+  RunEventView,
+  SeriesPoint,
+  SeriesSample,
+  StationView,
+  StreamMessage,
+} from './types';
 
 export const STATION_INTERVAL_MS = 200;
 /** `run`, `csms` and `csms.session` state messages. */
 export const STATE_INTERVAL_MS = 250;
 /** `csms.violation` messages per second; the rest are counted in `csms` totals and fetched from `/api/csms/violations`. */
 export const CSMS_VIOLATIONS_PER_S = 50;
+/** `series` points held per station between two messages; older ones are dropped (the HTTP API has them). */
+export const SERIES_PENDING_CAP = 500;
 
 export type StreamSocket = { send(data: string): unknown; close(code?: number, reason?: string): unknown };
 
@@ -21,6 +31,8 @@ export class StreamHub implements Sink {
   private readonly lastSent = new Map<string, number>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private violationWindow = { start: 0, sent: 0 };
+  /** Series points not yet sent, per station. */
+  private readonly pendingSeries = new Map<string, SeriesPoint[]>();
 
   constructor(private readonly view: (id: string) => StationView | undefined) {}
 
@@ -44,8 +56,37 @@ export class StreamHub implements Sink {
     });
   }
 
+  /** Coalesced like `station`: one `series` message per station per interval, carrying every point since. */
+  series(stationId: string, evse: number, sample: SeriesSample): void {
+    if (this.sockets.size === 0) return;
+    let list = this.pendingSeries.get(stationId);
+    if (!list) {
+      list = [];
+      this.pendingSeries.set(stationId, list);
+    }
+    const last = list.at(-1);
+    // A sample that replaced the newest one of its series replaces it here too.
+    if (last && last.evse === evse && last.t <= sample.t && sample.t - last.t < 250 && last.status === sample.status) {
+      list[list.length - 1] = { ...sample, evse, t: last.t };
+    } else {
+      list.push({ ...sample, evse });
+      if (list.length > SERIES_PENDING_CAP) list.shift();
+    }
+    this.coalesce(`series:${stationId}`, STATION_INTERVAL_MS, () => {
+      const points = this.pendingSeries.get(stationId);
+      this.pendingSeries.delete(stationId);
+      return points && points.length > 0 ? { type: 'series', stationId, points } : undefined;
+    });
+  }
+
+  fleet(bin: FleetBin): void {
+    this.broadcast({ type: 'fleet', bin });
+  }
+
   removed(id: string): void {
     this.forget(`station:${id}`);
+    this.forget(`series:${id}`);
+    this.pendingSeries.delete(id);
     this.broadcast({ type: 'removed', id });
   }
 
@@ -106,6 +147,7 @@ export class StreamHub implements Sink {
   /** Cancel pending messages and close every socket. */
   close(): void {
     for (const key of [...this.timers.keys()]) this.forget(key);
+    this.pendingSeries.clear();
     for (const ws of this.sockets) {
       try {
         ws.close(1001, 'server stopping');

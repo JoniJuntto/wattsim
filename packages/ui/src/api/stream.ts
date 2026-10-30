@@ -31,6 +31,8 @@ const TYPES = new Set([
   'csms',
   'csms.session',
   'csms.violation',
+  'series',
+  'fleet',
 ]);
 
 const isObject = (v: unknown) => typeof v === 'object' && v !== null;
@@ -70,6 +72,10 @@ export function parseStreamMessage(data: unknown): StreamMessage | null {
       return isObject(m.session) ? (m as StreamMessage) : null;
     case 'csms.violation':
       return isObject(m.violation) ? (m as StreamMessage) : null;
+    case 'series':
+      return typeof m.stationId === 'string' && Array.isArray(m.points) ? (m as StreamMessage) : null;
+    case 'fleet':
+      return isObject(m.bin) ? (m as StreamMessage) : null;
     default:
       return null;
   }
