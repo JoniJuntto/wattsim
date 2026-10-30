@@ -24,7 +24,7 @@ import {
 } from '@/lib/frames';
 import { cn } from '@/lib/utils';
 import { useLive } from '@/state/live';
-import type { ViolationEntry } from '@/state/store';
+import { isTrimmed, type ViolationEntry } from '@/state/store';
 
 const NO_FRAMES: FrameEvent[] = [];
 const NO_VIOLATIONS: ViolationEntry[] = [];
@@ -48,7 +48,7 @@ function problemOf(f: FrameEvent, pairing: Pairing, violations: Violation[] | un
   if (isError(f)) return 'error';
   if (violations?.length) return 'violation';
   if (!parseFrame(f).ok) return 'malformed';
-  if (isResponse(f) && !pairing.partner.has(f.seq)) return 'unpaired';
+  if (isResponse(f) && !pairing.partner.has(f.seq) && !pairing.callNotKept.has(f.seq)) return 'unpaired';
   return null;
 }
 
@@ -64,16 +64,18 @@ function exchangeProblems(ex: Exchange, pairing: Pairing, violationsBySeq: Map<n
 const sideOf = (f: FrameEvent): Initiator => (f.dir === 'out' ? 'station' : 'csms');
 
 /** The request and return arrows between the two lanes for one exchange. */
-function WireGlyph({ ex, bad }: { ex: Exchange; bad: boolean }) {
+function WireGlyph({ ex, bad, callNotKept }: { ex: Exchange; bad: boolean; callNotKept: boolean }) {
   const first = ex.call ?? ex.lone;
   if (!first) return null;
   const from = (side: Initiator) => (side === 'station' ? LANE_CP : LANE_CSMS);
   const color = (f: FrameEvent) =>
-    isError(f) || (f === ex.lone && isResponse(f)) || !parseFrame(f).ok
+    isError(f) || (f === ex.lone && isResponse(f) && !callNotKept) || !parseFrame(f).ok
       ? 'var(--violation)'
-      : f.dir === 'out'
-        ? 'var(--out)'
-        : 'var(--in)';
+      : callNotKept
+        ? 'var(--muted-foreground)'
+        : f.dir === 'out'
+          ? 'var(--out)'
+          : 'var(--in)';
   const arrow = (f: FrameEvent, y: number, dashed: boolean) => {
     const x1 = from(sideOf(f));
     const x2 = x1 === LANE_CP ? LANE_CSMS : LANE_CP;
@@ -208,6 +210,8 @@ const Row = memo(function Row({
 }) {
   const problems = exchangeProblems(ex, pairing, violationsBySeq);
   const bad = problems.length > 0;
+  // A reply whose CALL scrolled out of the buffer: shown, but not a problem.
+  const callNotKept = ex.lone !== undefined && pairing.callNotKept.has(ex.lone.seq);
   const violationCount = ex.frames.reduce((n, f) => n + (violationsBySeq.get(f.seq)?.length ?? 0), 0);
   const first = (ex.call ?? ex.lone) as FrameEvent;
   const latency = ex.reply ? pairing.latencyMs.get(ex.reply.seq) : undefined;
@@ -231,7 +235,7 @@ const Row = memo(function Row({
         className="relative grid w-full grid-cols-[5.6rem_68px_minmax(0,1fr)_auto] items-start gap-x-2 px-2 py-1 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
       >
         <span className="pt-0.5 font-mono text-[11px] text-muted-foreground">{clockTime(first.at)}</span>
-        <WireGlyph ex={ex} bad={bad} />
+        <WireGlyph ex={ex} bad={bad} callNotKept={callNotKept} />
         <span className="flex min-w-0 flex-col">
           <span className="flex min-w-0 items-baseline gap-2">
             <span className="truncate font-medium text-[13px]">{ex.action ?? '(unknown action)'}</span>
@@ -257,6 +261,14 @@ const Row = memo(function Row({
             {problems.includes('unpaired') && (
               <span className="shrink-0 text-[11px] text-violation" title="No CALL with this message id">
                 answers no call
+              </span>
+            )}
+            {callNotKept && (
+              <span
+                className="shrink-0 text-[11px] text-muted-foreground"
+                title="Its CALL is older than the frames kept in this log"
+              >
+                earlier call not kept
               </span>
             )}
           </span>
@@ -312,7 +324,7 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
   const debouncedText = useDebounced(text, 150);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const pairing = useMemo(() => pairFrames(frames), [frames]);
+  const pairing = useMemo(() => pairFrames(frames, { trimmed: isTrimmed(frames) }), [frames]);
   const exchanges = useMemo(() => groupExchanges(frames, pairing), [frames, pairing]);
   const violationsBySeq = useMemo(() => {
     const m = new Map<number, Violation[]>();

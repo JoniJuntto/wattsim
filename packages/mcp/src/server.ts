@@ -2,6 +2,7 @@
  * The MCP surface: tools that are thin wrappers over the UI server's HTTP API (so a person watching the UI sees
  * what the agent does), scenario tools that run in-process, and two resources.
  */
+import { connect } from 'node:net';
 import { resolve } from 'node:path';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
@@ -16,6 +17,7 @@ import {
   DEFAULT_FAILURE_FRAMES,
   DEFAULT_WALL_TIMEOUT_MS,
   formatScenario,
+  MAX_TIMER_MS,
   MAX_VIRTUAL_MS,
   runScenario,
 } from './scenario';
@@ -103,9 +105,42 @@ function frameOut(f: FrameEvent): Json {
   return out;
 }
 
+const isLoopbackHost = (hostname: string) =>
+  hostname === 'localhost' || hostname === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(hostname);
+
+/**
+ * The UI server's test CSMS URL as seen from this process when attached to `serverUrl`. The server reports its test
+ * CSMS as `ws://127.0.0.1:<port>`, which is right for stations it runs itself but not for run_scenario, whose stations
+ * run here: when the server is on another host, its host replaces the loopback one (port and path are kept).
+ */
+export function attachedCsmsUrl(loopbackUrl: string, serverUrl: string): string {
+  const { hostname } = new URL(serverUrl);
+  if (isLoopbackHost(hostname)) return loopbackUrl;
+  return loopbackUrl.replace(/^(wss?:\/\/)(\[[^\]]*\]|[^/:]+)/, (_, scheme: string) => `${scheme}${hostname}`);
+}
+
+/** Whether a TCP connection to the URL's host and port opens within `timeoutMs`. */
+function reachable(url: string, timeoutMs = 3000): Promise<boolean> {
+  const u = new URL(url);
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const port = Number(u.port || (u.protocol === 'wss:' ? 443 : 80));
+  return new Promise((resolve) => {
+    const socket = connect({ host, port });
+    const done = (ok: boolean) => {
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.once('connect', () => done(true));
+    socket.once('error', () => done(false));
+  });
+}
+
 export type WattsimMcpOptions = {
   /** Base URL of the UI server whose API the tools wrap, e.g. `http://127.0.0.1:7700`. */
   serverUrl: string;
+  /** The server was started elsewhere (`--attach`), possibly on another host. */
+  attached?: boolean;
 };
 
 export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
@@ -113,6 +148,17 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
   const wall = new WallClock();
   const server = new McpServer({ name: 'wattsim', version: pkg.version }, { instructions: INSTRUCTIONS });
   const testCsms = async () => (await api.post<{ url: string }>('/api/loopback')).url;
+  /** The test CSMS for run_scenario, whose stations run in this process rather than in the UI server. */
+  const scenarioCsms = async () => {
+    const loopback = await testCsms();
+    if (!opts.attached) return loopback;
+    const url = attachedCsmsUrl(loopback, opts.serverUrl);
+    if (url === loopback || (await reachable(url))) return url;
+    throw new Error(
+      `cannot reach the built-in test CSMS of ${opts.serverUrl} at ${url}: it listens on 127.0.0.1 on that host. ` +
+        'Pass csmsUrl with a CSMS this machine can reach.',
+    );
+  };
 
   // ---- stations ----------------------------------------------------------------------------------------------
 
@@ -400,7 +446,7 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
         'Run a scenario and report per station: ok, asserts (expect lines), schema violations and, for failing ' +
         'stations, their first frames. Runs on a virtual clock by default, so hours of scenario time take ' +
         `seconds (capped at ${MAX_VIRTUAL_MS / 3_600_000} h). Uses the built-in test CSMS unless csmsUrl is given; ` +
-        "the scenario's own csms line is ignored.",
+        "the scenario's own csms line is ignored. Attached to a wattsim ui on another host, give csmsUrl.",
       inputSchema: {
         text: scenarioText,
         csmsUrl: z.string().optional().describe('CSMS WebSocket URL; omit for the built-in test CSMS'),
@@ -417,6 +463,7 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
         timeoutSeconds: z
           .number()
           .positive()
+          .max(Math.floor(MAX_TIMER_MS / 1000))
           .default(DEFAULT_WALL_TIMEOUT_MS / 1000)
           .describe('Real-time runs only: abort after this long'),
       },
@@ -427,7 +474,7 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
         const checked = checkScenario(text);
         if (!checked.ok) throw new Error(checked.error.text);
         return runScenario(text, {
-          csmsUrl: csmsUrl ?? (await testCsms()),
+          csmsUrl: csmsUrl ?? (await scenarioCsms()),
           virtual,
           seed,
           speed,

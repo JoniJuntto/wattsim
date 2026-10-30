@@ -11,7 +11,7 @@ import { createWattsimMcp } from './server';
 
 export { Api, ApiError } from './api';
 export * from './scenario';
-export { createWattsimMcp, DEFAULT_FRAME_LIMIT, DSL_DOC_PATH, type WattsimMcpOptions } from './server';
+export { attachedCsmsUrl, createWattsimMcp, DEFAULT_FRAME_LIMIT, DSL_DOC_PATH, type WattsimMcpOptions } from './server';
 
 export type McpOptions = {
   /** URL of a running `wattsim ui` to drive instead of embedding a server. */
@@ -37,7 +37,7 @@ export async function createMcp(opts: McpOptions = {}): Promise<WattsimMcp> {
     const api = new Api(opts.attach);
     const health = await api.get<{ ok?: boolean }>('/api/health');
     if (health?.ok !== true) throw new Error(`${api.baseUrl} is not a wattsim server (no /api/health)`);
-    const server = createWattsimMcp({ serverUrl: api.baseUrl });
+    const server = createWattsimMcp({ serverUrl: api.baseUrl, attached: true });
     return { server, url: api.baseUrl, embedded: false, close: () => server.close() };
   }
   const running = await startServer({ port: opts.port ?? 0, host: opts.host ?? DEFAULT_HOST });

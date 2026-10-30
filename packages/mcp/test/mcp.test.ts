@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { RunningServer } from '@wattsim/server';
 import { startServer } from '@wattsim/server';
-import { createMcp, type WattsimMcp } from '../src/index';
+import { attachedCsmsUrl, createMcp, runScenario, type WattsimMcp } from '../src/index';
 
 const BASIC = resolve(import.meta.dir, '../../../examples/basic.ws');
 
@@ -236,6 +237,27 @@ describe('embedded server', () => {
     expect(fmt.text).toStartWith('3:3: ');
   });
 
+  test('a wall-clock timeout above the 32-bit timer limit does not abort the run at once', async () => {
+    const text = [
+      'wattsim 1',
+      'station "CP-T" {',
+      '  version 1.6',
+      '  boot',
+      '  expect result BootNotification {status: "Accepted"} within 5s',
+      '}',
+      '',
+    ].join('\n');
+    const { url } = (await ok(client, 'start_test_csms')) as { url: string };
+    // 2^31 ms and more overflows setTimeout, which then fires after 1 ms.
+    const report = await runScenario(text, { csmsUrl: url, virtual: false, timeoutMs: 3_000_000_000 });
+    expect(report.note).toBeUndefined();
+    expect(report).toMatchObject({ ok: true, failedCount: 0 });
+
+    const tooLong = await call(client, 'run_scenario', { text, virtual: false, timeoutSeconds: 2_147_484 });
+    expect(tooLong.isError).toBe(true);
+    expect(tooLong.text).toContain('timeoutSeconds');
+  });
+
   test('the DSL reference resource', async () => {
     const res = await client.readResource({ uri: 'wattsim://docs/dsl' });
     expect((res.contents[0] as { text: string }).text).toContain('expect');
@@ -272,6 +294,48 @@ describe('--attach', () => {
   test('refuses a URL that is not a wattsim server', async () => {
     await expect(createMcp({ attach: 'http://127.0.0.1:1' })).rejects.toThrow('cannot reach');
   });
+});
+
+describe('attachedCsmsUrl', () => {
+  test('points the loopback URL at the attached host, keeping port and path', () => {
+    expect(attachedCsmsUrl('ws://127.0.0.1:41234', 'http://ui.example:7700')).toBe('ws://ui.example:41234');
+    expect(attachedCsmsUrl('ws://127.0.0.1:41234/ocpp', 'http://10.0.0.5:7700')).toBe('ws://10.0.0.5:41234/ocpp');
+    expect(attachedCsmsUrl('ws://localhost:41234', 'http://[fd00::5]:7700')).toBe('ws://[fd00::5]:41234');
+  });
+
+  test('leaves the URL alone when the attached server is on this machine', () => {
+    for (const server of ['http://127.0.0.1:7700', 'http://localhost:7700', 'http://[::1]:7700']) {
+      expect(attachedCsmsUrl('ws://127.0.0.1:41234', server)).toBe('ws://127.0.0.1:41234');
+    }
+  });
+});
+
+/** A non-loopback IPv4 address of this machine, to attach as if the UI server were remote. */
+const lanAddress = Object.values(networkInterfaces())
+  .flat()
+  .find((i) => i?.family === 'IPv4' && !i.internal)?.address;
+
+describe('--attach to a server on another host', () => {
+  test.skipIf(lanAddress === undefined)(
+    'run_scenario without csmsUrl reports the unreachable test CSMS instead of dialing 127.0.0.1 here',
+    async () => {
+      const ui = await startServer({ port: 0, host: '0.0.0.0' });
+      const port = new URL(ui.url).port;
+      const mcp = await createMcp({ attach: `http://${lanAddress}:${port}` });
+      const client = await connect(mcp);
+      try {
+        const text = await Bun.file(BASIC).text();
+        const r = await call(client, 'run_scenario', { text });
+        expect(r.isError).toBe(true);
+        expect(r.text).toContain(`ws://${lanAddress}:`);
+        expect(r.text).toContain('csmsUrl');
+      } finally {
+        await client.close();
+        await mcp.close();
+        await ui.stop();
+      }
+    },
+  );
 });
 
 describe('stdio', () => {

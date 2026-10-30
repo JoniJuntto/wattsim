@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import type { FrameEvent } from '../src/api/types';
 import { actionsIn, filterFrames, groupExchanges, pairFrames, parseFrame, previewOf } from '../src/lib/frames';
 import { frame } from './fixtures';
 
@@ -140,5 +141,66 @@ describe('groupExchanges', () => {
     const frames = [frame({ seq: 7, type: 2, id: 'a', dir: 'out' }), frame({ seq: 9, type: 4, id: 'a', dir: 'in' })];
     const [ex] = groupExchanges(frames, pairFrames(frames));
     expect(ex?.frames.map((f) => f.seq)).toEqual([7, 9]);
+  });
+});
+
+describe('malformed frames and trimmed buffers', () => {
+  test('a malformed CALL and its reply form one exchange, so the reply does not vanish', () => {
+    const frames = [
+      frame({ seq: 1, type: 2, id: 'a', dir: 'out', raw: '[2,"a","Heartbeat",{}' }), // chaos corrupt
+      frame({ seq: 2, type: 4, id: 'a', dir: 'in', raw: '[4,"a","RpcFrameworkError","bad json",{}]' }),
+    ];
+    const ex = groupExchanges(frames, pairFrames(frames));
+    expect(ex).toHaveLength(1);
+    expect(ex[0]?.frames.map((f) => f.seq)).toEqual([1, 2]);
+    expect(ex[0]?.call).toBe(frames[0] as FrameEvent);
+    expect(ex[0]?.reply).toBe(frames[1] as FrameEvent);
+    expect(parseFrame(ex[0]?.call as FrameEvent).ok).toBe(false); // still flagged malformed
+  });
+
+  test('every frame appears in exactly one exchange (random logs)', () => {
+    // Small deterministic PRNG (mulberry32), so a failure reproduces.
+    let state = 0x5eed;
+    const rand = () => {
+      state = (state + 0x6d2b79f5) | 0;
+      let t = Math.imul(state ^ (state >>> 15), 1 | state);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = <T>(xs: readonly T[]) => xs[Math.floor(rand() * xs.length)] as T;
+    for (let run = 0; run < 2000; run++) {
+      const frames: FrameEvent[] = [];
+      const n = Math.floor(rand() * 30);
+      for (let seq = 1; seq <= n; seq++) {
+        const f = frame({
+          seq,
+          type: pick([2, 2, 3, 3, 4, 5, 6] as const),
+          id: pick(['a', 'b', 'c']),
+          dir: pick(['in', 'out'] as const),
+        });
+        if (rand() < 0.2) f.raw = f.raw.slice(0, -1);
+        frames.push(f);
+      }
+      for (const trimmed of [false, true]) {
+        const seen = groupExchanges(frames, pairFrames(frames, { trimmed })).flatMap((e) => e.frames.map((f) => f.seq));
+        expect(seen.sort((x, y) => x - y)).toEqual(frames.map((f) => f.seq));
+      }
+    }
+  });
+
+  test('after a trim, a reply before the first kept CALL from its side lost its CALL; later ones answer no call', () => {
+    const frames = [
+      frame({ seq: 2, type: 3, id: 'gone', dir: 'in' }), // its station CALL scrolled out
+      frame({ seq: 3, type: 2, id: 'b', dir: 'out' }),
+      frame({ seq: 4, type: 3, id: 'b', dir: 'in' }),
+      frame({ seq: 5, type: 3, id: 'gone-csms', dir: 'out' }), // answers a CSMS CALL: none kept yet
+      frame({ seq: 6, type: 3, id: 'zzz', dir: 'in' }), // wrong id: a real orphan
+    ];
+    const trimmed = pairFrames(frames, { trimmed: true });
+    expect([...trimmed.callNotKept].sort()).toEqual([2, 5]);
+    expect(trimmed.partner.has(6)).toBe(false);
+    expect(pairFrames(frames).callNotKept.size).toBe(0);
+    const ex = groupExchanges(frames, trimmed);
+    expect(ex.map((e) => e.lone?.seq).filter((s) => s !== undefined)).toEqual([2, 5, 6]);
   });
 });

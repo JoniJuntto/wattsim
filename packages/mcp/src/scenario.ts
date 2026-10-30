@@ -9,6 +9,8 @@ import { driveVirtual, format, isIdle, ParseError, parse, run } from '@wattsim/s
 /** Same cap as `wattsim run --virtual`. */
 export const MAX_VIRTUAL_MS = 24 * 3_600_000;
 export const DEFAULT_WALL_TIMEOUT_MS = 5 * 60_000;
+/** Longest delay `setTimeout` takes; a larger one overflows its 32-bit counter and fires after 1 ms. */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
 export const DEFAULT_FAILURE_FRAMES = 40;
 /** Stations listed in a run result; failing ones first. Fleet runs report the rest as a count. */
 export const MAX_STATIONS_LISTED = 50;
@@ -87,7 +89,7 @@ export type RunScenarioOptions = {
   speed?: number;
   /** Frames kept per failing station. */
   failureFrames?: number;
-  /** Wall-clock runs only: abort after this long. */
+  /** Wall-clock runs only: abort after this long (at most `MAX_TIMER_MS`, about 24.8 days; longer is capped). */
   timeoutMs?: number;
 };
 
@@ -163,7 +165,7 @@ export async function runScenario(text: string, opts: RunScenarioOptions): Promi
         result = await running;
       }
     } else {
-      const timeoutMs = opts.timeoutMs ?? DEFAULT_WALL_TIMEOUT_MS;
+      const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_WALL_TIMEOUT_MS, MAX_TIMER_MS);
       const timer = wall.setTimeout(() => {
         note = `wall-clock run exceeded ${timeoutMs} ms; the run was aborted`;
         controller.abort();

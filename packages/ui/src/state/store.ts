@@ -2,6 +2,13 @@ import type { FrameEvent, StationView, StreamMessage, Violation } from '../api/t
 
 /** Per-station frame list cap; matches the server's ring buffer. */
 export const FRAME_CAP = 2000;
+
+/**
+ * Whether older frames were dropped from the start of a station's list. Both this store and the server's ring buffer
+ * (where history comes from) hold `FRAME_CAP` frames, so a full list is a trimmed one; a station with exactly that many
+ * frames in its whole life is the only false positive.
+ */
+export const isTrimmed = (frames: readonly FrameEvent[]) => frames.length >= FRAME_CAP;
 /** How much power history the sparklines keep. */
 export const POWER_WINDOW_MS = 5 * 60_000;
 /** Samples closer together than this overwrite the previous one instead of appending. */

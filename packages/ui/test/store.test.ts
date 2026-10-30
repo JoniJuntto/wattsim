@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import type { Violation } from '../src/api/types';
-import { createStore, FRAME_CAP, initialState, POWER_WINDOW_MS, reduce, reduceAll } from '../src/state/store';
+import {
+  createStore,
+  FRAME_CAP,
+  initialState,
+  isTrimmed,
+  POWER_WINDOW_MS,
+  reduce,
+  reduceAll,
+} from '../src/state/store';
 import { evse, frame, station } from './fixtures';
 
 const violation = (p: Partial<Violation> = {}): Violation => ({
@@ -57,6 +65,8 @@ describe('reduce', () => {
     expect(list).toHaveLength(FRAME_CAP);
     expect(list[0]?.seq).toBe(51);
     expect(list.at(-1)?.seq).toBe(FRAME_CAP + 50);
+    expect(isTrimmed(list)).toBe(true);
+    expect(isTrimmed(list.slice(1))).toBe(false);
   });
 
   test('history merges with streamed frames by seq without duplicates', () => {

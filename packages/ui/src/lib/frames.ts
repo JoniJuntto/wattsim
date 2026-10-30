@@ -61,6 +61,17 @@ export type Pairing = {
   partner: Map<number, number>;
   /** response seq → milliseconds since its CALL. */
   latencyMs: Map<number, number>;
+  /**
+   * Unpaired responses whose CALL was probably trimmed off the start of the buffer, rather than answering no CALL at
+   * all. Only filled for a trimmed buffer: a response that comes before the first kept CALL from the side it answers.
+   * A side has one CALL outstanding at a time (OCPP-J), so a CALL it sent later cannot be the one answered.
+   */
+  callNotKept: Set<number>;
+};
+
+export type PairOptions = {
+  /** Frames were dropped from the start of `frames` (the buffer is full), so early responses may lack their CALL. */
+  trimmed?: boolean;
 };
 
 /**
@@ -69,17 +80,24 @@ export type Pairing = {
  * id never pair with each other's responses. A second response to the same CALL (chaos `duplicate`) stays unpaired,
  * as do responses whose id matches nothing (chaos `wrongId`).
  */
-export function pairFrames(frames: readonly FrameEvent[]): Pairing {
+export function pairFrames(frames: readonly FrameEvent[], opts: PairOptions = {}): Pairing {
   const pending = new Map<string, FrameEvent>();
   const partner = new Map<number, number>();
   const latencyMs = new Map<number, number>();
+  const callNotKept = new Set<number>();
+  const sentCall = { in: false, out: false };
   for (const f of frames) {
     if (f.type === 2) {
       pending.set(`${f.dir}|${f.id}`, f);
+      sentCall[f.dir] = true;
     } else if (isResponse(f)) {
-      const key = `${f.dir === 'in' ? 'out' : 'in'}|${f.id}`;
+      const callDir = f.dir === 'in' ? 'out' : 'in';
+      const key = `${callDir}|${f.id}`;
       const call = pending.get(key);
-      if (!call) continue;
+      if (!call) {
+        if (opts.trimmed && !sentCall[callDir]) callNotKept.add(f.seq);
+        continue;
+      }
       pending.delete(key);
       partner.set(call.seq, f.seq);
       partner.set(f.seq, call.seq);
@@ -87,7 +105,7 @@ export function pairFrames(frames: readonly FrameEvent[]): Pairing {
       if (Number.isFinite(ms)) latencyMs.set(f.seq, ms);
     }
   }
-  return { partner, latencyMs };
+  return { partner, latencyMs, callNotKept };
 }
 
 export type FrameFilter = { action?: string; dir?: 'in' | 'out'; text?: string };
@@ -128,7 +146,7 @@ export type Initiator = 'station' | 'csms';
 
 /**
  * One request and what answered it: the unit the message log shows. `lone` is a frame that belongs to no CALL: a SEND
- * (never answered), a response whose id matched nothing, or a malformed frame.
+ * (never answered), a response whose id matched nothing, or a malformed frame that is not an answered CALL.
  */
 export type Exchange = {
   /** seq of the first frame; stable across appends. */
@@ -142,14 +160,19 @@ export type Exchange = {
   frames: FrameEvent[];
 };
 
-/** Groups frames into exchanges, ordered by their first frame. */
+/**
+ * Groups frames into exchanges, ordered by their first frame. Every frame lands in exactly one exchange: a response
+ * goes with its CALL (even a malformed one, which the log still flags), anything else stands alone.
+ */
 export function groupExchanges(frames: readonly FrameEvent[], pairing: Pairing): Exchange[] {
   const bySeq = new Map(frames.map((f) => [f.seq, f]));
   const out: Exchange[] = [];
   for (const f of frames) {
     const partnerSeq = pairing.partner.get(f.seq);
-    if (f.type === 2 && parseFrame(f).ok) {
-      const reply = partnerSeq !== undefined ? bySeq.get(partnerSeq) : undefined;
+    const partnerFrame = partnerSeq !== undefined ? bySeq.get(partnerSeq) : undefined;
+    // A malformed CALL nobody answered stays a lone frame rather than a request "waiting" for a reply.
+    if (f.type === 2 && (parseFrame(f).ok || partnerFrame)) {
+      const reply = partnerFrame;
       out.push({
         key: f.seq,
         initiator: f.dir === 'out' ? 'station' : 'csms',
@@ -158,7 +181,7 @@ export function groupExchanges(frames: readonly FrameEvent[], pairing: Pairing):
         reply,
         frames: reply ? [f, reply] : [f],
       });
-    } else if (partnerSeq === undefined || f.type === 2) {
+    } else if (f.type === 2 || !partnerFrame) {
       // Paired responses are shown with their CALL; anything else stands alone.
       out.push({ key: f.seq, initiator: f.dir === 'out' ? 'station' : 'csms', action: f.action, lone: f, frames: [f] });
     }
