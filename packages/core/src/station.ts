@@ -4,7 +4,8 @@
  * a `VersionAdapter` turns state into wire payloads and inbound CALLs into state changes.
  *
  * Status is derived, not stored by hand: `deriveStatus` reads EV state, the smart-charging limit and the
- * availability flags. Manual statuses (`Faulted`, `Reserved` via `setStatus`) stick until `setStatus('Available')`.
+ * availability flags. The limit comes from the installed charging profiles (`ProfileStore`), evaluated on the
+ * station's clock; a timer fires at the next schedule boundary so a step changes the power at that instant. Manual statuses (`Faulted`, `Reserved` via `setStatus`) stick until `setStatus('Available')`.
  *
  * Every outbound CALL goes through `request()`, which emits `error` once when it fails and still rejects to the
  * caller, so fire-and-forget sends (heartbeats, meter values) never become unhandled rejections.
@@ -15,7 +16,6 @@ import { ocpp21 } from './adapters/ocpp21';
 import { ocpp201 } from './adapters/ocpp201';
 import type {
   BootReason,
-  ProfilePurpose,
   ResetRequest,
   SampleContext,
   StationContext,
@@ -23,6 +23,8 @@ import type {
   VersionAdapter,
 } from './adapters/types';
 import type { ChaosEngine } from './chaos';
+import type { ChargingProfile } from './charging';
+import { ProfileStore } from './charging';
 import type { Clock, Timer } from './clock';
 import type { ConnectionEvents, ConnectionOptions, ConnectionState } from './connection';
 import { CallError, Connection, QueueOverflowError, RequestTimeoutError, ViolationError } from './connection';
@@ -109,8 +111,6 @@ export type TransactionState = {
   /** Pending start message, so a stop issued before the CSMS answered waits for the transaction id. */
   starting?: Promise<boolean>;
   ending?: Promise<void>;
-  /** The EVSE's `limitKw` came from a TxProfile: it is cleared when this transaction ends. */
-  txProfileLimit?: boolean;
 };
 
 export type EvseState = {
@@ -122,7 +122,7 @@ export type EvseState = {
   idTag?: string;
   /** What the EVSE offers right now: min(rated power, smart-charging limit). */
   offeredKw: number;
-  /** Smart-charging limit, when a profile is in force. */
+  /** Composite smart-charging limit in kW at the last evaluation, when a profile is in force. */
   limitKw?: number;
   tx?: TransactionState;
 };
@@ -145,8 +145,8 @@ export type StartOptions = {
   remote?: boolean;
   remoteStartId?: number;
   idTokenType?: string;
-  /** TxProfile limit sent with the remote start; in force for this transaction only. */
-  limitKw?: number;
+  /** TxProfile sent with the remote start; installed for this transaction only. */
+  txProfile?: ChargingProfile;
 };
 
 export const DEFAULT_ID_TAG = 'WATTSIM';
@@ -181,6 +181,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   readonly clock: Clock;
   readonly cfg: ResolvedStationConfig;
   readonly evses: EvseState[];
+  readonly charging: ProfileStore;
 
   private readonly conn: Connection;
   private readonly adapter: VersionAdapter;
@@ -196,6 +197,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   private mvTimer: Timer | undefined;
   private bootRetry: Timer | undefined;
   private resetTimer: Timer | undefined;
+  /** Fires at the next charging-schedule boundary; armed only while profiles are installed. */
+  private limitTimer: Timer | undefined;
   private pending = 0;
   private resetOnIdle: ResetRequest | undefined;
   /** EVSEs with a 2.0.1 per-EVSE OnIdle reset waiting for their transaction to end. */
@@ -238,6 +241,14 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       meter: new MeterModel({ voltageV: this.cfg.voltageV, phases: this.cfg.phases }),
       offeredKw: this.ratedKw,
     }));
+    this.charging = new ProfileStore({
+      voltageV: this.cfg.voltageV,
+      phases: this.cfg.phases,
+      ratedKw: this.ratedKw,
+      evses: evseCount,
+      now: () => this.clock.now(),
+      txStartedAt: (id) => this.evses[id - 1]?.tx?.startedAt,
+    });
 
     this.conn = new Connection({
       url: cfg.csmsUrl,
@@ -451,6 +462,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
    */
   tick(): void {
     if (this.bootHold) return;
+    // The boundary timer keeps limits current; this catches a tick due at the same instant as a boundary.
+    if (this.charging.size > 0) this.updateLimits(undefined, false);
     let active = false;
     for (const evse of this.evses) {
       const tx = evse.tx;
@@ -549,7 +562,9 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     };
     evse.tx = tx;
     evse.idTag = tx.idTag;
-    if (opts.limitKw !== undefined) this.applyLimit(evse, opts.limitKw, 'TxProfile');
+    if (opts.txProfile) this.charging.set({ ...opts.txProfile, evseId: evse.id, purpose: 'TxProfile' });
+    // This EVSE's start message carries its limit; other EVSEs may see a station-wide cap shared one more way.
+    this.updateLimits(evse);
     // A plugged EV (IEC 61851 state B) requests energy as soon as the EVSE offers it, so the transaction starts
     // Charging and draws power without an explicit `evReady`. A scenario that wants an EV that refuses energy
     // suspends it (`ev suspend`) before `start`; that EV stays SuspendedEV.
@@ -617,17 +632,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     return scheduled ? 'Scheduled' : 'Accepted';
   }
 
-  setLimitKw(evseId: number | undefined, kw: number | undefined, purpose?: ProfilePurpose): void {
-    const targets = evseId === undefined ? this.evses : [this.evseOrThrow(evseId)];
-    for (const evse of targets) {
-      this.integrate(evse);
-      this.applyLimit(evse, kw, purpose);
-      // A limit that flips the state (-> SuspendedEVSE) is a ChargingStateChanged; otherwise report the new rate.
-      const changed = this.refresh(evse);
-      if (!changed && evse.tx) {
-        fire(this.adapter.txUpdate(this, evse, this.takeSample(evse, evse.tx, 'Other'), 'ChargingRateChanged'));
-      }
-    }
+  chargingProfilesChanged(): void {
+    this.updateLimits();
   }
 
   scheduleReset(req: ResetRequest): 'Accepted' | 'Scheduled' {
@@ -724,11 +730,49 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     return this.deriveStatus(evse);
   }
 
-  /** Set or clear the limit on one EVSE and remember, on the transaction, whether a TxProfile set it. */
-  private applyLimit(evse: EvseState, kw: number | undefined, purpose: ProfilePurpose | undefined): void {
+  /** Set or clear the limit on one EVSE; the offer is the rated power capped by it. */
+  private applyLimit(evse: EvseState, kw: number | undefined): void {
     evse.limitKw = kw;
     evse.offeredKw = kw === undefined ? this.ratedKw : Math.max(0, Math.min(this.ratedKw, kw));
-    if (evse.tx) evse.tx.txProfileLimit = kw !== undefined && purpose === 'TxProfile';
+  }
+
+  /**
+   * Re-evaluate every EVSE's limit at the current instant. Power that flowed before now is integrated at the old
+   * offer first, so a schedule step lands exactly on its boundary. An EVSE whose limit changed is refreshed: a
+   * state flip (-> SuspendedEVSE and back) is a ChargingStateChanged; a different offer during a transaction is a
+   * ChargingRateChanged. `quiet` is updated without either (its caller reports it). Then re-arms the boundary timer
+   * (with `rearm` false only when a limit changed). Without profiles and limits this is one pass over the EVSEs.
+   */
+  private updateLimits(quiet?: EvseState, rearm = true): void {
+    const now = this.clock.now();
+    const empty = this.charging.size === 0;
+    let changedAny = false;
+    for (const evse of this.evses) {
+      const kw = empty ? undefined : this.charging.limitAt(evse.id, now);
+      if (kw === evse.limitKw) continue;
+      changedAny = true;
+      const offered = evse.offeredKw;
+      this.integrate(evse);
+      this.applyLimit(evse, kw);
+      if (evse === quiet) continue;
+      const changed = this.refresh(evse);
+      if (!changed && evse.tx && !evse.tx.ending && evse.offeredKw !== offered) {
+        fire(this.adapter.txUpdate(this, evse, this.takeSample(evse, evse.tx, 'Other'), 'ChargingRateChanged'));
+      }
+    }
+    if (rearm || changedAny) this.armLimitTimer(now, empty);
+  }
+
+  private armLimitTimer(now: number, empty: boolean): void {
+    this.limitTimer?.cancel();
+    this.limitTimer = undefined;
+    if (empty) return;
+    const next = this.charging.nextChange(now);
+    if (next === undefined) return;
+    this.limitTimer = this.clock.setTimeout(() => {
+      this.limitTimer = undefined;
+      this.updateLimits();
+    }, next - now);
   }
 
   private deriveStatus(evse: EvseState): ConnectorStatus {
@@ -783,6 +827,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     evse.tx = undefined;
     evse.transactionId = undefined;
     evse.idTag = undefined;
+    this.charging.endTransaction(evse.id);
+    this.updateLimits(evse);
     this.refresh(evse);
     this.stopMeterTimerIfIdle();
   }
@@ -803,7 +849,9 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     evse.tx = undefined;
     evse.transactionId = undefined;
     evse.idTag = undefined;
-    if (tx.txProfileLimit) this.applyLimit(evse, undefined, undefined);
+    // TxProfiles die with their transaction; a station-wide cap is now shared one way fewer.
+    this.charging.endTransaction(evse.id);
+    this.updateLimits(evse);
     if (!this.manual.has(evse.id)) {
       // Finishing while the EV stays plugged in, unless a scheduled ChangeAvailability now takes the EVSE out.
       const next = evse.ev && !this.inoperative.has(evse.id) ? 'Finishing' : this.deriveStatus(evse);

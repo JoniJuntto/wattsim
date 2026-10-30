@@ -2,6 +2,8 @@
  * OCPP 1.6J adapter. Payloads are typed with the generated `v16` types so a spec mistake fails `tsc`.
  */
 import type { CallFrame, v16 } from '@wattsim/protocol';
+import type { ChargingProfile } from '../charging';
+import { parseTime, profileProblem } from '../charging';
 import type { Clock } from '../clock';
 import { isoTimestamp } from '../clock';
 import type { MeterSample } from '../meter';
@@ -48,15 +50,38 @@ export function meterValue16(sample: MeterSample, context: SampleContext): Meter
   return { timestamp: sample.timestamp, sampledValue };
 }
 
-/** kW limit of the period in force now (the first period) of a charging schedule. */
-function scheduleLimitKw(
-  schedule: ChargingProfile16['chargingSchedule'],
-  cfg: ResolvedStationConfig,
-): number | undefined {
-  const period = [...schedule.chargingSchedulePeriod].sort((a, b) => a.startPeriod - b.startPeriod)[0];
-  if (!period) return undefined;
-  if (schedule.chargingRateUnit === 'W') return period.limit / 1000;
-  return (period.limit * (period.numberPhases ?? cfg.phases) * cfg.voltageV) / 1000;
+/** A 1.6 `csChargingProfiles` as a store profile installed on `connectorId` (0 = the charge point). */
+function toProfile16(cp: ChargingProfile16, connectorId: number): ChargingProfile {
+  const s = cp.chargingSchedule;
+  return {
+    id: cp.chargingProfileId,
+    evseId: connectorId,
+    stackLevel: cp.stackLevel,
+    purpose: cp.chargingProfilePurpose,
+    kind: cp.chargingProfileKind,
+    recurrency: cp.recurrencyKind,
+    validFrom: parseTime(cp.validFrom),
+    validTo: parseTime(cp.validTo),
+    transactionId: cp.transactionId,
+    unit: s.chargingRateUnit,
+    startSchedule: parseTime(s.startSchedule),
+    duration: s.duration,
+    periods: s.chargingSchedulePeriod,
+    raw: cp,
+  };
+}
+
+/**
+ * True when SetChargingProfile must be rejected: an unknown connector, a ChargePointMaxProfile off connector 0, or a
+ * TxProfile without a running transaction on that specific connector (or naming another transaction).
+ */
+function rejectSet16(st: StationContext, connectorId: number, cp: ChargingProfile16): boolean {
+  if (connectorId !== 0 && !st.evse(connectorId)) return true;
+  const purpose = cp.chargingProfilePurpose;
+  if (purpose === 'ChargePointMaxProfile') return connectorId !== 0;
+  if (purpose !== 'TxProfile') return false;
+  const tx = connectorId === 0 ? undefined : st.evse(connectorId)?.tx;
+  return !tx || (cp.transactionId !== undefined && cp.transactionId !== tx.id);
 }
 
 function txOf(evse: EvseState): TransactionState {
@@ -133,12 +158,14 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       if (!evse || st.resetPending(evse.id)) {
         return { result: { status: 'Rejected' } satisfies v16.RemoteStartTransactionResponse };
       }
-      const profile = p.chargingProfile;
-      // The profile of a remote start is a TxProfile by definition: it applies to this transaction only.
-      const limitKw = profile ? scheduleLimitKw(profile.chargingSchedule, st.cfg) : undefined;
+      // The profile of a remote start must be a TxProfile: it applies to this transaction only.
+      const txProfile = p.chargingProfile ? toProfile16(p.chargingProfile, evse.id) : undefined;
+      if (txProfile && (txProfile.purpose !== 'TxProfile' || profileProblem(txProfile))) {
+        return { result: { status: 'Rejected' } satisfies v16.RemoteStartTransactionResponse };
+      }
       return {
         result: { status: 'Accepted' } satisfies v16.RemoteStartTransactionResponse,
-        after: () => st.beginTransaction(evse.id, { idTag: p.idTag, remote: true, limitKw }),
+        after: () => st.beginTransaction(evse.id, { idTag: p.idTag, remote: true, txProfile }),
       };
     }
     case 'RemoteStopTransaction': {
@@ -208,27 +235,47 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
     }
     case 'SetChargingProfile': {
       const p = call.payload as v16.SetChargingProfileRequest;
-      if (p.connectorId !== 0 && !st.evse(p.connectorId)) {
+      const profile = toProfile16(p.csChargingProfiles, p.connectorId);
+      // §5.16: the same id, or the same stackLevel + purpose on the connector, is replaced.
+      if (rejectSet16(st, p.connectorId, p.csChargingProfiles) || profileProblem(profile)) {
         return { result: { status: 'Rejected' } satisfies v16.SetChargingProfileResponse };
       }
-      const purpose = p.csChargingProfiles.chargingProfilePurpose;
-      // A TxProfile needs a running transaction on one specific connector; otherwise it is discarded.
-      if (purpose === 'TxProfile' && (p.connectorId === 0 || !st.evse(p.connectorId)?.tx)) {
-        return { result: { status: 'Rejected' } satisfies v16.SetChargingProfileResponse };
-      }
-      const limitKw = scheduleLimitKw(p.csChargingProfiles.chargingSchedule, st.cfg);
-      if (limitKw === undefined) return { result: { status: 'Rejected' } satisfies v16.SetChargingProfileResponse };
-      st.setLimitKw(p.connectorId === 0 ? undefined : p.connectorId, limitKw, purpose);
+      st.charging.set(profile, 'replace');
+      st.chargingProfilesChanged();
       return { result: { status: 'Accepted' } satisfies v16.SetChargingProfileResponse };
     }
     case 'ClearChargingProfile': {
       const p = call.payload as v16.ClearChargingProfileRequest;
-      const target = p.connectorId !== undefined && p.connectorId > 0 ? p.connectorId : undefined;
-      if (target !== undefined && !st.evse(target)) {
-        return { result: { status: 'Unknown' } satisfies v16.ClearChargingProfileResponse };
-      }
-      st.setLimitKw(target, undefined);
+      const removed = st.charging.clear({
+        id: p.id,
+        evseId: p.connectorId,
+        purpose: p.chargingProfilePurpose,
+        stackLevel: p.stackLevel,
+      });
+      if (removed === 0) return { result: { status: 'Unknown' } satisfies v16.ClearChargingProfileResponse };
+      st.chargingProfilesChanged();
       return { result: { status: 'Accepted' } satisfies v16.ClearChargingProfileResponse };
+    }
+    case 'GetCompositeSchedule': {
+      const p = call.payload as v16.GetCompositeScheduleRequest;
+      if (p.connectorId !== 0 && !st.evse(p.connectorId)) {
+        return { result: { status: 'Rejected' } satisfies v16.GetCompositeScheduleResponse };
+      }
+      const unit = p.chargingRateUnit ?? 'W';
+      const start = isoTimestamp(st.clock);
+      const periods = st.charging.composite(p.connectorId, st.clock.now(), Math.max(0, p.duration) * 1000, unit);
+      const result: v16.GetCompositeScheduleResponse = {
+        status: 'Accepted',
+        connectorId: p.connectorId,
+        scheduleStart: start,
+        chargingSchedule: {
+          duration: p.duration,
+          startSchedule: start,
+          chargingRateUnit: unit,
+          chargingSchedulePeriod: periods,
+        },
+      };
+      return { result };
     }
     case 'DataTransfer':
       return { result: { status: 'UnknownVendorId' } satisfies v16.DataTransferResponse };

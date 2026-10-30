@@ -4,6 +4,8 @@
  * `seqNo`.
  */
 import type { CallFrame, OcppVersion, v201 } from '@wattsim/protocol';
+import type { ChargingProfile } from '../charging';
+import { parseTime, profileProblem } from '../charging';
 import type { Clock } from '../clock';
 import { isoTimestamp } from '../clock';
 import type { MeterSample } from '../meter';
@@ -18,7 +20,7 @@ type ChargingState201 = NonNullable<TxEvent['transactionInfo']['chargingState']>
 type StopReason201 = NonNullable<TxEvent['transactionInfo']['stoppedReason']>;
 type IdTokenType201 = NonNullable<TxEvent['idToken']>['type'];
 type WireStatus201 = v201.StatusNotificationRequest['connectorStatus'];
-type ChargingSchedule201 = v201.SetChargingProfileRequest['chargingProfile']['chargingSchedule'][number];
+type ChargingProfile201 = v201.SetChargingProfileRequest['chargingProfile'];
 type GetVariableResult = v201.GetVariablesResponse['getVariableResult'][number];
 type SetVariableResult = v201.SetVariablesResponse['setVariableResult'][number];
 
@@ -132,12 +134,71 @@ export function meterValue201(sample: MeterSample, context: SampleContext): Mete
   return { timestamp: sample.timestamp, sampledValue };
 }
 
-function scheduleLimitKw(schedule: ChargingSchedule201 | undefined, cfg: ResolvedStationConfig): number | undefined {
-  if (!schedule) return undefined;
-  const period = [...schedule.chargingSchedulePeriod].sort((a, b) => a.startPeriod - b.startPeriod)[0];
-  if (!period) return undefined;
-  if (schedule.chargingRateUnit === 'W') return period.limit / 1000;
-  return (period.limit * (period.numberPhases ?? cfg.phases) * cfg.voltageV) / 1000;
+/** Purposes the CSMS may set. ExternalConstraints come from outside OCPP; 2.1-only purposes are not modelled. */
+const SETTABLE_PURPOSES: ReadonlySet<string> = new Set(['TxProfile', 'TxDefaultProfile', 'ChargingStationMaxProfile']);
+
+/**
+ * A 2.x `chargingProfile` as a store profile installed on `evseId` (0 = the station). Only the first of the (up to
+ * three, ISO 15118 alternative) schedules is evaluated.
+ */
+function toProfile201(cp: ChargingProfile201, evseId: number): ChargingProfile {
+  const s = cp.chargingSchedule[0];
+  return {
+    id: cp.id,
+    evseId,
+    stackLevel: cp.stackLevel,
+    purpose: cp.chargingProfilePurpose,
+    kind: cp.chargingProfileKind,
+    recurrency: cp.recurrencyKind,
+    validFrom: parseTime(cp.validFrom),
+    validTo: parseTime(cp.validTo),
+    transactionId: cp.transactionId,
+    unit: s?.chargingRateUnit ?? 'W',
+    startSchedule: parseTime(s?.startSchedule),
+    duration: s?.duration,
+    periods: s?.chargingSchedulePeriod ?? [],
+    raw: cp,
+  };
+}
+
+/**
+ * True when SetChargingProfile must be rejected: an unknown EVSE, a purpose or kind this station does not take
+ * (ExternalConstraints, the 2.1 additions), a ChargingStationMaxProfile off evseId 0, or a TxProfile without a
+ * running transaction on that specific EVSE (or naming another transaction).
+ */
+function rejectSet201(st: StationContext, evseId: number, cp: ChargingProfile201): boolean {
+  if (evseId !== 0 && !st.evse(evseId)) return true;
+  const purpose: string = cp.chargingProfilePurpose;
+  const kind: string = cp.chargingProfileKind;
+  if (!SETTABLE_PURPOSES.has(purpose) || kind === 'Dynamic') return true;
+  if (purpose === 'ChargingStationMaxProfile') return evseId !== 0;
+  if (purpose !== 'TxProfile') return false;
+  const tx = evseId === 0 ? undefined : st.evse(evseId)?.tx;
+  return !tx || (cp.transactionId !== undefined && cp.transactionId !== tx.id);
+}
+
+/** ReportChargingProfiles payloads for `found`: one per EVSE and source, `tbc` on all but the last. */
+function reports201(requestId: number, found: readonly ChargingProfile[]): v201.ReportChargingProfilesRequest[] {
+  const groups = new Map<string, v201.ReportChargingProfilesRequest>();
+  for (const p of [...found].sort((a, b) => a.evseId - b.evseId)) {
+    const chargingLimitSource = p.source ?? 'CSO';
+    const key = `${p.evseId}/${chargingLimitSource}`;
+    const group = groups.get(key);
+    if (group) group.chargingProfile.push(p.raw as ChargingProfile201);
+    else {
+      groups.set(key, {
+        requestId,
+        chargingLimitSource,
+        evseId: p.evseId,
+        chargingProfile: [p.raw as ChargingProfile201],
+      });
+    }
+  }
+  const out = [...groups.values()];
+  out.forEach((r, i) => {
+    r.tbc = i < out.length - 1;
+  });
+  return out;
 }
 
 function txOf(evse: EvseState): TransactionState {
@@ -236,8 +297,11 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       if (!evse || st.resetPending(evse.id)) {
         return { result: { status: 'Rejected' } satisfies v201.RequestStartTransactionResponse };
       }
-      // The profile of a remote start is a TxProfile by definition: it applies to this transaction only.
-      const limitKw = scheduleLimitKw(p.chargingProfile?.chargingSchedule[0], st.cfg);
+      // The profile of a remote start must be a TxProfile: it applies to this transaction only.
+      const txProfile = p.chargingProfile ? toProfile201(p.chargingProfile, evse.id) : undefined;
+      if (txProfile && (txProfile.purpose !== 'TxProfile' || profileProblem(txProfile))) {
+        return { result: { status: 'Rejected' } satisfies v201.RequestStartTransactionResponse };
+      }
       return {
         result: { status: 'Accepted' } satisfies v201.RequestStartTransactionResponse,
         after: () =>
@@ -246,7 +310,7 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
             idTokenType: p.idToken.type,
             remote: true,
             remoteStartId: p.remoteStartId,
-            limitKw,
+            txProfile,
           }),
       };
     }
@@ -339,28 +403,67 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
     }
     case 'SetChargingProfile': {
       const p = call.payload as v201.SetChargingProfileRequest;
-      if (p.evseId !== 0 && !st.evse(p.evseId)) {
+      const profile = toProfile201(p.chargingProfile, p.evseId);
+      // K01.FR.05 replaces the same id; another id on the same stackLevel + purpose + EVSE is rejected.
+      if (rejectSet201(st, p.evseId, p.chargingProfile) || profileProblem(profile)) {
         return { result: { status: 'Rejected' } satisfies v201.SetChargingProfileResponse };
       }
-      const purpose = p.chargingProfile.chargingProfilePurpose;
-      // A TxProfile needs a running transaction on one specific EVSE; otherwise it is discarded.
-      if (purpose === 'TxProfile' && (p.evseId === 0 || !st.evse(p.evseId)?.tx)) {
+      if (!st.charging.set(profile, 'reject')) {
         return { result: { status: 'Rejected' } satisfies v201.SetChargingProfileResponse };
       }
-      const limitKw = scheduleLimitKw(p.chargingProfile.chargingSchedule[0], st.cfg);
-      if (limitKw === undefined) return { result: { status: 'Rejected' } satisfies v201.SetChargingProfileResponse };
-      st.setLimitKw(p.evseId === 0 ? undefined : p.evseId, limitKw, purpose);
+      st.chargingProfilesChanged();
       return { result: { status: 'Accepted' } satisfies v201.SetChargingProfileResponse };
     }
     case 'ClearChargingProfile': {
       const p = call.payload as v201.ClearChargingProfileRequest;
-      const evseId = p.chargingProfileCriteria?.evseId;
-      const target = evseId !== undefined && evseId > 0 ? evseId : undefined;
-      if (target !== undefined && !st.evse(target)) {
-        return { result: { status: 'Unknown' } satisfies v201.ClearChargingProfileResponse };
-      }
-      st.setLimitKw(target, undefined);
+      const c = p.chargingProfileCriteria;
+      const removed = st.charging.clear({
+        id: p.chargingProfileId,
+        evseId: c?.evseId,
+        purpose: c?.chargingProfilePurpose,
+        stackLevel: c?.stackLevel,
+      });
+      if (removed === 0) return { result: { status: 'Unknown' } satisfies v201.ClearChargingProfileResponse };
+      st.chargingProfilesChanged();
       return { result: { status: 'Accepted' } satisfies v201.ClearChargingProfileResponse };
+    }
+    case 'GetCompositeSchedule': {
+      const p = call.payload as v201.GetCompositeScheduleRequest;
+      if (p.evseId !== 0 && !st.evse(p.evseId)) {
+        return { result: { status: 'Rejected' } satisfies v201.GetCompositeScheduleResponse };
+      }
+      const unit = p.chargingRateUnit ?? 'W';
+      const periods = st.charging.composite(p.evseId, st.clock.now(), Math.max(0, p.duration) * 1000, unit);
+      const result: v201.GetCompositeScheduleResponse = {
+        status: 'Accepted',
+        schedule: {
+          evseId: p.evseId,
+          duration: p.duration,
+          scheduleStart: isoTimestamp(st.clock),
+          chargingRateUnit: unit,
+          chargingSchedulePeriod: periods,
+        },
+      };
+      return { result };
+    }
+    case 'GetChargingProfiles': {
+      const p = call.payload as v201.GetChargingProfilesRequest;
+      const c = p.chargingProfile;
+      const found = st.charging.query({
+        evseId: p.evseId,
+        purpose: c.chargingProfilePurpose,
+        stackLevel: c.stackLevel,
+        ids: c.chargingProfileId,
+        sources: c.chargingLimitSource,
+      });
+      if (found.length === 0) return { result: { status: 'NoProfiles' } satisfies v201.GetChargingProfilesResponse };
+      const reports = reports201(p.requestId, found);
+      return {
+        result: { status: 'Accepted' } satisfies v201.GetChargingProfilesResponse,
+        after: async () => {
+          await Promise.all(reports.map((r) => st.request('ReportChargingProfiles', r)));
+        },
+      };
     }
     case 'DataTransfer':
       return { result: { status: 'UnknownVendorId' } satisfies v201.DataTransferResponse };

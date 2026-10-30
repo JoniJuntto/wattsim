@@ -4,6 +4,7 @@ export type { Ocpp2xVersion } from './adapters/ocpp201';
 export { chargingState201, createOcpp2xAdapter, meterValue201, ocpp201, wireStatus201 } from './adapters/ocpp201';
 export * from './adapters/types';
 export * from './chaos';
+export * from './charging';
 export * from './clock';
 export * from './connection';
 export * from './ev';

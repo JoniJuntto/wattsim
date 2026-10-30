@@ -21,3 +21,7 @@ Milestone 1 uses a hand-written lexer and parser rather than a grammar generator
 ## 2026-10-30 Generated Zod drops JSON Schema `default` before conversion
 
 `json-schema-to-zod` treats any property with a `default` as required. Thirteen 2.0.1 schemas (MeterValues, TransactionEvent, GetVariables, SetVariables, NotifyReport among them) would have rejected valid payloads. The generator strips `default` as a keyword, never as a property name, and the Ajv oracle test exists to catch this class of drift.
+
+## 2026-10-30 A station-wide Max profile is one cap shared equally by the charging EVSEs
+
+A `ChargePointMaxProfile` / `ChargingStationMaxProfile` (and `ChargingStationExternalConstraints`) installed on evseId 0 limits the whole grid connection, not each EVSE. `ProfileStore.limitAt` divides it equally across the EVSEs with an active transaction at `t`, counting the EVSE being asked about even when it is idle, so an idle EVSE reports what it would get if it started now. The split is re-evaluated whenever a transaction starts or ends. Equal shares are simpler than a real load balancer and are deterministic; capacity an EV leaves unused (full battery, low max current) is not redistributed. GetCompositeSchedule reports the EVSE's physical limit where no profile applies, and for evseId 0 the sum of the EVSE limits capped by the station-level profiles.

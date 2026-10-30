@@ -4,6 +4,7 @@
  * lives on `EvseState.tx`.
  */
 import type { CallFrame, OcppVersion, v201 } from '@wattsim/protocol';
+import type { ProfileStore } from '../charging';
 import type { Clock } from '../clock';
 import type { MeterSample } from '../meter';
 import type { ConnectorStatus, EvseState, ResolvedStationConfig, StartOptions } from '../station';
@@ -78,10 +79,12 @@ export interface StationContext {
   /** ChangeAvailability. `undefined` targets every EVSE. `Scheduled` when a transaction is still running. */
   setOperative(evseId: number | undefined, operative: boolean): 'Accepted' | 'Scheduled';
   /**
-   * Smart-charging limit in kW; `undefined` evseId targets every EVSE, `undefined` kw clears the limit. A
-   * `TxProfile` limit is cleared when the transaction it was set during ends; every other purpose persists.
+   * Installed charging profiles. After changing them, call `chargingProfilesChanged()`. TxProfiles are removed when
+   * their transaction ends; every other purpose persists.
    */
-  setLimitKw(evseId: number | undefined, kw: number | undefined, purpose?: ProfilePurpose): void;
+  readonly charging: ProfileStore;
+  /** Re-evaluate every EVSE's limit now (power, status, 2.x ChargingRateChanged) and re-arm the boundary timer. */
+  chargingProfilesChanged(): void;
   scheduleReset(req: ResetRequest): 'Accepted' | 'Scheduled';
   /**
    * 2.0.1 Reset with `evseId`: end that EVSE's transaction (`ImmediateReset`) and re-send its StatusNotification;
