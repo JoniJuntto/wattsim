@@ -7,7 +7,15 @@
  *   CALLRESULT/CALLERROR frames carry the action of the CALL they answer (tracked by message id from the
  *   station's `frame` events); inbound CALLs match by action. A CALLERROR is matched against
  *   `{code, description, details}`. The payload is a deep subset match: every expected key must be present with
- *   a matching value, arrays match by length and element-wise, primitives by `===`.
+ *   a matching value, arrays match by length and element-wise, primitives by `===`. `expect call|result|error A`
+ *   additionally requires a CALL, CALLRESULT or CALLERROR frame, in either direction (the action fixes which side
+ *   sends it; DataTransfer is the one action both sides send). A 2.1 SEND counts as a CALL of its action but
+ *   gets no reply; a 2.1 CALLRESULTERROR carries no action and matches nothing.
+ * - Statement arguments that are variable references are resolved when the statement runs and type-checked; a
+ *   mismatch fails the station with the statement's `line:col`. A distribution (`normal`, `uniform`, `exp`) is
+ *   sampled every time its statement runs, from an LCG seeded with FNV-1a(instance name, statement loc, draw
+ *   index) XOR `opts.seed`: reproducible per seed, independent of `choose` and of other statements. A sample below
+ *   zero is clamped to 0 ms.
  * - "Next frame" means: the first matching frame observed since the start of the statement that precedes the
  *   `expect` in the same block (so frames a statement emits after it has resolved still count), or any later
  *   frame. Consecutive `expect`s each match a frame after the one matched by the previous `expect`. A compound
@@ -26,9 +34,14 @@
  * - `net drop d` = `station.disconnect()`, sleep `d`, `station.connect()`. The station keeps metering while
  *   disconnected, so MeterValues and StopTransaction generated offline queue in the Connection and flush in order
  *   on reconnect, as the reference says.
+ * - `net delay d [for w]` appends a chaos `delay` rule for every frame in both directions; with `for` the rule is
+ *   removed after `w` by a background task that the station awaits like an `at` branch.
+ * - `on ...` handlers are parsed but fail the station when run: the core has no hook to answer an inbound CALL.
  * - `clock skew` / `clock drift` wrap the station's clock in a `SkewedClock`; they must appear before
  *   `connect`/`boot` (and before any statement that needs the station), otherwise the station fails. The DSL's
- *   own timing (`wait`, `at`, `net drop`, `within`) always runs on the run clock, not the skewed one.
+ *   own timing (`wait`, `at`, `net drop`, `within`) always runs on the run clock, not the skewed one. `clock set`,
+ *   `clock freeze` and `clock resume` work at any time through `StationClock`, which only changes the time the
+ *   station reads: its timers keep the run clock's pace.
  * - `clock speed N` overrides `opts.speed` for that station when the run clock is a `WallClock`; it is ignored
  *   under any other clock. `opts.speed` divides the timing durations (`wait`, `at`, `net drop`, `within`); it
  *   does not touch station configuration such as `heartbeat 30s`, which is what the station tells the CSMS.
@@ -60,18 +73,24 @@ import { MessageType } from '@wattsim/protocol';
 import type {
   ChaosStmt,
   ClockStmt,
+  DistExpr,
   Duration,
+  DurExpr,
   EvStmt,
   ExpectStmt,
   JsonValue,
   LetDecl,
+  Loc,
+  NetStmt,
+  NumExpr,
   Prop,
   Scenario,
   StationBlock,
   Stmt,
+  StrExpr,
   StringExpr,
 } from './ast';
-import { formatDuration } from './format';
+import { formatDuration, formatDurExpr } from './format';
 
 // ---- public types ----------------------------------------------------------------------------------------------
 
@@ -321,7 +340,66 @@ class Barriers {
   }
 }
 
-type Vars = Map<string, string | number | Duration>;
+/** A resolved variable. A `let` bound to a distribution stays unsampled until a statement uses it. */
+type Value = string | number | Duration | DistExpr;
+type Vars = Map<string, Value>;
+
+const at = (loc: Loc) => `${loc.line}:${loc.col}`;
+
+function describeValue(v: Value): string {
+  if (typeof v === 'string') return `the string "${v}"`;
+  if (typeof v === 'number') return `the number ${v}`;
+  return 'ms' in v ? `the duration ${formatDuration(v)}` : `the distribution ${formatDurExpr(v)}`;
+}
+
+const FRAME_TYPES = { call: MessageType.Call, result: MessageType.CallResult, error: MessageType.CallError } as const;
+
+/**
+ * The clock a station reads. `set` makes it read a given instant, `freeze` stops it and `resume` continues from the
+ * frozen reading. Timers run on `inner` untouched, so heartbeats and meter ticks keep the run clock's pace.
+ */
+class StationClock implements Clock {
+  private offsetMs = 0;
+  private frozenAt: number | undefined;
+
+  constructor(public inner: Clock) {}
+
+  now(): number {
+    return this.frozenAt ?? this.inner.now() + this.offsetMs;
+  }
+
+  date(): Date {
+    return new Date(this.now());
+  }
+
+  setTimeout(fn: () => void, ms: number): Timer {
+    return this.inner.setTimeout(fn, ms);
+  }
+
+  setInterval(fn: () => void, ms: number): Timer {
+    return this.inner.setInterval(fn, ms);
+  }
+
+  sleep(ms: number): Promise<void> {
+    return this.inner.sleep(ms);
+  }
+
+  set(epochMs: number): void {
+    if (this.frozenAt !== undefined) this.frozenAt = epochMs;
+    else this.offsetMs += epochMs - this.now();
+  }
+
+  freeze(): void {
+    this.frozenAt ??= this.now();
+  }
+
+  resume(): void {
+    if (this.frozenAt === undefined) return;
+    const frozen = this.frozenAt;
+    this.frozenAt = undefined;
+    this.offsetMs += frozen - this.now();
+  }
+}
 
 type Instance = { index: number; name: string; block: StationBlock; vars: Vars };
 
@@ -415,7 +493,7 @@ class Run {
   }
 
   /** Resolve `name` from the instance's loop variables and the `let`s to its typed value. */
-  lookup(name: string, vars: Vars, depth = 0): string | number | Duration {
+  lookup(name: string, vars: Vars, depth = 0): Value {
     const local = vars.get(name);
     if (local !== undefined) return local;
     const decl = this.lets.get(name);
@@ -431,6 +509,8 @@ class Run {
         return { ms: v.ms };
       case 'ref':
         return this.lookup(v.name, vars, depth + 1);
+      default:
+        return v;
     }
   }
 
@@ -449,7 +529,9 @@ class Run {
         return null;
       case 'ref': {
         const r = this.lookup(v.name, vars);
-        return typeof r === 'object' ? r.ms : r;
+        if (typeof r !== 'object') return r;
+        if ('ms' in r) return r.ms;
+        throw new StationFailure(`${at(v.loc)}: '${v.name}' is a distribution and cannot be used in a payload`);
       }
       case 'array':
         return v.items.map((i) => this.resolveJson(i, vars));
@@ -465,7 +547,23 @@ class Run {
 
   private scenarioCsms(): string | undefined {
     const csms = this.scenario.csms;
-    return csms ? this.interpolate(csms, new Map()) : undefined;
+    if (!csms) return undefined;
+    if (csms.kind === 'string') return this.interpolate(csms, new Map());
+    const v = this.lookup(csms.name, new Map());
+    if (typeof v !== 'string') {
+      throw new Error(`${at(csms.loc)}: csms must be a string, but '${csms.name}' is ${describeValue(v)}`);
+    }
+    return v;
+  }
+
+  /** A station range bound: an integer literal or a `let` holding one. */
+  private bound(e: NumExpr): number {
+    if (e.kind === 'number') return e.value;
+    const v = this.lookup(e.name, new Map());
+    if (typeof v !== 'number' || !Number.isInteger(v)) {
+      throw new Error(`${at(e.loc)}: a station range bound must be an integer, but '${e.name}' is ${describeValue(v)}`);
+    }
+    return v;
   }
 
   private expand(): Instance[] {
@@ -476,7 +574,10 @@ class Run {
         out.push({ index: out.length, name: this.interpolate(block.name, vars), block, vars });
         continue;
       }
-      for (let i = block.range.from; i <= block.range.to; i++) {
+      const from = this.bound(block.range.from);
+      const to = this.bound(block.range.to);
+      if (to < from) throw new Error(`${at(block.loc)}: invalid range ${from}..${to}: end must not be before start`);
+      for (let i = from; i <= to; i++) {
         const vars: Vars = new Map([[block.range.var, i]]);
         out.push({ index: out.length, name: this.interpolate(block.name, vars), block, vars });
       }
@@ -485,10 +586,10 @@ class Run {
   }
 }
 
-function stringify(v: string | number | Duration): string {
+function stringify(v: Value): string {
   if (typeof v === 'string') return v;
   if (typeof v === 'number') return String(v);
-  return formatDuration(v);
+  return 'ms' in v ? formatDuration(v) : formatDurExpr(v);
 }
 
 /** Every barrier name a body can reach, through procs and every nested block. */
@@ -553,6 +654,9 @@ class InstanceRunner {
   private readonly asserts: AssertResult[] = [];
   private readonly branches: Promise<void>[] = [];
   private readonly cfg: PendingConfig = { skewMs: 0, driftPpm: 0 };
+  private readonly stationClock: StationClock;
+  /** Distribution draws per statement loc, so repeated statements sample afresh but reproducibly. */
+  private readonly draws = new Map<string, number>();
   private station: Station | undefined;
   private speedOverride: number | undefined;
   private failure: Error | undefined;
@@ -566,6 +670,7 @@ class InstanceRunner {
     this.name = inst.name;
     this.csmsUrl = csmsUrl;
     this.clock = run.runClock;
+    this.stationClock = new StationClock(this.clock);
     const seed = (fnv1a(inst.name) ^ run.seed) >>> 0;
     this.rng = lcg(seed);
     this.chaos = new ChaosEngine(lcg((seed ^ CHAOS_SEED_SALT) >>> 0));
@@ -648,42 +753,42 @@ class InstanceRunner {
     switch (stmt.kind) {
       case 'version':
         this.configure(stmt.kind, () => {
-          this.cfg.version = stmt.version === '1.6' ? 'ocpp1.6' : 'ocpp2.0.1';
+          this.cfg.version = `ocpp${stmt.version}`;
         });
         return;
       case 'evses':
         this.configure(stmt.kind, () => {
-          this.cfg.evses = stmt.count;
+          this.cfg.evses = this.num(stmt.count, stmt.loc, "'evses'", 1);
         });
         return;
       case 'connectors':
         this.configure(stmt.kind, () => {
-          this.cfg.connectors = stmt.count;
+          this.cfg.connectors = this.num(stmt.count, stmt.loc, "'connectors'", 1);
         });
         return;
       case 'vendor':
         this.configure(stmt.kind, () => {
-          this.cfg.vendor = this.str(stmt.value);
+          this.cfg.vendor = this.text(stmt.value, stmt.loc);
         });
         return;
       case 'model':
         this.configure(stmt.kind, () => {
-          this.cfg.model = this.str(stmt.value);
+          this.cfg.model = this.text(stmt.value, stmt.loc);
         });
         return;
       case 'serial':
         this.configure(stmt.kind, () => {
-          this.cfg.serial = this.str(stmt.value);
+          this.cfg.serial = this.text(stmt.value, stmt.loc);
         });
         return;
       case 'auth':
         this.configure(stmt.kind, () => {
-          this.cfg.basicAuth = { user: this.str(stmt.user), password: this.str(stmt.password) };
+          this.cfg.basicAuth = { user: this.text(stmt.user, stmt.loc), password: this.text(stmt.password, stmt.loc) };
         });
         return;
       case 'heartbeat':
         if (stmt.interval) {
-          const ms = stmt.interval.ms;
+          const ms = this.ms(stmt.interval, stmt.loc, "'heartbeat'");
           if (this.station) this.station.setHeartbeatMs(ms);
           else this.cfg.heartbeatMs = ms;
           return;
@@ -691,7 +796,7 @@ class InstanceRunner {
         await this.race(this.ensureStation('heartbeat').sendHeartbeat());
         return;
       case 'meterInterval': {
-        const ms = stmt.interval.ms;
+        const ms = this.ms(stmt.interval, stmt.loc, "'meterInterval'");
         if (this.station) this.station.setMeterIntervalMs(ms);
         else this.cfg.meterIntervalMs = ms;
         return;
@@ -712,38 +817,42 @@ class InstanceRunner {
         await this.race(this.ev(stmt));
         return;
       case 'authorize':
-        await this.race(this.ensureStation('authorize').authorize(this.str(stmt.tag)));
+        await this.race(this.ensureStation('authorize').authorize(this.text(stmt.tag, stmt.loc)));
         return;
-      case 'start':
-        await this.race(
-          this.ensureStation('start').startTransaction(stmt.evse, stmt.tag ? this.str(stmt.tag) : undefined),
-        );
+      case 'start': {
+        const evse = this.num(stmt.evse, stmt.loc, 'EVSE id', 1);
+        const tag = stmt.tag ? this.text(stmt.tag, stmt.loc) : undefined;
+        await this.race(this.ensureStation('start').startTransaction(evse, tag));
         return;
+      }
       case 'stop':
-        await this.race(this.ensureStation('stop').stopTransaction(stmt.evse));
+        await this.race(this.ensureStation('stop').stopTransaction(this.num(stmt.evse, stmt.loc, 'EVSE id', 1)));
         return;
       case 'status': {
         if (!CONNECTOR_STATUSES.has(stmt.status)) {
           throw new StationFailure(`unknown connector status '${stmt.status}' (${[...CONNECTOR_STATUSES].join(', ')})`);
         }
-        await this.race(this.ensureStation('status').setStatus(stmt.evse, stmt.status as ConnectorStatus));
+        const evse = this.num(stmt.evse, stmt.loc, 'EVSE id', 1);
+        await this.race(this.ensureStation('status').setStatus(evse, stmt.status as ConnectorStatus));
         return;
       }
-      case 'send':
-        await this.race(this.ensureStation('send').sendRaw(stmt.action, this.run.resolveJson(stmt.payload, vars)));
+      case 'send': {
+        const payload = stmt.payload ? this.run.resolveJson(stmt.payload, vars) : {};
+        await this.race(this.ensureStation('send').sendRaw(stmt.action, payload));
         return;
+      }
       case 'expect':
         await this.expect(stmt, branch);
         return;
       case 'wait':
         if (stmt.until !== undefined) await this.race(this.run.barrierRegistry.wait(stmt.until));
-        else await this.sleep(this.scaled(stmt.duration));
+        else await this.sleep(this.scaled(this.ms(stmt.duration, stmt.loc, "'wait'")));
         return;
       case 'barrier':
         this.run.barrierRegistry.arrive(stmt.name, this.inst.index);
         return;
       case 'at': {
-        const due = blockStart + this.scaled(stmt.offset);
+        const due = blockStart + this.scaled(this.ms(stmt.offset, stmt.loc, "'at'"));
         const body = stmt.body;
         const task = (async () => {
           await this.sleep(Math.max(0, due - this.clock.now()));
@@ -753,9 +862,11 @@ class InstanceRunner {
         this.branches.push(task);
         return;
       }
-      case 'repeat':
-        for (let i = 0; i < stmt.count; i++) await this.runBlock(stmt.body, this.nested(branch));
+      case 'repeat': {
+        const count = this.num(stmt.count, stmt.loc, "'repeat' count", 0);
+        for (let i = 0; i < count; i++) await this.runBlock(stmt.body, this.nested(branch));
         return;
+      }
       case 'choose': {
         const draw = this.rng() * 100;
         let acc = 0;
@@ -771,8 +882,13 @@ class InstanceRunner {
         return;
       }
       case 'net':
-        await this.netDrop(stmt.duration);
+        if (stmt.op === 'drop') await this.netDrop(this.ms(stmt.duration, stmt.loc, "'net drop'"));
+        else this.netDelay(stmt);
         return;
+      case 'on':
+        throw new StationFailure(
+          `${at(stmt.loc)}: 'on' is not supported yet: the core has no hook to answer an inbound CALL from a scenario`,
+        );
       case 'chaos':
         this.addChaos(stmt);
         return;
@@ -792,10 +908,15 @@ class InstanceRunner {
         return;
       }
       case 'log':
-        this.emit({ type: 'log', station: this.name, message: this.str(stmt.message), at: this.clock.now() });
+        this.emit({
+          type: 'log',
+          station: this.name,
+          message: this.text(stmt.message, stmt.loc),
+          at: this.clock.now(),
+        });
         return;
       case 'fail':
-        throw new StationFailure(this.str(stmt.message));
+        throw new StationFailure(this.text(stmt.message, stmt.loc));
     }
   }
 
@@ -803,6 +924,92 @@ class InstanceRunner {
 
   private str(s: StringExpr): string {
     return this.run.interpolate(s, this.inst.vars);
+  }
+
+  /** `run.lookup` with the statement's position on its errors. */
+  private lookup(name: string, loc: Loc): Value {
+    try {
+      return this.run.lookup(name, this.inst.vars);
+    } catch (err) {
+      if (err instanceof StationFailure) throw new StationFailure(`${at(loc)}: ${err.message}`);
+      throw err;
+    }
+  }
+
+  private text(e: StrExpr, loc: Loc): string {
+    if (e.kind === 'string') return this.str(e);
+    const v = this.lookup(e.name, loc);
+    if (typeof v !== 'string')
+      throw new StationFailure(`${at(loc)}: expected a string, but '${e.name}' is ${describeValue(v)}`);
+    return v;
+  }
+
+  /** A number argument; with `min` it must be an integer >= `min`. */
+  private num(e: NumExpr, loc: Loc, what: string, min?: number): number {
+    let v: number;
+    if (e.kind === 'number') v = e.value;
+    else {
+      const r = this.lookup(e.name, loc);
+      if (typeof r !== 'number') {
+        throw new StationFailure(`${at(loc)}: ${what} must be a number, but '${e.name}' is ${describeValue(r)}`);
+      }
+      v = r;
+    }
+    if (min !== undefined && !(Number.isInteger(v) && v >= min)) {
+      throw new StationFailure(`${at(loc)}: ${what} must be an integer >= ${min}, got ${v}`);
+    }
+    return v;
+  }
+
+  /** A duration argument in ms, sampled when it is a distribution. Negative only with `signed`. */
+  private ms(e: DurExpr, loc: Loc, what: string, signed = false): number {
+    let v: number;
+    if (e.kind === 'duration') v = e.ms;
+    else if (e.kind !== 'ref') v = this.sample(e, loc, what);
+    else {
+      const r = this.lookup(e.name, loc);
+      if (typeof r !== 'object') {
+        throw new StationFailure(`${at(loc)}: ${what} must be a duration, but '${e.name}' is ${describeValue(r)}`);
+      }
+      v = 'ms' in r ? r.ms : this.sample(r, loc, what);
+    }
+    if (v < 0 && !signed) {
+      throw new StationFailure(`${at(loc)}: ${what} must not be negative, got ${formatDuration({ ms: v })}`);
+    }
+    return v;
+  }
+
+  /** One draw from `d`: a pure function of (seed, station name, statement loc, draw index). */
+  private sample(d: DistExpr, loc: Loc, what: string): number {
+    const key = at(loc);
+    const n = this.draws.get(key) ?? 0;
+    this.draws.set(key, n + 1);
+    const rng = lcg((fnv1a(`${this.name}@${key}#${n}`) ^ this.run.seed) >>> 0);
+    let v: number;
+    switch (d.kind) {
+      case 'normal': {
+        const mean = this.ms(d.mean, loc, what);
+        const sd = this.ms(d.sd, loc, what);
+        // Box-Muller; 1 - u keeps the logarithm finite.
+        v = mean + sd * Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(2 * Math.PI * rng());
+        break;
+      }
+      case 'uniform': {
+        const lo = this.ms(d.min, loc, what);
+        const hi = this.ms(d.max, loc, what);
+        if (hi < lo) {
+          throw new StationFailure(
+            `${at(loc)}: uniform(min, max) needs max >= min, got ${formatDuration({ ms: lo })}, ${formatDuration({ ms: hi })}`,
+          );
+        }
+        v = lo + rng() * (hi - lo);
+        break;
+      }
+      case 'exp':
+        v = -this.ms(d.mean, loc, what) * Math.log(1 - rng());
+        break;
+    }
+    return Math.max(0, Math.round(v));
   }
 
   private emit(e: RunEvent): void {
@@ -816,9 +1023,9 @@ class InstanceRunner {
   }
 
   /** Divide a DSL timing duration by the effective speed. */
-  private scaled(d: Duration): number {
+  private scaled(ms: number): number {
     const speed = this.speedOverride ?? this.run.speed;
-    return speed > 0 && speed !== 1 ? d.ms / speed : d.ms;
+    return speed > 0 && speed !== 1 ? ms / speed : ms;
   }
 
   /** Race a wait against the station's abort so a failure elsewhere ends long sleeps promptly. */
@@ -834,14 +1041,14 @@ class InstanceRunner {
     if (this.station) return this.station;
     if (!this.cfg.version) throw new StationFailure(`'version' is required before '${kind}'`);
     const skewed = this.cfg.skewMs !== 0 || this.cfg.driftPpm !== 0;
-    const clock = skewed
-      ? new SkewedClock(this.clock, { offsetMs: this.cfg.skewMs, driftPpm: this.cfg.driftPpm })
-      : this.clock;
+    if (skewed) {
+      this.stationClock.inner = new SkewedClock(this.clock, { offsetMs: this.cfg.skewMs, driftPpm: this.cfg.driftPpm });
+    }
     const config: StationConfig = {
       id: this.name,
       version: this.cfg.version,
       csmsUrl: this.csmsUrl,
-      clock,
+      clock: this.stationClock,
       chaos: this.chaos,
       evses: this.cfg.evses ?? this.cfg.connectors,
       vendor: this.cfg.vendor,
@@ -867,17 +1074,21 @@ class InstanceRunner {
   private onFrame(direction: 'in' | 'out', frame: Frame): void {
     let action: string | undefined;
     let payload: unknown;
-    if (frame.type === MessageType.Call) {
+    if (frame.type === MessageType.Call || frame.type === MessageType.Send) {
       action = frame.action;
       payload = frame.payload;
-      this.pendingIds.set(frame.id, frame.action);
+      // A SEND gets no reply, so only a CALL's id names the action of a later CALLRESULT/CALLERROR.
+      if (frame.type === MessageType.Call) this.pendingIds.set(frame.id, frame.action);
     } else {
-      action = this.pendingIds.get(frame.id);
-      this.pendingIds.delete(frame.id);
+      // A CALLRESULTERROR answers a CALLRESULT, not a CALL: its id is never pending and it gets no action.
+      if (frame.type !== MessageType.CallResultError) {
+        action = this.pendingIds.get(frame.id);
+        this.pendingIds.delete(frame.id);
+      }
       payload =
-        frame.type === MessageType.CallError
-          ? { code: frame.code, description: frame.description, details: frame.details }
-          : frame.payload;
+        'payload' in frame
+          ? frame.payload
+          : { code: frame.code, description: frame.description, details: frame.details };
     }
     this.log.push({ direction, action, payload, frame });
     this.emit({ type: 'frame', station: this.name, direction, frame, at: this.clock.now() });
@@ -885,21 +1096,22 @@ class InstanceRunner {
 
   private async ev(stmt: EvStmt): Promise<void> {
     const station = this.ensureStation('ev');
+    const evse = this.num(stmt.evse, stmt.loc, 'EVSE id', 1);
     switch (stmt.action) {
       case 'plug':
-        await station.plugIn(stmt.evse, this.evConfig(stmt.props));
+        await station.plugIn(evse, this.evConfig(stmt.props));
         return;
       case 'unplug':
-        await station.unplug(stmt.evse);
+        await station.unplug(evse);
         return;
       case 'ready':
-        await station.evReady(stmt.evse);
+        await station.evReady(evse);
         return;
       case 'suspend':
-        await station.suspendEv(stmt.evse);
+        await station.suspendEv(evse);
         return;
       case 'resume':
-        await station.resumeEv(stmt.evse);
+        await station.resumeEv(evse);
         return;
     }
   }
@@ -908,6 +1120,7 @@ class InstanceRunner {
   private evConfig(props: Prop[]): Partial<EvConfig> {
     const cfg: Partial<EvConfig> = {};
     const num = (p: Prop): number => {
+      if (p.value.kind === 'ref') return this.num(p.value, p.loc, `ev property '${p.name}'`);
       if (p.value.kind !== 'number') throw new StationFailure(`ev property '${p.name}' must be a number`);
       return p.value.value;
     };
@@ -944,15 +1157,26 @@ class InstanceRunner {
 
   private async expect(stmt: ExpectStmt, branch: Branch): Promise<void> {
     this.ensureStation('expect'); // frames are only recorded once the station exists
-    const expected = stmt.payload === undefined ? undefined : this.run.resolveJson(stmt.payload, this.inst.vars);
+    const expected =
+      stmt.code !== undefined
+        ? { code: stmt.code }
+        : stmt.payload === undefined
+          ? undefined
+          : this.run.resolveJson(stmt.payload, this.inst.vars);
+    const withinMs = stmt.within ? this.ms(stmt.within, stmt.loc, "'within'") : DEFAULT_EXPECT_TIMEOUT_MS;
     const label = [
-      `expect ${stmt.action}`,
-      expected === undefined ? '' : ` ${JSON.stringify(expected)}`,
-      stmt.within ? ` within ${formatDuration(stmt.within)}` : '',
+      `expect ${stmt.frame ? `${stmt.frame} ` : ''}${stmt.action}`,
+      stmt.code !== undefined ? ` ${stmt.code}` : expected === undefined ? '' : ` ${JSON.stringify(expected)}`,
+      stmt.within
+        ? ` within ${stmt.within.kind === 'duration' ? formatDuration(stmt.within) : formatDuration({ ms: withinMs })}`
+        : '',
     ].join('');
-    const timeoutMs = this.scaled(stmt.within ?? { ms: DEFAULT_EXPECT_TIMEOUT_MS });
+    const timeoutMs = this.scaled(withinMs);
+    const frameType = stmt.frame && FRAME_TYPES[stmt.frame];
     const matches = (e: FrameEntry) =>
-      e.action === stmt.action && (expected === undefined || partialMatch(expected, e.payload));
+      e.action === stmt.action &&
+      (frameType === undefined || e.frame.type === frameType) &&
+      (expected === undefined || partialMatch(expected, e.payload));
 
     let seq = this.log.find(branch.cursor, matches);
     if (seq === undefined) {
@@ -986,38 +1210,71 @@ class InstanceRunner {
     this.emit({ type: 'assert', station: this.name, ...a, at: this.clock.now() });
   }
 
-  private async netDrop(d: Duration): Promise<void> {
+  private async netDrop(ms: number): Promise<void> {
     const station = this.ensureStation('net drop');
     await this.race(station.disconnect());
-    await this.sleep(this.scaled(d));
+    await this.sleep(this.scaled(ms));
     await this.race(station.connect());
+  }
+
+  private netDelay(stmt: Extract<NetStmt, { op: 'delay' }>): void {
+    const ms = this.ms(stmt.delay, stmt.loc, "'net delay'");
+    const id = this.chaos.add({ match: {}, effect: { kind: 'delay', ms } });
+    if (!stmt.for) return;
+    const forMs = this.scaled(this.ms(stmt.for, stmt.loc, "'net delay ... for'"));
+    const task = (async () => {
+      await this.sleep(forMs);
+      this.chaos.remove(id);
+    })();
+    task.catch((err: unknown) => this.abort(toError(err)));
+    this.branches.push(task);
   }
 
   private addChaos(stmt: ChaosStmt): void {
     const match: ChaosMatch = { direction: stmt.direction, action: stmt.action };
     const t = stmt.trigger;
-    if (t?.kind === 'nth') match.nth = t.n;
-    else if (t?.kind === 'every') match.every = t.n;
-    else if (t?.kind === 'probability') match.probability = t.percent / 100;
+    if (t?.kind === 'nth') match.nth = this.num(t.n, stmt.loc, "'nth'", 1);
+    else if (t?.kind === 'every') match.every = this.num(t.n, stmt.loc, "'every'", 1);
+    else if (t?.kind === 'probability') match.probability = this.num(t.percent, stmt.loc, "'probability'") / 100;
     const effect: ChaosEffect =
-      stmt.fault === 'delay' ? { kind: 'delay', ms: stmt.delay?.ms ?? 0 } : { kind: stmt.fault };
+      stmt.fault === 'delay'
+        ? { kind: 'delay', ms: stmt.delay ? this.ms(stmt.delay, stmt.loc, "'chaos delay'") : 0 }
+        : { kind: stmt.fault };
     this.chaos.add({ match, effect, once: stmt.once });
   }
 
   private clockStmt(stmt: ClockStmt): void {
     switch (stmt.mode) {
-      case 'speed':
-        if (this.run.wallClock) this.speedOverride = stmt.speed;
+      case 'speed': {
+        const speed = this.num(stmt.speed, stmt.loc, "'clock speed'");
+        if (this.run.wallClock) this.speedOverride = speed;
         return;
+      }
       case 'skew':
         this.configure('clock skew', () => {
-          this.cfg.skewMs += stmt.skew.ms;
+          this.cfg.skewMs += this.ms(stmt.skew, stmt.loc, "'clock skew'", true);
         });
         return;
       case 'drift':
         this.configure('clock drift', () => {
-          this.cfg.driftPpm += stmt.ppm;
+          this.cfg.driftPpm += this.num(stmt.ppm, stmt.loc, "'clock drift'");
+          if (this.cfg.driftPpm <= -1_000_000) {
+            throw new StationFailure(`${at(stmt.loc)}: clock drift must be greater than -1000000 ppm`);
+          }
         });
+        return;
+      case 'set': {
+        const text = this.text(stmt.time, stmt.loc);
+        const epoch = Date.parse(text);
+        if (Number.isNaN(epoch)) throw new StationFailure(`${at(stmt.loc)}: invalid timestamp "${text}" for clock set`);
+        this.stationClock.set(epoch);
+        return;
+      }
+      case 'freeze':
+        this.stationClock.freeze();
+        return;
+      case 'resume':
+        this.stationClock.resume();
         return;
     }
   }

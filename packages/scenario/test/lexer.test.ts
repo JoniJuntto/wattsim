@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { lex, ParseError } from '../src/index';
+import { type Comment, lex, ParseError } from '../src/index';
 
 const sig = (src: string) =>
   lex(src)
@@ -32,6 +32,16 @@ describe('lex', () => {
       'ident:s',
     ]);
     expect(sig('// only a comment')).toEqual([]);
+  });
+
+  test('comments are collected with their position and whether they trail a token', () => {
+    const comments: Comment[] = [];
+    lex('// lead\nboot // trail\n  // indented', undefined, comments);
+    expect(comments).toEqual([
+      { text: ' lead', line: 1, col: 1, trailing: false },
+      { text: ' trail', line: 2, col: 6, trailing: true },
+      { text: ' indented', line: 3, col: 3, trailing: false },
+    ]);
   });
 
   test('line and col are 1-based and correct after newlines', () => {

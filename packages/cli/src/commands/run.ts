@@ -73,10 +73,16 @@ class EventFormatter {
       this.calls.set(`${station}\0${direction}\0${frame.id}`, frame.action);
       return `${frame.action}  ${compactJson(frame.payload)}`;
     }
+    // A SEND (2.1) is never answered, so its id is not remembered.
+    if (frame.type === MessageType.Send) return `${frame.action}  SEND ${compactJson(frame.payload)}`;
+    const error = (label: string, f: { code: string; description: string; details: unknown }) =>
+      `${label} ${compactJson({ code: f.code, description: f.description, details: f.details })}`;
+    // A CALLRESULTERROR (2.1) answers a CALLRESULT, whose CALL id has already been forgotten.
+    if (frame.type === MessageType.CallResultError) return `#${frame.id}  ${error('CALLRESULTERROR', frame)}`;
     const action = this.calls.get(key) ?? `#${frame.id}`;
     this.calls.delete(key);
     if (frame.type === MessageType.CallResult) return `${action}  ${compactJson(frame.payload)}`;
-    return `${action}  CALLERROR ${compactJson({ code: frame.code, description: frame.description, details: frame.details })}`;
+    return `${action}  ${error('CALLERROR', frame)}`;
   }
 }
 

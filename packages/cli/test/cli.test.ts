@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FakeCsms } from '../../core/test/fake-csms';
@@ -203,5 +203,30 @@ describe('wattsim run', () => {
     expect(stdout).toContain('interrupted');
     expect(stdout).toMatch(/^CP-1\s+FAIL\s+/m);
     expect(await stderr).toBe('');
+  });
+});
+
+describe('examples/*.ws', async () => {
+  const dir = join(repoRoot, 'examples');
+  const examples = (await readdir(dir)).filter((f) => f.endsWith('.ws')).sort();
+  let csms: FakeCsms;
+  beforeAll(async () => {
+    csms = await FakeCsms.start();
+  });
+  afterAll(() => csms.stop());
+
+  test('there are examples', () => {
+    expect(examples.length).toBeGreaterThan(0);
+  });
+
+  test.each(examples)('%s checks clean, is canonical and runs green against the FakeCsms', async (name) => {
+    const file = join(dir, name);
+    expect((await cli('check', file)).code).toBe(0);
+    const fmt = await cli('fmt', file);
+    expect(fmt.code).toBe(0);
+    expect(fmt.stdout).toBe(await Bun.file(file).text());
+    const run = await cli('run', file, '--csms', `${csms.url}/ocpp`, '--virtual', '--quiet');
+    expect(run.stdout).toContain(' 0 failed;');
+    expect(run.code).toBe(0);
   });
 });

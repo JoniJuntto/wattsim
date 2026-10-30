@@ -6,7 +6,14 @@ const result: RunResult = {
   ok: false,
   durationMs: 1234,
   violations: [
-    { version: 'ocpp1.6', action: 'Heartbeat', direction: 'response', path: 'currentTime', message: 'not a string' },
+    {
+      version: 'ocpp1.6',
+      action: 'Heartbeat',
+      direction: 'response',
+      path: 'currentTime',
+      message: 'not a string',
+      code: 'type',
+    },
   ],
   stations: [
     {

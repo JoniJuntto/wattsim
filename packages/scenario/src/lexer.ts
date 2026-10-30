@@ -2,6 +2,9 @@ export type TokenType = 'ident' | 'string' | 'number' | 'int' | 'punct' | 'keywo
 
 export type Token = { type: TokenType; value: string; line: number; col: number };
 
+/** A `//` comment. `text` follows the slashes verbatim; `trailing` when a token precedes it on its line. */
+export type Comment = { text: string; line: number; col: number; trailing: boolean };
+
 /** Syntax error with a 1-based source location. `String(err)` yields `file:line:col: message`. */
 export class ParseError extends Error {
   constructor(
@@ -54,6 +57,7 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   'net',
   'chaos',
   'clock',
+  'on',
   'call',
   'log',
   'fail',
@@ -66,8 +70,11 @@ const isDigit = (c: string) => c >= '0' && c <= '9';
 const isIdentStart = (c: string) => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_';
 const isIdentPart = (c: string) => isIdentStart(c) || isDigit(c);
 
-/** Tokenize a scenario source. Comments are dropped; newlines are kept as tokens. Throws `ParseError`. */
-export function lex(src: string, file?: string): Token[] {
+/**
+ * Tokenize a scenario source. Newlines are kept as tokens; comments are not tokens but are appended to `comments`
+ * when given. Throws `ParseError`.
+ */
+export function lex(src: string, file?: string, comments?: Comment[]): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   let line = 1;
@@ -95,10 +102,15 @@ export function lex(src: string, file?: string): Token[] {
       continue;
     }
     if (ch === '/' && src[i + 1] === '/') {
+      const start = i;
+      const startCol = col;
       while (i < n && src[i] !== '\n') {
         i++;
         col++;
       }
+      const last = tokens.at(-1);
+      const trailing = last !== undefined && last.type !== 'newline' && last.line === line;
+      comments?.push({ text: src.slice(start + 2, i).trimEnd(), line, col: startCol, trailing });
       continue;
     }
 

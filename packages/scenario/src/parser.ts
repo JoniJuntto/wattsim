@@ -1,29 +1,56 @@
 import type {
+  AtStmt,
   ChaosDirection,
   ChaosFault,
   ChaosStmt,
   ChaosTrigger,
   ChooseBranch,
+  ChooseStmt,
   ClockStmt,
-  Duration,
+  Comments,
+  DistExpr,
+  DurationLit,
+  DurationUnit,
+  DurExpr,
   EvAction,
+  ExpectFrame,
+  ExpectStmt,
   Expr,
   JsonEntry,
   JsonValue,
   LetDecl,
   Loc,
+  NetStmt,
+  NumExpr,
   OcppVersion,
+  OnResponse,
+  OnStmt,
   ProcDecl,
   Prop,
   PropValue,
+  RepeatStmt,
   Scenario,
   StationBlock,
   Stmt,
+  StrExpr,
   StringExpr,
 } from './ast';
-import { KEYWORDS, lex, ParseError, type Token } from './lexer';
+import { type Comment, KEYWORDS, lex, ParseError, type Token } from './lexer';
 
-const DURATION_UNITS: Record<string, number> = { ms: 1, s: 1000, m: 60_000, min: 60_000, h: 3_600_000 };
+const DURATION_UNITS: Record<string, [ms: number, unit: DurationUnit]> = {
+  ms: [1, 'ms'],
+  s: [1000, 's'],
+  m: [60_000, 'min'],
+  min: [60_000, 'min'],
+  h: [3_600_000, 'h'],
+};
+const DISTRIBUTIONS: ReadonlySet<string> = new Set(['normal', 'uniform', 'exp']);
+/** Units that may follow an ev property number after a space (`battery 60 kWh`); attached ones may be any word. */
+const PROP_UNITS: ReadonlySet<string> = new Set(['kWh', 'Wh', 'kW', 'W', 'A', 'V']);
+const EXPECT_FRAMES: ReadonlySet<string> = new Set(['call', 'result', 'error']);
+const OCPP_VERSIONS: ReadonlySet<string> = new Set(['1.6', '2.0.1', '2.1']);
+/** `clock set` needs an explicit zone so a run means the same instant everywhere. */
+const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 const EV_ACTIONS: ReadonlySet<string> = new Set(['plug', 'unplug', 'ready', 'suspend', 'resume']);
 const CHAOS_FAULTS: ReadonlySet<string> = new Set([
   'drop',
@@ -39,7 +66,9 @@ const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Parse a scenario source into its AST. Throws `ParseError` with a 1-based location. */
 export function parse(src: string, file?: string): Scenario {
-  return new Parser(lex(src, file), file).parseScenario();
+  const comments: Comment[] = [];
+  const tokens = lex(src, file, comments);
+  return new Parser(tokens, comments, file).parseScenario();
 }
 
 /** Split a raw string literal into literal chunks and `{var}` references, resolving escapes in the chunks. */
@@ -82,13 +111,61 @@ export function parseStringParts(raw: string, loc: Loc, file?: string): StringEx
   return parts;
 }
 
+/** Sets `node.comments` when there is anything to attach. */
+function setComments(node: { comments?: Comments }, leading: string[], trailing?: string): void {
+  if (leading.length === 0 && trailing === undefined) return;
+  node.comments = {};
+  if (leading.length) node.comments.leading = leading;
+  if (trailing !== undefined) node.comments.trailing = trailing;
+}
+
+/** Sets `node.endComments` (comments after the last statement of a block) when there are any. */
+function withEnd<T extends { endComments?: string[] }>(node: T, end: string[]): T {
+  if (end.length) node.endComments = end;
+  return node;
+}
+
 class Parser {
   private pos = 0;
+  /** Index of the first comment not yet attached to a node. */
+  private ci = 0;
 
   constructor(
     private readonly tokens: Token[],
+    private readonly comments: Comment[],
     private readonly file?: string,
   ) {}
+
+  // ---- comments -------------------------------------------------------------------------------------------------
+
+  /** Unattached comments on lines before `line`: they lead the node starting there. */
+  private takeLeading(line: number): string[] {
+    const out: string[] = [];
+    for (let c = this.comments[this.ci]; c && c.line < line; c = this.comments[++this.ci]) out.push(c.text);
+    return out;
+  }
+
+  /**
+   * Attach comments to a node whose last token was just consumed: comments inside its span move above it, and a
+   * comment at the end of its last line trails it unless another statement follows on that line (`a; b // c`).
+   */
+  private attach(node: { comments?: Comments }, leading: string[]): void {
+    const endLine = (this.tokens[this.pos - 1] as Token).line;
+    const inner: string[] = [];
+    for (let c = this.comments[this.ci]; c && c.line < endLine; c = this.comments[++this.ci]) inner.push(c.text);
+    let trailing: string | undefined;
+    const c = this.comments[this.ci];
+    if (c && c.line === endLine && c.trailing) {
+      let k = 0;
+      while (this.peek(k).type === 'punct' && this.peek(k).value === ';') k++;
+      const next = this.peek(k);
+      if (next.type === 'newline' || next.type === 'eof') {
+        trailing = c.text;
+        this.ci++;
+      }
+    }
+    setComments(node, [...leading, ...inner], trailing);
+  }
 
   // ---- token helpers --------------------------------------------------------------------------------------------
 
@@ -160,13 +237,6 @@ class Parser {
     return this.advance().value;
   }
 
-  private expectInt(what: string): number {
-    const t = this.peek();
-    if (t.type !== 'int') this.fail(`expected integer ${what}, got ${Parser.describe(t)}`);
-    this.advance();
-    return Number(t.value);
-  }
-
   private expectNumber(what: string): number {
     const t = this.peek();
     if (t.type !== 'int' && t.type !== 'number') this.fail(`expected number ${what}, got ${Parser.describe(t)}`);
@@ -181,17 +251,44 @@ class Parser {
     return this.stringExpr(t);
   }
 
+  private static loc(t: Token): Loc {
+    return { line: t.line, col: t.col };
+  }
+
+  /** A number literal (integer only with `int`, sign only with `signed`) or a variable reference. */
+  private parseNum(what: string, opts: { int?: boolean; signed?: boolean } = {}): NumExpr {
+    const t = this.peek();
+    const loc = Parser.loc(t);
+    if (Parser.isWord(t)) {
+      this.advance();
+      return { kind: 'ref', name: t.value, loc };
+    }
+    let sign = 1;
+    if (opts.signed && (this.atPunct('-') || this.atPunct('+'))) sign = this.advance().value === '-' ? -1 : 1;
+    const n = this.peek();
+    const ok = n.type === 'int' || (!opts.int && n.type === 'number');
+    if (!ok) this.fail(`expected ${opts.int ? 'integer' : 'number'} ${what}, got ${Parser.describe(n)}`);
+    this.advance();
+    return { kind: 'number', value: sign * Number(n.value), loc };
+  }
+
+  /** A string literal or a variable reference. */
+  private parseStr(what: string): StrExpr {
+    const t = this.peek();
+    if (Parser.isWord(t)) {
+      this.advance();
+      return { kind: 'ref', name: t.value, loc: Parser.loc(t) };
+    }
+    return this.expectString(what);
+  }
+
   private stringExpr(t: Token): StringExpr {
     const loc = { line: t.line, col: t.col };
     return { kind: 'string', raw: t.value, parts: parseStringParts(t.value, loc, this.file), loc };
   }
 
-  private atDurationStart(): boolean {
-    const t = this.peek();
-    return t.type === 'int' || t.type === 'number';
-  }
-
-  private parseDuration(what: string): Duration {
+  /** A number literal followed by its unit; `loc` is the number (or its sign). */
+  private parseDurationLit(what: string, loc: Loc, sign = 1): DurationLit {
     const num = this.peek();
     if (num.type !== 'int' && num.type !== 'number')
       this.fail(`expected duration ${what}, got ${Parser.describe(num)}`);
@@ -200,26 +297,56 @@ class Parser {
     if (!Parser.isWord(unit) || unit.line !== num.line) {
       this.fail(`expected duration unit (ms, s, m, min, h) after '${num.value}'`, unit.type === 'eof' ? num : unit);
     }
-    const factor = DURATION_UNITS[unit.value];
-    if (factor === undefined) this.fail(`unknown duration unit '${unit.value}', expected ms, s, m, min or h`);
+    const known = DURATION_UNITS[unit.value];
+    if (known === undefined) this.fail(`unknown duration unit '${unit.value}', expected ms, s, m, min or h`);
     this.advance();
-    const exact = Number(num.value) * factor;
+    const exact = Number(num.value) * known[0];
     const ms = Math.round(exact);
     // Tolerate binary float noise (1.1s -> 1100.0000000000002) but reject real fractions (0.4ms).
     if (Math.abs(exact - ms) > 1e-6) this.fail('duration must be a whole number of milliseconds', num);
-    return { ms };
+    return { kind: 'duration', ms: sign < 0 && ms !== 0 ? -ms : ms, unit: known[1], loc };
   }
 
-  private parseSignedDuration(what: string): Duration {
-    let sign = 1;
-    if (this.atPunct('-')) {
-      sign = -1;
+  /** A duration literal, a distribution call or a variable reference. `signed` admits `-`/`+` on a literal. */
+  private parseDur(what: string, signed = false): DurExpr {
+    const t = this.peek();
+    const loc = Parser.loc(t);
+    if (Parser.isWord(t)) {
+      const open = this.peek(1);
+      if (open.type === 'punct' && open.value === '(' && open.line === t.line) return this.parseDist();
       this.advance();
-    } else if (this.atPunct('+')) {
-      this.advance();
+      return { kind: 'ref', name: t.value, loc };
     }
-    const d = this.parseDuration(what);
-    return { ms: sign * d.ms };
+    let sign = 1;
+    if (signed && (this.atPunct('-') || this.atPunct('+'))) {
+      sign = this.advance().value === '-' ? -1 : 1;
+      const next = this.peek();
+      if (Parser.isWord(next)) this.fail(`a sign is only allowed on a literal duration, not on '${next.value}'`, next);
+    }
+    return this.parseDurationLit(what, loc, sign);
+  }
+
+  /** `normal(mean, sd)`, `uniform(min, max)` or `exp(mean)`; the name is the current token. */
+  private parseDist(): DistExpr {
+    const nameTok = this.advance();
+    const name = nameTok.value;
+    const loc = Parser.loc(nameTok);
+    if (!DISTRIBUTIONS.has(name)) this.fail(`unknown distribution '${name}', expected normal, uniform or exp`, loc);
+    this.advance(); // (
+    const first = this.parseDur(`as first argument of ${name}()`);
+    let second: DurExpr | undefined;
+    if (name !== 'exp') {
+      this.expectPunct(',', `between the arguments of ${name}()`);
+      second = this.parseDur(`as second argument of ${name}()`);
+    }
+    this.expectPunct(')', `to close ${name}(`);
+    if (name === 'exp') return { kind: 'exp', mean: first, loc };
+    const b = second as DurExpr;
+    if (name === 'normal') return { kind: 'normal', mean: first, sd: b, loc };
+    if (first.kind === 'duration' && b.kind === 'duration' && b.ms < first.ms) {
+      this.fail(`uniform(min, max) needs max >= min, got uniform(${first.ms}ms, ${b.ms}ms)`, loc);
+    }
+    return { kind: 'uniform', min: first, max: b, loc };
   }
 
   // ---- top level ------------------------------------------------------------------------------------------------
@@ -227,6 +354,7 @@ class Parser {
   parseScenario(): Scenario {
     this.skipNewlines();
     const head = this.peek();
+    const headLeading = this.takeLeading(head.line);
     if (!this.atWord('wattsim')) {
       this.fail(`expected 'wattsim 1' version header on the first line, got ${Parser.describe(head)}`);
     }
@@ -235,30 +363,38 @@ class Parser {
     if (v.type !== 'int' || v.value !== '1')
       this.fail(`unsupported scenario version ${Parser.describe(v)}, expected 1`);
     this.advance();
+    const header: { comments?: Comments } = {};
+    this.attach(header, headLeading);
     this.endStmt('wattsim header');
 
     const scenario: Scenario = { version: 1, lets: [], procs: [], stations: [] };
+    const comments: NonNullable<Scenario['comments']> = {};
+    if (header.comments) comments.header = header.comments;
     for (;;) {
       this.skipNewlines();
       const t = this.peek();
       if (t.type === 'eof') break;
       if (!Parser.isWord(t)) this.fail(`expected a declaration, got ${Parser.describe(t)}`);
+      const leading = this.takeLeading(t.line);
       switch (t.value) {
         case 'csms': {
           this.advance();
           if (scenario.csms) this.fail("duplicate 'csms' declaration", t);
-          scenario.csms = this.expectString("URL after 'csms'");
+          scenario.csms = this.parseStr("URL after 'csms'");
+          const holder: { comments?: Comments } = {};
+          this.attach(holder, leading);
+          if (holder.comments) comments.csms = holder.comments;
           this.endStmt('csms');
           break;
         }
         case 'let':
-          scenario.lets.push(this.parseLet());
+          scenario.lets.push(this.parseLet(leading));
           break;
         case 'proc':
-          scenario.procs.push(this.parseProc());
+          scenario.procs.push(this.parseProc(leading));
           break;
         case 'station':
-          scenario.stations.push(this.parseStation());
+          scenario.stations.push(this.parseStation(leading));
           break;
         default:
           if (KEYWORDS.has(t.value)) {
@@ -267,47 +403,54 @@ class Parser {
           this.fail(`unknown top-level declaration '${t.value}'`);
       }
     }
+    const end = this.comments.slice(this.ci).map((c) => c.text);
+    if (end.length) comments.end = end;
+    if (Object.keys(comments).length) scenario.comments = comments;
     return scenario;
   }
 
-  private parseLet(): LetDecl {
+  private parseLet(leading: string[]): LetDecl {
     const kw = this.advance();
     const name = this.expectIdent("variable name after 'let'");
     this.expectPunct('=', `after 'let ${name}'`);
     const value = this.parseExpr();
+    const node: LetDecl = { kind: 'let', name, value, loc: Parser.loc(kw) };
+    this.attach(node, leading);
     this.endStmt('let');
-    return { kind: 'let', name, value, loc: { line: kw.line, col: kw.col } };
+    return node;
   }
 
   private parseExpr(): Expr {
     const t = this.peek();
-    const loc = { line: t.line, col: t.col };
+    const loc = Parser.loc(t);
     if (t.type === 'string') {
       this.advance();
       return this.stringExpr(t);
     }
-    if (t.type === 'int' || t.type === 'number') {
+    if (Parser.isWord(t)) return this.parseDur('');
+    let sign = 1;
+    if (this.atPunct('-') || this.atPunct('+')) sign = this.advance().value === '-' ? -1 : 1;
+    const n = this.peek();
+    if (n.type === 'int' || n.type === 'number') {
       const unit = this.peek(1);
-      if (Parser.isWord(unit) && unit.line === t.line) return { kind: 'duration', ms: this.parseDuration('').ms, loc };
+      if (Parser.isWord(unit) && unit.line === n.line) return this.parseDurationLit('', loc, sign);
       this.advance();
-      return { kind: 'number', value: Number(t.value), loc };
+      return { kind: 'number', value: sign * Number(n.value), loc };
     }
-    if (Parser.isWord(t)) {
-      this.advance();
-      return { kind: 'ref', name: t.value, loc };
-    }
-    return this.fail(`expected string, number, duration or identifier, got ${Parser.describe(t)}`);
+    return this.fail(`expected string, number, duration or identifier, got ${Parser.describe(n)}`, n);
   }
 
-  private parseProc(): ProcDecl {
+  private parseProc(leading: string[]): ProcDecl {
     const kw = this.advance();
     const name = this.expectIdent("procedure name after 'proc'");
     this.expectPunct('{', `to open proc '${name}'`);
-    const body = this.parseBlockBody('proc', kw);
-    return { kind: 'proc', name, body, loc: { line: kw.line, col: kw.col } };
+    const [body, end] = this.parseBlockBody('proc', kw);
+    const node: ProcDecl = withEnd<ProcDecl>({ kind: 'proc', name, body, loc: Parser.loc(kw) }, end);
+    this.attach(node, leading);
+    return node;
   }
 
-  private parseStation(): StationBlock {
+  private parseStation(leading: string[]): StationBlock {
     const kw = this.advance();
     const name = this.expectString("station name after 'station'");
     let range: StationBlock['range'];
@@ -316,35 +459,42 @@ class Parser {
       const v = this.expectIdent("loop variable after 'for'");
       this.expectWord('in', `after 'for ${v}'`);
       const fromTok = this.peek();
-      const from = this.expectInt('for range start');
+      const from = this.parseNum('for range start', { int: true });
       this.expectPunct('..', 'in range');
-      const to = this.expectInt('for range end');
-      if (to < from) this.fail(`invalid range ${from}..${to}: end must not be before start`, fromTok);
+      const to = this.parseNum('for range end', { int: true });
+      if (from.kind === 'number' && to.kind === 'number' && to.value < from.value) {
+        this.fail(`invalid range ${from.value}..${to.value}: end must not be before start`, fromTok);
+      }
       range = { var: v, from, to };
     }
     this.expectPunct('{', 'to open station block');
-    const body = this.parseBlockBody('station', kw);
-    const node: StationBlock = { kind: 'station', name, body, loc: { line: kw.line, col: kw.col } };
+    const [body, end] = this.parseBlockBody('station', kw);
+    const node: StationBlock = withEnd<StationBlock>({ kind: 'station', name, body, loc: Parser.loc(kw) }, end);
     if (range) node.range = range;
+    this.attach(node, leading);
     return node;
   }
 
-  /** Parses statements up to and including the closing `}`; the opening `{` has been consumed. */
-  private parseBlockBody(what: string, opener: Token): Stmt[] {
+  /**
+   * Parses statements up to and including the closing `}`; the opening `{` has been consumed. Returns the body and
+   * the comments between its last statement and the `}`.
+   */
+  private parseBlockBody(what: string, opener: Token): [Stmt[], string[]] {
     const body: Stmt[] = [];
     for (;;) {
       this.skipNewlines();
       const t = this.peek();
       if (this.atPunct('}')) {
+        const end = this.takeLeading(t.line);
         this.advance();
-        return body;
+        return [body, end];
       }
       if (t.type === 'eof') this.fail(`expected '}' to close ${what} block opened at line ${opener.line}`);
       body.push(this.parseStmt());
     }
   }
 
-  private parseBlock(what: string): Stmt[] {
+  private parseBlock(what: string): [Stmt[], string[]] {
     const open = this.expectPunct('{', `to open ${what} block`);
     return this.parseBlockBody(what, open);
   }
@@ -354,8 +504,9 @@ class Parser {
   private parseStmt(): Stmt {
     const t = this.peek();
     if (!Parser.isWord(t)) this.fail(`expected a statement, got ${Parser.describe(t)}`);
-    const loc: Loc = { line: t.line, col: t.col };
-    const stmt = this.parseStmtBody(t, loc);
+    const leading = this.takeLeading(t.line);
+    const stmt = this.parseStmtBody(t, Parser.loc(t));
+    this.attach(stmt, leading);
     this.endStmt(t.value);
     return stmt;
   }
@@ -369,29 +520,30 @@ class Parser {
       case 'evses':
       case 'connectors': {
         this.advance();
-        return { kind: t.value, count: this.expectInt(`after '${t.value}'`), loc };
+        return { kind: t.value, count: this.parseNum(`after '${t.value}'`, { int: true }), loc };
       }
       case 'vendor':
       case 'model':
       case 'serial': {
         this.advance();
-        return { kind: t.value, value: this.expectString(`after '${t.value}'`), loc };
+        return { kind: t.value, value: this.parseStr(`after '${t.value}'`), loc };
       }
       case 'auth': {
         this.advance();
-        const user = this.expectString("user name after 'auth'");
-        const password = this.expectString('password after auth user');
+        const user = this.parseStr("user name after 'auth'");
+        const password = this.parseStr('password after auth user');
         return { kind: 'auth', user, password, loc };
       }
       case 'heartbeat': {
         this.advance();
-        if (this.atDurationStart())
-          return { kind: 'heartbeat', interval: this.parseDuration("after 'heartbeat'"), loc };
+        const next = this.peek();
+        if (Parser.isWord(next) || next.type === 'int' || next.type === 'number')
+          return { kind: 'heartbeat', interval: this.parseDur("after 'heartbeat'"), loc };
         return { kind: 'heartbeat', loc };
       }
       case 'meterInterval': {
         this.advance();
-        return { kind: 'meterInterval', interval: this.parseDuration("after 'meterInterval'"), loc };
+        return { kind: 'meterInterval', interval: this.parseDur("after 'meterInterval'"), loc };
       }
       case 'connect':
       case 'disconnect':
@@ -403,35 +555,37 @@ class Parser {
         return this.parseEv(loc);
       case 'authorize': {
         this.advance();
-        return { kind: 'authorize', tag: this.expectString("id tag after 'authorize'"), loc };
+        return { kind: 'authorize', tag: this.parseStr("id tag after 'authorize'"), loc };
       }
       case 'start': {
         this.advance();
         this.expectWord('evse', "after 'start'");
-        const evse = this.expectInt('EVSE id');
+        const evse = this.parseNum('EVSE id', { int: true });
         const node: Stmt = { kind: 'start', evse, loc };
         if (this.atWord('tag')) {
           this.advance();
-          node.tag = this.expectString("id tag after 'tag'");
+          node.tag = this.parseStr("id tag after 'tag'");
         }
         return node;
       }
       case 'stop': {
         this.advance();
         this.expectWord('evse', "after 'stop'");
-        return { kind: 'stop', evse: this.expectInt('EVSE id'), loc };
+        return { kind: 'stop', evse: this.parseNum('EVSE id', { int: true }), loc };
       }
       case 'status': {
         this.advance();
         this.expectWord('evse', "after 'status'");
-        const evse = this.expectInt('EVSE id');
+        const evse = this.parseNum('EVSE id', { int: true });
         return { kind: 'status', evse, status: this.expectIdent('status name (e.g. Faulted)'), loc };
       }
       case 'send': {
         this.advance();
         const action = this.expectIdent("OCPP action name after 'send'");
         this.rejectBarePayloadWord('send', action);
-        return { kind: 'send', action, payload: this.parseJson(), loc };
+        const node: Stmt = { kind: 'send', action, loc };
+        if (this.atPayloadStart()) node.payload = this.parseJson();
+        return node;
       }
       case 'expect':
         return this.parseExpect(loc);
@@ -441,7 +595,7 @@ class Parser {
           this.advance();
           return { kind: 'wait', until: this.expectIdent("barrier name after 'wait until'"), loc };
         }
-        return { kind: 'wait', duration: this.parseDuration("after 'wait'"), loc };
+        return { kind: 'wait', duration: this.parseDur("after 'wait'"), loc };
       }
       case 'barrier': {
         this.advance();
@@ -449,24 +603,28 @@ class Parser {
       }
       case 'at': {
         this.advance();
+        if (this.atPunct('-')) {
+          this.fail(
+            "'at' takes a positive offset ('at +5s'): it counts from the start of the enclosing block, which has already begun",
+          );
+        }
         this.expectPunct('+', "after 'at'");
-        const offset = this.parseDuration("after 'at +'");
-        return { kind: 'at', offset, body: this.parseBlock('at'), loc };
+        const offset = this.parseDur("after 'at +'");
+        const [body, end] = this.parseBlock('at');
+        return withEnd<AtStmt>({ kind: 'at', offset, body, loc }, end);
       }
       case 'repeat': {
         this.advance();
-        const count = this.expectInt("count after 'repeat'");
-        return { kind: 'repeat', count, body: this.parseBlock('repeat'), loc };
+        const count = this.parseNum("count after 'repeat'", { int: true });
+        const [body, end] = this.parseBlock('repeat');
+        return withEnd<RepeatStmt>({ kind: 'repeat', count, body, loc }, end);
       }
       case 'choose':
         return this.parseChoose(loc);
-      case 'net': {
-        this.advance();
-        const op = this.peek();
-        if (!this.atWord('drop')) this.fail(`unknown net operation ${Parser.describe(op)}, expected 'drop'`);
-        this.advance();
-        return { kind: 'net', op: 'drop', duration: this.parseDuration("after 'net drop'"), loc };
-      }
+      case 'net':
+        return this.parseNet(loc);
+      case 'on':
+        return this.parseOn(loc);
       case 'chaos':
         return this.parseChaos(loc);
       case 'clock':
@@ -478,7 +636,7 @@ class Parser {
       case 'log':
       case 'fail': {
         this.advance();
-        return { kind: t.value, message: this.expectString(`message after '${t.value}'`), loc };
+        return { kind: t.value, message: this.parseStr(`message after '${t.value}'`), loc };
       }
       default:
         return this.fail(`unknown statement '${t.value}'`);
@@ -488,7 +646,7 @@ class Parser {
   private parseVersion(): OcppVersion {
     const t = this.peek();
     if (t.type !== 'int' && t.type !== 'number')
-      this.fail(`expected OCPP version 1.6 or 2.0.1, got ${Parser.describe(t)}`);
+      this.fail(`expected OCPP version 1.6, 2.0.1 or 2.1, got ${Parser.describe(t)}`);
     this.advance();
     let text = t.value;
     // `2.0.1` lexes as number `2.0`, punct `.`, int `1`.
@@ -496,8 +654,8 @@ class Parser {
       this.advance();
       text += `.${this.advance().value}`;
     }
-    if (text !== '1.6' && text !== '2.0.1') this.fail(`unknown OCPP version '${text}', expected 1.6 or 2.0.1`, t);
-    return text;
+    if (!OCPP_VERSIONS.has(text)) this.fail(`unknown OCPP version '${text}', expected 1.6, 2.0.1 or 2.1`, t);
+    return text as OcppVersion;
   }
 
   private parseEv(loc: Loc): Stmt {
@@ -509,7 +667,7 @@ class Parser {
     this.advance();
     const action = actionTok.value as EvAction;
     this.expectWord('evse', `after 'ev ${action}'`);
-    const evse = this.expectInt('EVSE id');
+    const evse = this.parseNum('EVSE id', { int: true });
     const props: Prop[] = [];
     if (this.atPunct('{')) {
       const open = this.advance();
@@ -531,10 +689,14 @@ class Parser {
 
   private parsePropValue(name: string): PropValue {
     const t = this.peek();
-    const loc = { line: t.line, col: t.col };
+    const loc = Parser.loc(t);
     if (t.type === 'string') {
       this.advance();
       return this.stringExpr(t);
+    }
+    if (Parser.isWord(t)) {
+      this.advance();
+      return { kind: 'ref', name: t.value, loc };
     }
     if (t.type === 'int' || t.type === 'number') {
       this.advance();
@@ -553,25 +715,94 @@ class Parser {
   }
 
   /**
-   * `60kWh` and `60 kWh` both carry a unit. A spaced word is a unit unless it is itself followed by a
-   * property value (`battery 60 soc 20%`), in which case it is the next property's name.
+   * `60kWh` carries any attached word as its unit. After a space only a known unit counts (`60 kWh`), so in
+   * `battery 60 soc 20%` the word is the next property's name.
    */
   private isPropUnit(word: Token, num: Token): boolean {
-    if (word.col === num.col + num.value.length) return true;
-    const after = this.peek(1);
-    return after.type !== 'int' && after.type !== 'number' && after.type !== 'string';
+    return word.col === num.col + num.value.length || PROP_UNITS.has(word.value);
   }
 
   private parseExpect(loc: Loc): Stmt {
     this.advance();
-    const action = this.expectIdent("OCPP action name after 'expect'");
-    const node: Stmt = { kind: 'expect', action, loc };
-    if (!this.atWord('within')) this.rejectBarePayloadWord('expect', action);
-    if (this.atPayloadStart()) node.payload = this.parseJson();
+    let frame: ExpectFrame | undefined;
+    const f = this.peek();
+    if (Parser.isWord(f) && EXPECT_FRAMES.has(f.value)) frame = this.advance().value as ExpectFrame;
+    const action = this.expectIdent(`OCPP action name after 'expect${frame ? ` ${frame}` : ''}'`);
+    const node: ExpectStmt = { kind: 'expect', action, loc };
+    if (frame) node.frame = frame;
+    if (frame === 'error') {
+      // A CALLERROR is matched by its code, a bare word: `expect error Authorize NotImplemented`.
+      if (Parser.isWord(this.peek()) && !this.atWord('within')) node.code = this.advance().value;
+    } else {
+      if (!this.atWord('within')) this.rejectBarePayloadWord('expect', action);
+      if (this.atPayloadStart()) node.payload = this.parseJson();
+    }
     if (this.atWord('within')) {
       this.advance();
-      node.within = this.parseDuration("after 'within'");
+      node.within = this.parseDur("after 'within'");
     }
+    return node;
+  }
+
+  private parseNet(loc: Loc): NetStmt {
+    this.advance();
+    const op = this.peek();
+    if (this.atWord('drop')) {
+      this.advance();
+      return { kind: 'net', op: 'drop', duration: this.parseDur("after 'net drop'"), loc };
+    }
+    if (!this.atWord('delay')) this.fail(`unknown net operation ${Parser.describe(op)}, expected 'drop' or 'delay'`);
+    this.advance();
+    const node: NetStmt = { kind: 'net', op: 'delay', delay: this.parseDur("after 'net delay'"), loc };
+    if (this.atWord('for')) {
+      this.advance();
+      node.for = this.parseDur("after 'net delay ... for'");
+    }
+    return node;
+  }
+
+  /** `{` opens the handler body unless it starts a payload pattern, i.e. a `key:` follows it. */
+  private atOnBody(): boolean {
+    if (!this.atPunct('{')) return false;
+    let k = 1;
+    while (this.peek(k).type === 'newline') k++;
+    const key = this.peek(k);
+    const colon = this.peek(k + 1);
+    const isKey = (Parser.isWord(key) || key.type === 'string') && colon.type === 'punct' && colon.value === ':';
+    return !isKey;
+  }
+
+  private parseOn(loc: Loc): OnStmt {
+    this.advance();
+    const action = this.expectIdent("OCPP action name after 'on'");
+    let payload: JsonValue | undefined;
+    if (!this.atOnBody() && !this.atWord('always')) {
+      this.rejectBarePayloadWord('on', action);
+      if (this.atPayloadStart()) payload = this.parseJson();
+    }
+    let always = false;
+    if (this.atWord('always')) {
+      this.advance();
+      always = true;
+    }
+    const open = this.expectPunct('{', `to open on ${action} block`);
+    this.skipNewlines();
+    const r = this.peek();
+    let response: OnResponse;
+    if (this.atWord('reply')) {
+      this.advance();
+      response = { kind: 'reply', payload: this.parseJson(), loc: Parser.loc(r) };
+    } else if (this.atWord('error')) {
+      this.advance();
+      response = { kind: 'error', code: this.expectIdent("CALLERROR code after 'error'"), loc: Parser.loc(r) };
+      if (this.peek().type === 'string') response.description = this.stringExpr(this.advance());
+    } else {
+      return this.fail(`expected 'reply' or 'error' in on block, got ${Parser.describe(r)}`);
+    }
+    this.skipNewlines();
+    this.expectPunct('}', `to close on block opened at line ${open.line}`);
+    const node: OnStmt = { kind: 'on', action, always, response, loc };
+    if (payload) node.payload = payload;
     return node;
   }
 
@@ -592,24 +823,30 @@ class Parser {
     this.advance();
     const open = this.expectPunct('{', "after 'choose'");
     const branches: ChooseBranch[] = [];
+    let end: string[];
     for (;;) {
       this.skipNewlines();
+      const t = this.peek();
       if (this.atPunct('}')) {
+        end = this.takeLeading(t.line);
         this.advance();
         break;
       }
-      const t = this.peek();
       if (t.type === 'eof') this.fail(`expected '}' to close choose block opened at line ${open.line}`);
-      const percent = this.expectInt('percentage for choose branch');
+      const leading = this.takeLeading(t.line);
+      const percent = this.expectNumber('percentage for choose branch');
       this.expectPunct('%', 'after choose branch weight');
       this.expectPunct(':', 'after choose branch weight');
-      const body = this.parseBlock('choose branch');
-      branches.push({ percent, body, loc: { line: t.line, col: t.col } });
+      const [body, bodyEnd] = this.parseBlock('choose branch');
+      const branch = withEnd<ChooseBranch>({ percent, body, loc: Parser.loc(t) }, bodyEnd);
+      this.attach(branch, leading);
+      branches.push(branch);
     }
     if (branches.length === 0) this.fail('choose needs at least one branch', loc);
     const sum = branches.reduce((a, b) => a + b.percent, 0);
-    if (sum !== 100) this.fail(`choose branches must sum to 100%, got ${sum}%`, loc);
-    return { kind: 'choose', branches, loc };
+    // Decimal weights add up with binary noise (33.3 + 33.3 + 33.4).
+    if (Math.abs(sum - 100) > 1e-9) this.fail(`choose branches must sum to 100%, got ${Number(sum.toFixed(9))}%`, loc);
+    return withEnd<ChooseStmt>({ kind: 'choose', branches, loc }, end);
   }
 
   private parseChaos(loc: Loc): ChaosStmt {
@@ -622,7 +859,7 @@ class Parser {
     }
     this.advance();
     const node: ChaosStmt = { kind: 'chaos', fault: faultTok.value as ChaosFault, once: false, loc };
-    if (node.fault === 'delay') node.delay = this.parseDuration("after 'chaos delay'");
+    if (node.fault === 'delay') node.delay = this.parseDur("after 'chaos delay'");
     if (this.atWord('in') || this.atWord('out')) node.direction = this.advance().value as ChaosDirection;
     const t = this.peek();
     if (Parser.isWord(t) && !CHAOS_TAIL_WORDS.has(t.value)) node.action = this.advance().value;
@@ -638,15 +875,15 @@ class Parser {
   private parseChaosTrigger(): ChaosTrigger | undefined {
     if (this.atWord('nth')) {
       this.advance();
-      return { kind: 'nth', n: this.expectInt("after 'nth'") };
+      return { kind: 'nth', n: this.parseNum("after 'nth'", { int: true }) };
     }
     if (this.atWord('every')) {
       this.advance();
-      return { kind: 'every', n: this.expectInt("after 'every'") };
+      return { kind: 'every', n: this.parseNum("after 'every'", { int: true }) };
     }
     if (this.atWord('probability')) {
       this.advance();
-      const percent = this.expectInt("percentage after 'probability'");
+      const percent = this.parseNum("percentage after 'probability'");
       this.expectPunct('%', 'after probability');
       return { kind: 'probability', percent };
     }
@@ -658,19 +895,41 @@ class Parser {
     const modeTok = this.peek();
     if (this.atWord('speed')) {
       this.advance();
-      return { kind: 'clock', mode: 'speed', speed: this.expectNumber("for clock speed after 'clock speed'"), loc };
+      return { kind: 'clock', mode: 'speed', speed: this.parseNum("for clock speed after 'clock speed'"), loc };
     }
     if (this.atWord('skew')) {
       this.advance();
-      return { kind: 'clock', mode: 'skew', skew: this.parseSignedDuration("after 'clock skew'"), loc };
+      return { kind: 'clock', mode: 'skew', skew: this.parseDur("after 'clock skew'", true), loc };
     }
     if (this.atWord('drift')) {
       this.advance();
-      const ppm = this.expectInt("ppm value after 'clock drift'");
+      const ppm = this.parseNum("ppm value after 'clock drift'", { signed: true });
+      if (ppm.kind === 'number' && ppm.value <= -1_000_000) {
+        this.fail(`clock drift must be greater than -1000000 ppm, got ${ppm.value}`, ppm.loc);
+      }
       this.expectWord('ppm', 'after drift value');
       return { kind: 'clock', mode: 'drift', ppm, loc };
     }
-    return this.fail(`unknown clock setting ${Parser.describe(modeTok)}, expected speed, skew or drift`);
+    if (this.atWord('set')) {
+      this.advance();
+      const time = this.parseStr("timestamp after 'clock set'");
+      if (time.kind === 'string' && time.parts.every((p) => typeof p === 'string')) {
+        const text = time.parts.join('');
+        if (!ISO_WITH_ZONE.test(text) || Number.isNaN(Date.parse(text))) {
+          this.fail(
+            `invalid timestamp "${text}" after 'clock set', expected ISO 8601 with a zone such as "2026-03-29T01:59:50Z"`,
+            time.loc,
+          );
+        }
+      }
+      return { kind: 'clock', mode: 'set', time, loc };
+    }
+    if (this.atWord('freeze') || this.atWord('resume')) {
+      return { kind: 'clock', mode: this.advance().value as 'freeze' | 'resume', loc };
+    }
+    return this.fail(
+      `unknown clock setting ${Parser.describe(modeTok)}, expected speed, skew, drift, set, freeze or resume`,
+    );
   }
 
   // ---- JSON values ----------------------------------------------------------------------------------------------

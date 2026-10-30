@@ -1,3 +1,4 @@
+// A charging session under transport faults: lost and late frames, a dropped link, a fault.
 wattsim 1
 
 csms "ws://localhost:9000/ocpp"
@@ -14,11 +15,15 @@ proc charge {
 station "CP-CHAOS" {
   version 1.6
   meterInterval 30s
-  chaos drop out MeterValues nth 3
+  chaos drop out MeterValues nth 3 // the third MeterValues never arrives
   chaos delay 2s in every 2
   boot
   at +3min {
     net drop 20s
+  }
+  at +5min {
+    // A slow link: every frame takes half a second, for one minute.
+    net delay 500ms for 1min
   }
   at +7min {
     status evse 1 Faulted

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { StationConfig } from '@wattsim/core';
 import { Station, VirtualClock, WallClock } from '@wattsim/core';
 import type { v16 } from '@wattsim/protocol';
-import { FakeCsms } from '../../core/test/fake-csms';
+import { CsmsCallError, FakeCsms } from '../../core/test/fake-csms';
 import type { RunEvent, RunOptions, RunResult, Scenario } from '../src/index';
 import { driveVirtual, isIdle, parse, run } from '../src/index';
 
@@ -274,7 +274,8 @@ station "CP-1" {
     const fleet = parse(await fixture('fleet'));
     const block = fleet.stations[0];
     if (!block) throw new Error('fixture has no station');
-    block.range = { var: 'i', from: 1, to: 10 };
+    const loc = { line: 1, col: 1 };
+    block.range = { var: 'i', from: { kind: 'number', value: 1, loc }, to: { kind: 'number', value: 10, loc } };
 
     const charged = async (seed?: number): Promise<string[]> => {
       const { result } = await runVirtual(fleet, { seed });
@@ -559,5 +560,211 @@ describe('run: options', () => {
     controller.abort();
     const result = await running;
     expect(result.stations[0]).toMatchObject({ ok: false, error: 'aborted' });
+  });
+});
+
+const logsOf = (events: RunEvent[], station?: string) =>
+  events.flatMap((e) => (e.type === 'log' && (!station || e.station === station) ? [e] : []));
+
+describe('run: milestone 2 forms', () => {
+  test('variables drive counts, durations, EVSE ids and strings', async () => {
+    const src = `${header}
+let n = 2
+let pause = 30s
+let e = 1
+let who = "CP"
+
+station "CP-1" {
+  version 1.6
+  vendor who
+  boot
+  repeat n {
+    heartbeat
+  }
+  ev plug evse e
+  start evse e
+  wait pause
+  stop evse e
+  log who
+}
+`;
+    const { result, events } = await runVirtual(src);
+    expect(result.stations[0]?.error).toBeUndefined();
+    expect(result.ok).toBe(true);
+    expect(csms.callsFrom('CP-1', 'Heartbeat')).toHaveLength(2);
+    const boot = csms.callsFrom('CP-1', 'BootNotification')[0]?.payload as v16.BootNotificationRequest;
+    expect(boot.chargePointVendor).toBe('CP');
+    expect(csms.callsFrom('CP-1', 'StopTransaction')).toHaveLength(1);
+    expect(logsOf(events).map((l) => l.message)).toContain('CP');
+    expect(clock.now() - T0).toBeGreaterThanOrEqual(30_000);
+  });
+
+  test('a variable of the wrong type fails the station with the statement line:col', async () => {
+    const src = `${header}let pause = "soon"\n\nstation "CP-1" {\n  version 1.6\n  wait pause\n}\n`;
+    const a = await runVirtual(src);
+    expect(a.result.stations[0]?.error).toBe(`6:3: 'wait' must be a duration, but 'pause' is the string "soon"`);
+    const b = await runVirtual(station('CP-2', '  version 1.6\n  repeat n {\n  }', 'let n = 1.5\n'));
+    expect(b.result.stations[0]?.error).toBe("6:3: 'repeat' count must be an integer >= 0, got 1.5");
+    const c = await runVirtual(station('CP-3', '  version 1.6\n  wait nope'));
+    expect(c.result.stations[0]?.error).toBe("5:3: unknown variable 'nope'");
+  });
+
+  test('csms and station range bounds resolve from lets', async () => {
+    const src = `${header}csms url\nlet url = "${csms.url}"\nlet last = 3\n\nstation "CP-{i}" for i in 2..last {\n  version 1.6\n  boot\n}\n`;
+    const { result } = await runVirtual(src, { csmsUrl: undefined });
+    expect(result.ok).toBe(true);
+    expect(result.stations.map((s) => s.name)).toEqual(['CP-2', 'CP-3']);
+    expect(csms.callsFrom('CP-2', 'BootNotification')).toHaveLength(1);
+    expect(csms.callsFrom('CP-3', 'BootNotification')).toHaveLength(1);
+  });
+
+  test('version 2.1 maps to ocpp2.1 in the StationConfig', async () => {
+    const versions: string[] = [];
+    await runVirtual(station('CP-1', '  version 2.1\n  disconnect'), {
+      stationFactory: (cfg) => {
+        versions.push(cfg.version);
+        return new Station(cfg);
+      },
+    });
+    expect(versions).toEqual(['ocpp2.1']);
+  });
+
+  test('expect call / result / error select the frame type', async () => {
+    csms.respondWith('DataTransfer', () => new CsmsCallError('NotImplemented', 'no'));
+    const src = station(
+      'CP-1',
+      `  version 1.6
+  boot
+  expect call BootNotification
+  expect result BootNotification {status: "Accepted"} within 1s
+  send DataTransfer {vendorId: "x"}
+  expect error DataTransfer NotImplemented within 1s
+  send DataTransfer {vendorId: "y"}
+  expect result DataTransfer within 1s
+  expect call BootNotification {status: "Accepted"} within 1s`,
+    );
+    const { result } = await runVirtual(src);
+    const asserts = result.stations[0]?.asserts ?? [];
+    expect(asserts.map((a) => [a.expect, a.ok])).toEqual([
+      ['expect call BootNotification', true],
+      ['expect result BootNotification {"status":"Accepted"} within 1s', true],
+      ['expect error DataTransfer NotImplemented within 1s', true],
+      ['expect result DataTransfer within 1s', false],
+      ['expect call BootNotification {"status":"Accepted"} within 1s', false],
+    ]);
+  });
+
+  test('on handlers fail the station as not supported yet, with their line:col', async () => {
+    const { result } = await runVirtual(
+      station('CP-1', '  version 1.6\n  on Reset {\n    reply {status: "Accepted"}\n  }'),
+    );
+    expect(result.stations[0]?.error).toMatch(/^5:3: 'on' is not supported yet/);
+  });
+
+  test('send without a payload sends {}', async () => {
+    const { result } = await runVirtual(station('CP-1', '  version 1.6\n  boot\n  send Heartbeat'));
+    expect(result.ok).toBe(true);
+    expect(csms.callsFrom('CP-1', 'Heartbeat')[0]?.payload).toEqual({});
+  });
+
+  test('distribution samples are reproducible per seed, differ per station and per draw', async () => {
+    const src = `${header}
+station "CP-{i}" for i in 1..3 {
+  version 1.6
+  repeat 2 {
+    wait normal(10min, 2min)
+    log "tick"
+  }
+}
+`;
+    const times = async (seed?: number) => {
+      clock = new VirtualClock(T0);
+      const { result, events } = await runVirtual(src, { seed });
+      expect(result.ok).toBe(true);
+      const t: Record<string, number[]> = {};
+      for (const l of logsOf(events)) {
+        const key = l.station ?? '';
+        t[key] = [...(t[key] ?? []), l.at - T0];
+      }
+      return t;
+    };
+    const a = await times(1);
+    const b = await times(1);
+    const c = await times(2);
+    expect(b).toEqual(a);
+    expect(c).not.toEqual(a);
+    const cp1 = a['CP-1'] ?? [];
+    const cp2 = a['CP-2'] ?? [];
+    expect(cp1).toHaveLength(2);
+    expect(cp1[0]).not.toBe(cp2[0]);
+    // The two draws of one statement differ: the second wait is not a copy of the first.
+    expect((cp1[1] ?? 0) - (cp1[0] ?? 0)).not.toBe(cp1[0]);
+    for (const t of Object.values(a).flat()) expect(t).toBeGreaterThan(0);
+  });
+
+  test('uniform and exp stay in range; a distribution let is sampled where it is used', async () => {
+    const src = `${header}let d = uniform(1min, 2min)\n\nstation "CP-{i}" for i in 1..5 {\n  version 1.6\n  wait d\n  log "a"\n  wait exp(1s)\n  log "b"\n}\n`;
+    const { result, events } = await runVirtual(src);
+    expect(result.ok).toBe(true);
+    const a = logsOf(events).filter((l) => l.message === 'a');
+    expect(a).toHaveLength(5);
+    for (const l of a) {
+      expect(l.at - T0).toBeGreaterThanOrEqual(60_000);
+      expect(l.at - T0).toBeLessThanOrEqual(120_000);
+    }
+    expect(new Set(a.map((l) => l.at)).size).toBeGreaterThan(1);
+  });
+
+  test('clock set, freeze and resume change the time the station reports', async () => {
+    const src = station(
+      'CP-1',
+      `  version 1.6
+  clock set "2026-03-29T01:59:50Z"
+  boot
+  clock freeze
+  wait 10s
+  status evse 1 Faulted
+  clock resume
+  wait 5s
+  status evse 1 Available`,
+    );
+    const { result } = await runVirtual(src);
+    expect(result.ok).toBe(true);
+    const stamps = csms
+      .callsFrom('CP-1', 'StatusNotification')
+      .map((c) => (c.payload as v16.StatusNotificationRequest).timestamp);
+    expect(stamps).toEqual(['2026-03-29T01:59:50.000Z', '2026-03-29T01:59:50.000Z', '2026-03-29T01:59:55.000Z']);
+  });
+
+  test('negative clock drift slows the station clock', async () => {
+    const src = station(
+      'CP-1',
+      '  version 1.6\n  clock drift -500000 ppm\n  boot\n  wait 10s\n  status evse 1 Faulted',
+    );
+    const { result } = await runVirtual(src);
+    expect(result.ok).toBe(true);
+    const stamps = csms
+      .callsFrom('CP-1', 'StatusNotification')
+      .map((c) => (c.payload as v16.StatusNotificationRequest).timestamp);
+    expect(stamps).toEqual(['2026-01-01T00:00:00.000Z', '2026-01-01T00:00:05.000Z']);
+  });
+
+  test('net delay holds every frame in both directions, and only for the given window', async () => {
+    const src = station(
+      'CP-1',
+      `  version 1.6
+  net delay 2s for 10s
+  boot
+  log "booted"
+  wait 20s
+  heartbeat
+  log "hb"`,
+    );
+    const { result, events } = await runVirtual(src);
+    expect(result.ok).toBe(true);
+    const [booted, hb] = logsOf(events);
+    // `boot` is two round trips (BootNotification, then StatusNotification), each 2 s out and 2 s back.
+    expect((booted?.at ?? 0) - T0).toBe(8000);
+    expect((hb?.at ?? 0) - (booted?.at ?? 0)).toBe(20_000);
   });
 });
