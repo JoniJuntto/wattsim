@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ui-dev",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--filter", "@wattsim/ui", "dev"],
+      "port": 5173
+    },
+    {
+      "name": "wattsim-ui",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["packages/cli/src/index.ts", "ui", "--no-open"],
+      "port": 7700
+    }
+  ]
+}

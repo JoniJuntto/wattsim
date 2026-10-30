@@ -131,6 +131,15 @@ describe('station lifecycle (1.6)', () => {
     expect(unknown.status).toBe(400);
   });
 
+  test('a CALLERROR answered within the wait is a 409 and one stream error, not two', async () => {
+    const before = stream.of('error').length;
+    const res = await act('CP-1', { type: 'send', action: 'DataTransfer', payload: { vendorId: 'x' } });
+    expect(res.status).toBe(409);
+    expect(String(res.json.error)).toContain('CALLERROR');
+    await Bun.sleep(100);
+    expect(stream.of('error').slice(before)).toHaveLength(1);
+  });
+
   test('status, heartbeat, disconnect, connect', async () => {
     expect((await act('CP-1', { type: 'status', evse: 1, status: 'Faulted' })).status).toBe(200);
     await until(() => latest('CP-1')?.evses[0]?.status === 'Faulted', 1000, 'Faulted');

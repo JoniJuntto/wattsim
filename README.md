@@ -4,7 +4,7 @@ A spec-strict, scriptable OCPP 1.6/2.0.1/2.1 simulator for every side of the wir
 
 ## Status
 
-A Bun/TypeScript library and CLI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL. The CSMS side, the UI, MCP server, vendor quirk profiles and record/replay are roadmap items, in that order. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
+A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. The CSMS side, MCP server, vendor quirk profiles and record/replay are roadmap items, in that order. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
 
 ## Quick start
 
@@ -17,7 +17,7 @@ bun packages/cli/src/index.ts check examples/basic.ws
 bun packages/cli/src/index.ts run examples/basic.ws --csms ws://localhost:9000/ocpp --virtual
 ```
 
-`check` parses a scenario and exits 0, or prints `file:line:col: message` and exits 1. `run` connects the stations to the CSMS, executes the scenario, prints one line per frame and a summary table, and exits 0 only if every assertion passed. The `run` command is being implemented; its flags are:
+`check` parses a scenario and exits 0, or prints `file:line:col: message` and exits 1. `run` connects the stations to the CSMS, executes the scenario, prints one line per frame and a summary table, and exits 0 only if every assertion passed. `run` flags:
 
 | Flag | Meaning |
 |---|---|
@@ -30,6 +30,15 @@ bun packages/cli/src/index.ts run examples/basic.ws --csms ws://localhost:9000/o
 | `--quiet` | Summary only, no per-frame lines |
 
 `wattsim fmt <file>` prints the canonical formatting and exits 1 when the file is not already canonical. `wattsim fmt --write <files...>` rewrites files in place; `wattsim fmt --check <files...>` lists the files that are not canonical and exits 1 if there are any, which makes it the CI check.
+
+## The UI
+
+```sh
+bun run build                                   # also builds the browser app into packages/ui/dist
+bun packages/cli/src/index.ts ui                # serves it on http://127.0.0.1:7700 and opens the browser
+```
+
+One local process, no login. Add charge points (one, or a numbered range like `CP-{i}`) pointed at your CSMS, or switch on the built-in test CSMS to try it with nothing else running. Per station you get EVSE cards to plug in an EV and start or stop charging with live power, energy and state of charge; a live message log with every CALL paired to its reply and schema violations highlighted; a panel to send any OCPP message with live schema validation; and fault injection rules. **Export session** downloads everything you clicked as a `.ws` scenario that `wattsim run` replays. Flags: `--port`, `--host` (default `127.0.0.1`), `--no-open`.
 
 ## A scenario
 
@@ -96,7 +105,9 @@ Packages, all Bun workspaces under `packages/`:
 - `protocol`: OCPP-J framing (including the 2.1 CALLRESULTERROR and SEND message types), vendored OCA schemas for 1.6, 2.0.1 and 2.1, and the Zod validators generated from them
 - `core`: clock, EV and meter models, WebSocket connection with chaos middleware, station state machine and version adapters
 - `scenario`: the DSL (lexer, parser, AST, formatter, interpreter) and JUnit reporting
-- `cli`: the `wattsim` command (`run`, `check`, `fmt`)
+- `server`: the local UI server: HTTP API and browser stream over the core, the built-in test CSMS, session export
+- `ui`: the browser app (React, Vite, Tailwind, shadcn); `bun run --filter @wattsim/ui dev` runs it against a server on port 7700
+- `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`)
 
 Style is Biome with two-space indent and single quotes; lefthook runs lint and typecheck on commit. Tests are `bun test` and never touch the network except through the in-repo fake CSMS.
 

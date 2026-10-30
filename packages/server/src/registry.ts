@@ -30,6 +30,9 @@ export interface Sink {
   error(stationId: string, message: string): void;
 }
 
+/** Errors already forwarded from a station's `error` event, so a late action failure is not streamed twice. */
+const streamedErrors = new WeakSet<Error>();
+
 type Entry = {
   id: string;
   version: OcppVersion;
@@ -153,7 +156,10 @@ export class Registry {
       }),
       station.on('frame', (dir, frame, raw) => this.onFrame(e, dir, frame, raw)),
       station.on('violation', (v) => this.sink.violation(id, v)),
-      station.on('error', (err) => this.sink.error(id, err.message)),
+      station.on('error', (err) => {
+        streamedErrors.add(err);
+        this.sink.error(id, err.message);
+      }),
       station.on('chaos', (rule) => {
         // A `once` rule leaves the engine when it fires; keep the view in step.
         if (rule.once && rule.id && e.chaosViews.delete(rule.id)) changed();
@@ -222,11 +228,18 @@ export class Registry {
     const at = Date.now();
     const { run, line } = this.plan(e, body);
     const p = run();
-    // Whatever happens after we stop waiting is reported through the station's `error` event or here.
-    p.catch((err: unknown) => this.reportLate(e, err));
+    let late = false;
+    // A failure inside the wait is the 409 below. One after we stopped waiting is reported through the station's
+    // `error` event (failed OCPP requests) or, when the station did not report it, here.
+    p.catch((err: unknown) => {
+      if (late) this.reportLate(e, err);
+    });
     let timer: Timer | undefined;
     const timeout = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), ACTION_WAIT_MS);
+      timer = setTimeout(() => {
+        late = true;
+        resolve('timeout');
+      }, ACTION_WAIT_MS);
     });
     try {
       const r = await Promise.race([p.then((result) => ({ result })), timeout]);
@@ -402,6 +415,7 @@ export class Registry {
 
   private reportLate(e: Entry, err: unknown): void {
     if (this.entries.get(e.id) !== e) return;
+    if (err instanceof Error && streamedErrors.has(err)) return;
     this.sink.error(e.id, err instanceof Error ? err.message : String(err));
   }
 

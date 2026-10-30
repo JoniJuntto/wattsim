@@ -3,7 +3,15 @@
   "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**/*.ts", "!**/*.d.ts", "**/*.json", "!**/generated", "!**/schemas/**/*.json"]
+    "includes": [
+      "**/*.ts",
+      "**/*.tsx",
+      "!**/*.d.ts",
+      "!packages/ui/src/components/ui",
+      "**/*.json",
+      "!**/generated",
+      "!**/schemas/**/*.json"
+    ]
   },
   "formatter": { "enabled": true, "indentStyle": "space", "lineWidth": 120, "indentWidth": 2 },
   "linter": {
