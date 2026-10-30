@@ -9,6 +9,7 @@ import type { Clock } from '../clock';
 import type { MeterSample } from '../meter';
 import type { SecurityEventKind, SecurityProfile, StationSecurity } from '../security';
 import type { ConnectorStatus, EvseState, ResolvedStationConfig, StartOptions } from '../station';
+import type { Tariff, TariffSetStatus, TariffStore } from '../tariff';
 
 export type BootReason = v201.BootNotificationRequest['reason'];
 
@@ -18,7 +19,9 @@ export type TxUpdateTrigger =
   | 'Trigger'
   | 'ChargingStateChanged'
   | 'ChargingRateChanged'
-  | 'CablePluggedIn';
+  | 'CablePluggedIn'
+  /** 2.1: ChangeTransactionTariff took effect. */
+  | 'TariffChanged';
 
 /** `ReadingContext` shared by both versions. */
 export type SampleContext =
@@ -114,6 +117,15 @@ export interface StationContext {
    * profile when that first attempt fails. Resolves true when the new profile is in use.
    */
   switchSecurityProfile(next: { profile: SecurityProfile; url?: string }): Promise<boolean>;
+  /** IANA time zone (2.x `ClockCtrlr.TimeZone`); setting an unknown one throws. */
+  timeZone: string;
+  /** 2.1 default tariffs; created on first use. */
+  readonly tariffs: TariffStore;
+  /** 2.1 ChangeTransactionTariff on a running transaction (sends TransactionEvent `TariffChanged` when Accepted). */
+  changeTransactionTariff(
+    transactionId: string,
+    tariff: Tariff,
+  ): { status: TariffSetStatus | 'TxNotFound' | 'NoCurrencyChange'; reason?: string };
 }
 
 export interface VersionAdapter {

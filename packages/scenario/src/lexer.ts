@@ -64,6 +64,10 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   'use',
   'quirk',
   'import',
+  'bootLoop',
+  'fault',
+  'meter',
+  'reset',
 ]);
 
 const PUNCT2 = ['..'];
@@ -144,6 +148,16 @@ export function lex(src: string, file?: string, comments?: Comment[]): Token[] {
         while (j < n && isDigit(src[j] as string)) j++;
       }
       push(type, src.slice(i, j), startLine, startCol);
+      col += j - i;
+      i = j;
+      continue;
+    }
+
+    // `°C` (and `°F`) is a unit word: `ev plug evse 1 { ambient 25°C }`.
+    if (ch === '°' && isIdentStart(src[i + 1] ?? '')) {
+      let j = i + 1;
+      while (j < n && isIdentPart(src[j] as string)) j++;
+      push('ident', src.slice(i, j), startLine, startCol);
       col += j - i;
       i = j;
       continue;

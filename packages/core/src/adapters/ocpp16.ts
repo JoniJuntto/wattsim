@@ -38,7 +38,10 @@ function stopReason16(reason: string): StopReason16 {
   return (STOP_REASONS as readonly string[]).includes(reason) ? (reason as StopReason16) : 'Other';
 }
 
-/** One 1.6 `MeterValue` from a sample: energy, power, voltage, current and (when known) SoC. */
+/**
+ * One 1.6 `MeterValue` from a sample: energy, power, voltage, current and (when known) SoC. An OCMF-signed sample
+ * adds the record as a second energy register value with `format: SignedData`.
+ */
 export function meterValue16(sample: MeterSample, context: SampleContext): MeterValue16 {
   const sampledValue: SampledValue16[] = [
     { value: String(Math.round(sample.energyWh)), context, measurand: 'Energy.Active.Import.Register', unit: 'Wh' },
@@ -48,6 +51,15 @@ export function meterValue16(sample: MeterSample, context: SampleContext): Meter
   ];
   if (sample.soc !== undefined) {
     sampledValue.push({ value: (sample.soc * 100).toFixed(1), context, measurand: 'SoC', unit: 'Percent' });
+  }
+  if (sample.signed) {
+    sampledValue.push({
+      value: sample.signed.ocmf,
+      context,
+      format: 'SignedData',
+      measurand: 'Energy.Active.Import.Register',
+      unit: 'Wh',
+    });
   }
   return { timestamp: sample.timestamp, sampledValue };
 }

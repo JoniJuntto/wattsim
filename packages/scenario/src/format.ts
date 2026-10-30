@@ -1,7 +1,10 @@
 import type {
+  ChaosFaultSpec,
+  ChaosFilters,
   Comments,
   DurationUnit,
   DurExpr,
+  EnergyExpr,
   Expr,
   JsonValue,
   NumExpr,
@@ -89,6 +92,47 @@ function formatExpr(e: Expr): string {
     default:
       return formatDurExpr(e);
   }
+}
+
+/** `1500Wh`, `2kWh`, or the variable name. */
+function formatEnergy(e: EnergyExpr): string {
+  if (e.kind === 'ref') return e.name;
+  return `${num(e.unit === 'kWh' ? e.wh / 1000 : e.wh)}${e.unit}`;
+}
+
+/** The arguments of a milestone-4 chaos fault, after its name. */
+function formatFaultArgs(f: ChaosFaultSpec): string[] {
+  switch (f.kind) {
+    case 'jitter':
+      return [`${formatDurExpr(f.min)}..${formatDurExpr(f.max)}`];
+    case 'reorder':
+      return f.after ? ['after', numExpr(f.after)] : [];
+    case 'halfOpen':
+      return f.for ? ['for', formatDurExpr(f.for)] : [];
+    case 'slowRead':
+      return [formatDurExpr(f.step)];
+    case 'reconnectStorm':
+      return [numExpr(f.count), 'within', formatDurExpr(f.within)];
+    case 'invalidEnum':
+    case 'missingField':
+      return f.path ? [f.path] : [];
+    case 'timestamp':
+      return [formatDurExpr(f.shift)];
+    case 'oversized':
+      return [f.kb.kind === 'ref' ? f.kb.name : `${num(f.kb.value)}kB`];
+  }
+}
+
+/** Direction, action and trigger tail of a chaos rule, in canonical order. */
+function formatChaosFilters(s: ChaosFilters): string[] {
+  const parts: string[] = [];
+  if (s.direction) parts.push(s.direction);
+  if (s.action) parts.push(s.action);
+  if (s.trigger) parts.push(s.trigger.kind, numExpr(s.trigger.n));
+  if (s.trigger?.kind === 'every' && s.trigger.from) parts.push('from', numExpr(s.trigger.from));
+  if (s.probability) parts.push('probability', `${numExpr(s.probability)}%`);
+  if (s.once) parts.push('once');
+  return parts;
 }
 
 function formatProp(v: PropValue): string {
@@ -187,7 +231,7 @@ function formatStmtLines(s: Stmt, depth: number, pad: string): string[] {
       return [`${pad}choose {`, ...branches, ...endLines(s.endComments, inner), `${pad}}`];
     }
     case 'net':
-      if (s.op === 'drop') return line(`net drop ${formatDurExpr(s.duration)}`);
+      if (s.op === 'drop') return line(`net drop ${formatDurExpr(s.duration)}${s.duplicate ? ' duplicate' : ''}`);
       return line(`net delay ${formatDurExpr(s.delay)}${s.for ? ` for ${formatDurExpr(s.for)}` : ''}`);
     case 'on': {
       const head = ['on', s.action];
@@ -203,14 +247,20 @@ function formatStmtLines(s: Stmt, depth: number, pad: string): string[] {
     case 'chaos': {
       const parts = ['chaos', s.fault];
       if (s.delay) parts.push(formatDurExpr(s.delay));
-      if (s.direction) parts.push(s.direction);
-      if (s.action) parts.push(s.action);
-      if (s.trigger) parts.push(s.trigger.kind, numExpr(s.trigger.n));
-      if (s.trigger?.kind === 'every' && s.trigger.from) parts.push('from', numExpr(s.trigger.from));
-      if (s.probability) parts.push('probability', `${numExpr(s.probability)}%`);
-      if (s.once) parts.push('once');
-      return line(parts.join(' '));
+      return line([...parts, ...formatChaosFilters(s)].join(' '));
     }
+    case 'chaosFault':
+      return line(['chaos', s.fault.kind, ...formatFaultArgs(s.fault), ...formatChaosFilters(s)].join(' '));
+    case 'bootLoop':
+      return line(`bootLoop ${numExpr(s.count)}`);
+    case 'fault':
+      return line(`fault evse ${numExpr(s.evse)}${s.code ? ` ${s.code}` : ''}`);
+    case 'meter': {
+      const evse = s.evse ? ` evse ${numExpr(s.evse)}` : '';
+      return line(s.op === 'reset' ? `meter reset${evse}` : `meter backwards ${formatEnergy(s.energy)}${evse}`);
+    }
+    case 'reset':
+      return line(`reset ${s.mode}`);
     case 'clock':
       switch (s.mode) {
         case 'speed':

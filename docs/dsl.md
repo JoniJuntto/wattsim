@@ -244,7 +244,33 @@ ev unplug evse 1
 | `resume` | EV asks for energy again. |
 | `unplug` | Cable removed (state A). |
 
-Properties are `name value` pairs separated by spaces or commas. Known properties: `battery` (kWh), `soc` (initial state of charge), `target` (SoC at which the EV stops), `phases` (1 or 3), `maxCurrent` (per phase, A), `name` (string). A value may be a variable (`battery cap`). Unit suffixes are kept verbatim and are optional (`soc 0.2` and `soc 20%` both parse; the interpreter normalises). Attached to the number (`60kWh`) any word is a unit; after a space only `kWh`, `Wh`, `kW`, `W`, `A`, `V` and `%` are, so in `battery 60 soc 20%` the word `soc` is the next property. Unknown property names are not a parse error.
+Properties are `name value` pairs separated by spaces or commas. Every field of the core `EvConfig` is a property, under its own name and under its name without the unit suffix (`cableMaxA` or `cableMax`), and `name` labels the EV without setting anything:
+
+| Property | Unit | Meaning |
+|---|---|---|
+| `battery` / `batteryKwh` | kWh (`Wh` converts) | Battery capacity. |
+| `soc` / `initialSoc` | `%` or fraction | State of charge at plug-in. |
+| `target` / `targetSoc` | `%` or fraction | SoC at which the EV stops charging. |
+| `phases` | 1 or 3 | Phases the EV charges on. |
+| `maxCurrent` / `maxCurrentA` | A | Current limit per phase. |
+| `cableMax` / `cableMaxA` | A | Cable rating; caps the current like the EVSE does. |
+| `minCurrent` / `minCurrentA` | A | Lowest current the EV charges with. |
+| `suspendAt` | `%` or fraction | SoC at which the EV pauses itself (SuspendedEV). |
+| `resumeAfter` / `resumeAfterMs` | duration | The EV asks for energy again this long after a suspension. |
+| `ambient` / `ambientC` | °C | Ambient temperature. |
+| `batteryTemp` / `batteryTempC` | °C | Battery temperature at plug-in. |
+| `heatPerHour` / `heatPerHourC` | °C | Battery heating per hour at a 1C rate. |
+| `coolingPerHour` | number | Share of the difference to ambient lost per hour. |
+| `v2x` | `true` / `false` | Bidirectional (follows negative 2.1 setpoints). |
+| `maxDischargeCurrent` / `maxDischargeCurrentA` | A | Discharge current limit per phase. |
+| `minDischargeSoc` | `%` or fraction | SoC below which a V2X EV stops discharging. |
+| `iso15118` | `true` / `false` | Speaks ISO 15118 (2.x: NotifyEVChargingNeeds). |
+| `departure` / `departureMs` | duration | ISO 15118 departure time after plug-in. |
+| `energyRequest` / `energyRequestKwh` | kWh | ISO 15118 energy request. |
+| `emaid` | string | Plug & Charge contract id. |
+| `name` | string | A label; sets nothing. |
+
+A value may be a variable (`battery cap`); `true` and `false` are booleans unless a variable has that name. Numbers may carry a sign (`ambient -5°C`). Values are converted to the field's unit: `40000Wh` is 40 kWh, `30min` is 1800000 ms, `20%` is 0.2, and a bare SoC above 1 is a percentage (`soc 20`). Attached to the number (`60kWh`, `30min`, `25°C`) any word is a unit; after a space only `kWh`, `Wh`, `kW`, `W`, `A`, `V`, `°C` and `%` are, so in `battery 60 soc 20%` the word `soc` is the next property. A duration property needs a duration unit. A property that names no field, or a unit that does not fit it, fails the station when `ev plug` runs, with the valid names: `5:20: unknown ev property 'batery' (known: ambient, ambientC, battery, ...)` or `5:20: ev property 'cableMax' takes A, got 16V`.
 
 ### Transactions
 
@@ -354,21 +380,24 @@ Arguments are durations or variables. A sample is rounded to whole milliseconds 
 
 ```
 net drop 10s
+net drop 2min duplicate
 net delay 200ms
 net delay 2s for 1min
 ```
 
 `net drop DUR` hard-closes the WebSocket and reconnects after the duration. Messages generated meanwhile (MeterValues, StopTransaction) are queued and flushed in order on reconnect, following the offline behaviour of the spec version in use. The statement takes `DUR` to complete.
 
+`net drop DUR duplicate` is a faulty offline queue: on reconnect, every CALL pending at that moment (queued while offline, or in flight when the socket closed) is sent twice in a row with the same message id. CALLs after the backlog are sent once. A CSMS sees the second copy as a reused message id on the same connection.
+
 `net delay DUR [for WINDOW]` adds `DUR` of latency to every frame in both directions, so a request and its answer take `2 x DUR` longer. It returns at once. Without `for` the delay lasts until the station finishes; with `for WINDOW` it is lifted after `WINDOW`, and the station counts as finished only after that, as with an `at` block. Under the hood it is a `chaos delay` rule for every frame. A delay composes with the other chaos faults (see [`chaos`](#chaos)), so `chaos` rules declared before or after `net delay` keep firing: a frame they match is held for the delay first, then dropped, duplicated and so on.
 
 ### `chaos`
 
 ```
-chaos FAULT [<dur>] [in|out] [ACTION] [nth N | every N [from M]] [probability P%] [once]
+chaos FAULT [ARGS] [in|out] [ACTION] [nth N | every N [from M]] [probability P%] [once]
 ```
 
-Adds a fault-injection rule to this station's pipeline. Rules are evaluated in declaration order on every frame; the first match wins, with one exception: `delay` composes with the other faults. A frame gets at most one delay (from the first `delay` rule it matches) and at most one other fault (from the first other rule it matches), whichever order they were declared in. With both, the frame is held for the delay and then gets the other fault. Once a rule of a kind has matched, later rules of that kind are not evaluated for the frame, so they neither count a `once` nor draw a `probability`. The statement usually sits before `boot` so BootNotification is covered too.
+Adds a fault-injection rule to this station's pipeline. Rules are evaluated in declaration order on every frame; the first match wins, with one exception: delays compose with the other faults. `delay`, `jitter` and `slowRead` are delays. A frame gets at most one delay (from the first delay rule it matches) and at most one other fault (from the first other rule it matches), whichever order they were declared in. With both, the frame is held for the delay and then gets the other fault. Once a rule of a kind has matched, later rules of that kind are not evaluated for the frame, so they neither count a `once` nor draw a `probability`. The statement usually sits before `boot` so BootNotification is covered too.
 
 Faults:
 
@@ -376,11 +405,26 @@ Faults:
 |---|---|---|
 | `drop` | transport | Discard the frame. |
 | `delay <dur>` | transport | Hold the frame for `dur` before passing it on. The duration is mandatory and comes right after `delay`. |
+| `jitter <min>..<max>` | transport | Hold each frame for a delay drawn between `min` and `max` (whole ms) from the run's seeded RNG. |
 | `duplicate` | transport | Deliver the frame twice. |
 | `corrupt` | transport | Turn the raw text into invalid JSON. |
+| `reorder [after N]` | transport | Hold the frame until N (default 1) later frames in the same direction have passed it. |
+| `halfOpen [for <dur>]` | transport | From this frame on (included) nothing is written to or read from the socket, which stays open: the CSMS sees silence. With `for`, the station gives up after `dur`, drops the socket and reconnects as usual. |
+| `slowRead <step>` | transport | Inbound only: the n-th frame this rule matches is held n x `step`. |
+| `reconnectStorm K within <dur>` | transport | Drop the socket K times in `dur`, every `dur`/K starting one interval after the frame, reconnecting at once each time. A storm in progress ignores further matches. |
 | `wrongId` | protocol | Answer with a CALLRESULT whose message id matches nothing. |
 | `callError` | protocol | Answer with a CALLERROR instead of a CALLRESULT. |
 | `noResponse` | protocol | Swallow the CALL so no response is ever sent. |
+| `invalidEnum [path]` | protocol | Outbound only: replace an enum value with `wattsim-invalid-enum`, the one at `path` or else the first enum field of the payload. |
+| `missingField [path]` | protocol | Outbound only: delete the field at `path`, or else the first required field of the payload. |
+| `timestamp <±dur>` | protocol | Outbound only: shift every date-time field of the payload by the signed duration. |
+| `oversized <N>kB` | protocol | Outbound only: add a `wattsimPadding` string field so the payload's JSON is N kB (1 kB = 1024 bytes). |
+
+The protocol mutations are deliberate schema breaks: they apply after the station's strict validation, so the mutated frame goes out and is reported as chaos, never as a violation of wattsim. They read the OCPP schema of the frame's action (the response schema for a CALLRESULT) and leave a payload with nothing to break unchanged (`missingField` on an empty Heartbeat). A CALLERROR has no payload and passes untouched. Without `in`/`out` they apply to outbound frames only, and `in` is an error; `slowRead` likewise only reads, and `out` is an error.
+
+A `path` is dot-joined payload keys with array positions as numbers, written without spaces: `idTag`, `idTagInfo.status`, `meterValue.0.sampledValue.0.value`. It starts with a lower-case letter, which is how the parser tells it from an action: `chaos missingField idTag out Authorize` names the field, `chaos missingField Authorize` drops the first required field of every Authorize. The arguments of `jitter`, `reorder`, `halfOpen`, `slowRead`, `reconnectStorm`, `timestamp` and `oversized` may be variables (`chaos jitter lo..hi`, `chaos oversized size`); like `chaos delay`, they are resolved once, when the rule is added.
+
+Frames that `delay`, `jitter`, `slowRead` or `reorder` hold, and a `halfOpen` in force, belong to the socket: when it closes they are gone, as on a real connection, and the station resends what it still waits for. `disconnect`, `net drop` and the end of the run therefore leave no chaos timers behind; `disconnect` and the end of the run also end a `reconnectStorm`.
 
 Filters, each optional, in this order:
 
@@ -414,9 +458,31 @@ chaos callError in StartTransaction
 chaos noResponse out BootNotification nth 1 once
 chaos drop out MeterValues every 2 from 5
 chaos duplicate in every 3 probability 50% once
+chaos jitter 50ms..2s
+chaos reorder after 2 out every 5
+chaos halfOpen for 2min out Heartbeat nth 3 once
+chaos slowRead 100ms in
+chaos reconnectStorm 5 within 1min out BootNotification once
+chaos invalidEnum out StatusNotification nth 1
+chaos missingField idTag out Authorize
+chaos timestamp -10min out MeterValues
+chaos oversized 64kB out DataTransfer once
 ```
 
-The behavioural layer of fault injection (boot loops, ignoring remote commands, spontaneous Faulted, meter resets) is written with ordinary statements: `repeat`, `status evse 1 Faulted`, `net drop`, `disconnect` and `connect`.
+### Faults
+
+Behavioural faults, which a station does to itself. They act, so a quirk cannot hold them.
+
+| Statement | Meaning | Example |
+|---|---|---|
+| `bootLoop N` | Boot, and as soon as the boot sequence finishes (BootNotification Accepted, then the StatusNotifications), drop the socket, reconnect and boot again: N times, then boot once more and stay up. A Pending or Rejected boot is retried as usual and the loop waits for it to be Accepted. 2.x boots after the first give reason `Watchdog`. | `bootLoop 3` |
+| `fault evse N [CODE]` | A spontaneous fault: the connector goes `Faulted` and sends StatusNotification. 1.6: `CODE` is the `errorCode`, a ChargePointErrorCode value (default `OtherError`); another word fails the station. 2.x: a NotifyEvent follows, reporting the connector's `AvailabilityState` as `Faulted` with `CODE` as `techCode` (at most 50 characters, default `OtherError`). A running transaction is left alone; `status evse N Available` clears the fault. | `fault evse 1 GroundFailure` |
+| `meter backwards <energy> [evse N]` | Turn the energy register back (not below 0) by `500Wh`, `1.5kWh`, or a variable holding Wh. The next meter sample shows the jump. Without `evse`, every EVSE. | `meter backwards 2kWh evse 1` |
+| `meter reset [evse N]` | Reset the energy registers to zero, as a replaced meter would read. Without `evse`, every EVSE. | `meter reset` |
+| `reset hard` | Power loss: the socket drops at once, the station reconnects and boots (2.x reason `PowerUp`), and only then ends the transactions it lost, with reason `PowerLoss`; their StopTransaction / TransactionEvent Ended queue behind the BootNotification. | `reset hard` |
+| `reset soft` | Software restart: running transactions end first with reason `Reboot`, then the station drops the socket, reconnects and boots (2.x reason `ApplicationReset`). | `reset soft` |
+
+The rest of the behavioural layer uses ordinary statements: `on Reset always { error NotSupported }` ignores remote commands, and `net drop ... duplicate` replays the offline queue with duplicates (see [Network](#network)).
 
 ### Clock
 

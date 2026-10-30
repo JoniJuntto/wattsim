@@ -2,6 +2,11 @@
  * One OCPP-J WebSocket connection: request/response matching, an in-order outbound queue that survives
  * disconnects, one CALL in flight at a time, reconnect with exponential backoff, strict schema validation and
  * chaos middleware. Every timer runs on the injected `Clock`; only the socket itself is real I/O.
+ *
+ * Chaos state that belongs to a socket (frames held by a delay, `jitter`, `slowRead` or `reorder`, and `halfOpen`)
+ * is discarded when that socket closes, as a real connection loses what was in flight. A `reconnectStorm` ends with
+ * `disconnect()`. Protocol faults (`invalidEnum`, `missingField`, `timestamp`, `oversized`) mutate the payload after
+ * strict-mode validation, so the frame goes out as mutated and is reported as `chaos`, never as a `violation`.
  */
 import type { CallErrorFrame, CallFrame, Frame, OcppVersion, SendFrame, Violation } from '@wattsim/protocol';
 import {
@@ -15,9 +20,10 @@ import {
   validatePayload,
   violationErrorCode,
 } from '@wattsim/protocol';
-import type { ChaosDirection, ChaosEffect, ChaosEngine, ChaosRule } from './chaos';
+import type { ChaosDirection, ChaosEffect, ChaosEngine, ChaosFaultEffect, ChaosRule } from './chaos';
 import type { Clock, Timer } from './clock';
 import { TypedEmitter } from './events';
+import { mutatePayload } from './faults';
 
 export type ConnectionState = 'Disconnected' | 'Connecting' | 'Connected';
 
@@ -192,7 +198,12 @@ type Pending = {
 
 type Waiter = { resolve: () => void; reject: (err: Error) => void };
 
+/** A frame `reorder` holds until `remaining` more frames have passed in its direction. */
+type Held = { remaining: number; release: () => void };
+
 const WS_OPEN = 1;
+/** Close code for sockets chaos drops (`halfOpen` giving up, `reconnectStorm`): the station goes away. */
+const CHAOS_CLOSE = 1001;
 
 export class Connection extends TypedEmitter<ConnectionEvents> {
   private url: string;
@@ -221,6 +232,16 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   private singleAttempt = false;
   /** The last socket error since the last successful open, for the rejection message. */
   private lastError: Error | undefined;
+  /** Timers releasing frames chaos holds (delay, jitter, slowRead); cancelled when the socket closes. Lazy. */
+  private chaosTimers: Set<Timer> | undefined;
+  /** Frames held by `reorder`, per direction. Lazy: most connections never hold one. */
+  private held: Record<ChaosDirection, Held[]> | undefined;
+  /** `halfOpen` in force on the current socket: nothing is written or read. */
+  private halfOpen: { timer?: Timer } | undefined;
+  /** Drops still to come in a `reconnectStorm`. */
+  private stormTimers: Timer[] | undefined;
+  /** Closes after which to reconnect at once instead of backing off (sockets a storm dropped). */
+  private reconnectNow = 0;
 
   constructor(opts: ConnectionOptions) {
     super();
@@ -288,6 +309,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   disconnect(code = 1000): Promise<void> {
     this.wantConnected = false;
     this.cancelReconnectTimer();
+    this.stopStorm();
     this.rejectOpenWaiters(new Error('disconnect() called before the connection opened'));
     const ws = this.ws;
     if (!ws || ws.readyState > WS_OPEN) {
@@ -377,11 +399,15 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
 
   private onClosed(code?: number, reason?: string): void {
     this.setState('Disconnected');
+    this.discardSocketChaos();
     this.requeueInflight();
     const closeWaiters = this.closeWaiters;
     this.closeWaiters = [];
     for (const w of closeWaiters) w();
-    if (!this.wantConnected) return;
+    if (!this.wantConnected) {
+      this.stopStorm();
+      return;
+    }
     if (this.reconnect === false || this.singleAttempt) {
       this.wantConnected = false;
       this.singleAttempt = false;
@@ -391,6 +417,12 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       this.rejectOpenWaiters(
         new Error(`connection closed${detail} and ${why}${cause ? `: ${cause.message}` : ''}`, { cause }),
       );
+      this.stopStorm();
+      return;
+    }
+    if (this.reconnectNow > 0) {
+      this.reconnectNow--;
+      this.open();
       return;
     }
     const { initialMs, maxMs, factor } = this.reconnect;
@@ -454,15 +486,52 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   /** Apply outbound chaos, then transmit. `action` is the hint for frames that carry none. */
   private send(frame: Frame, action: string): void {
     const decision = this.chaos?.decide('out', frame, action);
-    if (!decision?.effect || !decision.rule) {
+    if (!decision?.rule || (!decision.effect && !decision.fault)) {
       this.transmit(frame, encodeFrame(frame));
       return;
     }
-    const { effect, delayed } = decision;
+    const { effect, fault, delayed } = decision;
     if (delayed) this.emit('chaos', delayed.rule, frame);
     this.emit('chaos', decision.rule, frame);
-    if (delayed) this.clock.setTimeout(() => this.applyOut(frame, effect), delayed.ms);
-    else this.applyOut(frame, effect);
+    const apply = fault ? () => this.faultOut(frame, action, fault) : () => this.applyOut(frame, effect as ChaosEffect);
+    if (delayed) this.later(apply, delayed.ms);
+    else apply();
+  }
+
+  /** Run `fn` after `ms` unless the socket closes first. */
+  private later(fn: () => void, ms: number): void {
+    this.chaosTimers ??= new Set();
+    const timers = this.chaosTimers;
+    const timer = this.clock.setTimeout(() => {
+      timers.delete(timer);
+      fn();
+    }, ms);
+    timers.add(timer);
+  }
+
+  /** Apply one outbound milestone-4 fault (a delay-class one never gets here: `decide` resolves it). */
+  private faultOut(frame: Frame, action: string, fault: ChaosFaultEffect): void {
+    switch (fault.kind) {
+      case 'reorder':
+        this.hold('out', fault.after, () => this.transmit(frame, encodeFrame(frame)));
+        return;
+      case 'halfOpen':
+        this.goHalfOpen(fault.ms);
+        return;
+      case 'reconnectStorm':
+        this.transmit(frame, encodeFrame(frame));
+        this.startStorm(fault.count, fault.windowMs);
+        return;
+      default: {
+        if (!('payload' in frame)) {
+          this.transmit(frame, encodeFrame(frame));
+          return;
+        }
+        const kind = frame.type === MessageType.CallResult ? 'response' : 'request';
+        const f = { ...frame, payload: mutatePayload(this.version, action, kind, frame.payload, fault) };
+        this.transmit(f, encodeFrame(f));
+      }
+    }
   }
 
   /** Apply one outbound chaos effect. */
@@ -472,7 +541,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       case 'noResponse':
         return;
       case 'delay':
-        this.clock.setTimeout(() => this.transmit(frame, encodeFrame(frame)), effect.ms);
+        this.later(() => this.transmit(frame, encodeFrame(frame)), effect.ms);
         return;
       case 'duplicate': {
         const raw = encodeFrame(frame);
@@ -502,14 +571,95 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
 
   private transmit(frame: Frame, raw: string): void {
     const ws = this.ws;
-    if (!ws || ws.readyState !== WS_OPEN) return;
+    if (!ws || ws.readyState !== WS_OPEN || this.halfOpen) return;
     ws.send(raw);
     this.emit('frame', 'out', frame, raw);
+    if (this.held && this.held.out.length > 0) this.passed('out');
+  }
+
+  // ---- socket-level chaos ----------------------------------------------------------------------------------
+
+  /** Hold a frame until `after` (default 1) later frames have passed in `dir`. */
+  private hold(dir: ChaosDirection, after: number | undefined, release: () => void): void {
+    this.held ??= { in: [], out: [] };
+    this.held[dir].push({ remaining: Math.max(1, after ?? 1), release });
+  }
+
+  /** A frame passed in `dir`: count it against the held frames and release those that are due, in hold order. */
+  private passed(dir: ChaosDirection): void {
+    const held = this.held;
+    if (!held) return;
+    const due: Held[] = [];
+    for (const h of held[dir]) if (--h.remaining <= 0) due.push(h);
+    if (due.length === 0) return;
+    held[dir] = held[dir].filter((h) => h.remaining > 0);
+    for (const h of due) h.release();
+  }
+
+  /** Stop reading and writing on the open socket; with `ms`, drop it after that long (the station gives up). */
+  private goHalfOpen(ms: number | undefined): void {
+    if (this.halfOpen || !this.ws) return;
+    const state: { timer?: Timer } = {};
+    this.halfOpen = state;
+    if (ms === undefined) return;
+    state.timer = this.clock.setTimeout(() => {
+      state.timer = undefined;
+      if (this.halfOpen === state) this.dropSocket('wattsim chaos: halfOpen');
+    }, ms);
+  }
+
+  /**
+   * Drop the socket `count` times, `windowMs / count` apart (the last after `windowMs`), reconnecting at once each
+   * time. The first drop waits one interval, so the frame that started the storm normally gets its answer first.
+   */
+  private startStorm(count: number, windowMs: number): void {
+    if (this.stormTimers || count < 1) return;
+    const timers: Timer[] = [];
+    this.stormTimers = timers;
+    let left = count;
+    const drop = () => {
+      left--;
+      if (left === 0) this.stormTimers = undefined;
+      if (this.ws) {
+        this.reconnectNow++;
+        this.dropSocket('wattsim chaos: reconnectStorm');
+      }
+    };
+    for (let i = 1; i <= count; i++) timers.push(this.clock.setTimeout(drop, (i * windowMs) / count));
+  }
+
+  private stopStorm(): void {
+    for (const t of this.stormTimers ?? []) t.cancel();
+    this.stormTimers = undefined;
+    this.reconnectNow = 0;
+  }
+
+  /** Close the current socket now (open or still connecting) and treat it as closed without waiting for the event. */
+  private dropSocket(reason: string): void {
+    const ws = this.ws;
+    if (!ws) return;
+    this.ws = undefined;
+    try {
+      ws.close(CHAOS_CLOSE, reason);
+    } catch {
+      // A socket that is still connecting may refuse a close code; it is detached either way.
+    }
+    this.onClosed(CHAOS_CLOSE, reason);
+  }
+
+  /** The socket closed: what chaos held on it is lost. */
+  private discardSocketChaos(): void {
+    if (this.chaosTimers) for (const t of this.chaosTimers) t.cancel();
+    this.chaosTimers = undefined;
+    this.held = undefined;
+    this.halfOpen?.timer?.cancel();
+    this.halfOpen = undefined;
   }
 
   // ---- inbound ---------------------------------------------------------------------------------------------
 
   private onRaw(raw: string): void {
+    if (this.halfOpen) return; // a half-open socket is not read
     let frame: Frame;
     try {
       frame = decodeFrame(raw, { version: this.version });
@@ -525,15 +675,34 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
           ? this.inflight.action
           : undefined;
     const decision = this.chaos?.decide('in', frame, hint);
-    if (!decision?.effect || !decision.rule) {
+    if (!decision?.rule || (!decision.effect && !decision.fault)) {
       this.dispatch(frame);
       return;
     }
-    const { effect, delayed } = decision;
+    const { effect, fault, delayed } = decision;
     if (delayed) this.emit('chaos', delayed.rule, frame);
     this.emit('chaos', decision.rule, frame);
-    if (delayed) this.clock.setTimeout(() => this.applyIn(frame, raw, effect), delayed.ms);
-    else this.applyIn(frame, raw, effect);
+    const apply = fault ? () => this.faultIn(frame, fault) : () => this.applyIn(frame, raw, effect as ChaosEffect);
+    if (delayed) this.later(apply, delayed.ms);
+    else apply();
+  }
+
+  /** Apply one inbound milestone-4 fault. Protocol mutations never get here: `decide` skips them inbound. */
+  private faultIn(frame: Frame, fault: ChaosFaultEffect): void {
+    switch (fault.kind) {
+      case 'reorder':
+        this.hold('in', fault.after, () => this.dispatch(frame));
+        return;
+      case 'halfOpen':
+        this.goHalfOpen(fault.ms);
+        return;
+      case 'reconnectStorm':
+        this.dispatch(frame);
+        this.startStorm(fault.count, fault.windowMs);
+        return;
+      default:
+        this.dispatch(frame);
+    }
   }
 
   /** Apply one inbound chaos effect. */
@@ -543,7 +712,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       case 'noResponse':
         return;
       case 'delay':
-        this.clock.setTimeout(() => this.dispatch(frame), effect.ms);
+        this.later(() => this.dispatch(frame), effect.ms);
         return;
       case 'duplicate':
         for (let i = 0; i <= (effect.count ?? 1); i++) this.dispatch(frame);
@@ -569,7 +738,13 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
     }
   }
 
+  /** Deliver an inbound frame, then count it as passed for frames `reorder` holds. */
   private dispatch(frame: Frame): void {
+    this.deliver(frame);
+    if (this.held && this.held.in.length > 0) this.passed('in');
+  }
+
+  private deliver(frame: Frame): void {
     if (frame.type === MessageType.Call) {
       this.handleCall(frame);
       return;

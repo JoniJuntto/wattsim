@@ -58,13 +58,37 @@ export type JsonValue =
 
 export type JsonEntry = { key: string; value: JsonValue; loc: Loc };
 
-/** `ev plug evse 1 { battery 60kWh soc 20% }` property. Numbers keep their unit suffix verbatim (`kWh`, `%`, `A`). */
+/** `ev plug evse 1 { battery 60kWh soc 20% }` property. Numbers keep their unit suffix verbatim (`kWh`, `%`, `A`, `°C`). */
 export type PropValue = { kind: 'number'; value: number; unit?: string; loc: Loc } | StringExpr | RefExpr;
 export type Prop = { name: string; value: PropValue; loc: Loc };
 
 export type EvAction = 'plug' | 'unplug' | 'ready' | 'suspend' | 'resume';
 
 export type ChaosFault = 'drop' | 'delay' | 'duplicate' | 'corrupt' | 'wrongId' | 'callError' | 'noResponse';
+/**
+ * The chaos faults added in milestone 4, with their arguments. They parse to `ChaosFaultStmt` rather than
+ * `ChaosStmt`, so code written against `ChaosStmt` (whose `fault` maps 1:1 onto core's `ChaosEffect`) still holds.
+ */
+export type ChaosFaultSpec =
+  /** `jitter MIN..MAX`: a delay drawn per frame from the run's seeded RNG. */
+  | { kind: 'jitter'; min: DurExpr; max: DurExpr }
+  /** `reorder [after N]`: hold the frame until N (default 1) later frames have passed it. */
+  | { kind: 'reorder'; after?: NumExpr }
+  /** `halfOpen [for DUR]`: stop reading and writing without closing; with `for`, drop the socket after DUR. */
+  | { kind: 'halfOpen'; for?: DurExpr }
+  /** `slowRead STEP`: the n-th inbound frame matched waits n x STEP. */
+  | { kind: 'slowRead'; step: DurExpr }
+  /** `reconnectStorm K within DUR`: drop and reconnect K times in DUR. */
+  | { kind: 'reconnectStorm'; count: NumExpr; within: DurExpr }
+  /** `invalidEnum [path]`: replace an enum value. `path` is dot-joined, array positions as numbers. */
+  | { kind: 'invalidEnum'; path?: string }
+  /** `missingField [path]`: drop a required field. */
+  | { kind: 'missingField'; path?: string }
+  /** `timestamp ±DUR`: shift every date-time field. */
+  | { kind: 'timestamp'; shift: DurExpr }
+  /** `oversized N kB`: pad the payload to N kB (1 kB = 1024 bytes). */
+  | { kind: 'oversized'; kb: NumExpr };
+export type ChaosFaultKind = ChaosFaultSpec['kind'];
 export type ChaosDirection = 'in' | 'out';
 /** Which frames a chaos rule counts: `nth N`, or `every N [from M]` (the M-th frame, then every N-th after it). */
 export type ChaosTrigger = { kind: 'nth'; n: NumExpr } | { kind: 'every'; n: NumExpr; from?: NumExpr };
@@ -120,9 +144,12 @@ export type BarrierStmt = { kind: 'barrier'; name: string; loc: Loc };
 export type AtStmt = { kind: 'at'; offset: DurExpr; body: Stmt[]; loc: Loc; endComments?: string[] };
 export type RepeatStmt = { kind: 'repeat'; count: NumExpr; body: Stmt[]; loc: Loc; endComments?: string[] };
 export type ChooseStmt = { kind: 'choose'; branches: ChooseBranch[]; loc: Loc; endComments?: string[] };
-/** `net drop d` closes the socket for `d`; `net delay d [for w]` delays every frame by `d` (for `w`, else for good). */
+/**
+ * `net drop d` closes the socket for `d`; with `duplicate`, every CALL queued meanwhile is sent twice with the same
+ * message id on reconnect. `net delay d [for w]` delays every frame by `d` (for `w`, else for good).
+ */
 export type NetStmt =
-  | { kind: 'net'; op: 'drop'; duration: DurExpr; loc: Loc }
+  | { kind: 'net'; op: 'drop'; duration: DurExpr; duplicate?: boolean; loc: Loc }
   | { kind: 'net'; op: 'delay'; delay: DurExpr; for?: DurExpr; loc: Loc };
 /** `on A [pattern] [always] { reply ... | error ... }`: answer the next (every, with `always`) matching CSMS CALL. */
 export type OnStmt = {
@@ -147,6 +174,32 @@ export type ChaosStmt = {
   once: boolean;
   loc: Loc;
 };
+/** Filters and triggers shared by `chaos` rules of either kind. */
+export type ChaosFilters = {
+  direction?: ChaosDirection;
+  /** OCPP action name filter. */
+  action?: string;
+  trigger?: ChaosTrigger;
+  /** `probability P%`: drawn for each frame the other filters select. `percent` is P, not P/100. */
+  probability?: NumExpr;
+  once: boolean;
+};
+/** `chaos jitter|reorder|halfOpen|slowRead|reconnectStorm|invalidEnum|missingField|timestamp|oversized ...`. */
+export type ChaosFaultStmt = { kind: 'chaosFault'; fault: ChaosFaultSpec; loc: Loc } & ChaosFilters;
+/** `1500Wh`, `2kWh`: an energy, kept in the unit it was written in. */
+export type EnergyLit = { kind: 'energy'; wh: number; unit: 'Wh' | 'kWh'; loc: Loc };
+/** An energy literal or a variable holding a number of Wh. */
+export type EnergyExpr = EnergyLit | RefExpr;
+/** `bootLoop N`: boot, and reboot right after each Accepted boot N times. */
+export type BootLoopStmt = { kind: 'bootLoop'; count: NumExpr; loc: Loc };
+/** `fault evse N [CODE]`: a spontaneous Faulted (1.6 error code, 2.x NotifyEvent techCode). */
+export type FaultStmt = { kind: 'fault'; evse: NumExpr; code?: string; loc: Loc };
+/** `meter backwards E [evse N]` / `meter reset [evse N]`: a register jump; without `evse`, every EVSE. */
+export type MeterStmt =
+  | { kind: 'meter'; op: 'backwards'; energy: EnergyExpr; evse?: NumExpr; loc: Loc }
+  | { kind: 'meter'; op: 'reset'; evse?: NumExpr; loc: Loc };
+/** `reset hard|soft`: the station resets itself (hard: power loss; soft: transactions end first). */
+export type ResetStmt = { kind: 'reset'; mode: 'hard' | 'soft'; loc: Loc };
 export type ClockStmt =
   | { kind: 'clock'; mode: 'speed'; speed: NumExpr; loc: Loc }
   | { kind: 'clock'; mode: 'skew'; skew: DurExpr; loc: Loc }
@@ -190,6 +243,11 @@ export type Stmt = (
   | NetStmt
   | OnStmt
   | ChaosStmt
+  | ChaosFaultStmt
+  | BootLoopStmt
+  | FaultStmt
+  | MeterStmt
+  | ResetStmt
   | ClockStmt
   | CallStmt
   | LogStmt

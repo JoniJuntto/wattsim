@@ -3,13 +3,15 @@
  * Transactions are TransactionEvent Started/Updated/Ended with a station-generated UUID and a per-transaction
  * `seqNo`.
  */
-import type { CallFrame, OcppVersion, v201 } from '@wattsim/protocol';
+import type { CallFrame, OcppVersion, v21, v201 } from '@wattsim/protocol';
 import type { ChargingProfile } from '../charging';
 import { parseTime, profileProblem } from '../charging';
 import type { Clock } from '../clock';
 import { isoTimestamp } from '../clock';
 import type { MeterSample } from '../meter';
+import { OCMF_ENCODING, OCMF_SIGNING_METHOD } from '../ocmf';
 import type { ConnectorStatus, EvseState, ResolvedStationConfig, TransactionState } from '../station';
+import { isTimeZone } from '../tariff';
 import { handleSecurity2x, sendSignCertificate, signTrigger2x } from './security';
 import type { BootReason, CallOutcome, SampleContext, StationContext, TxUpdateTrigger, VersionAdapter } from './types';
 
@@ -107,14 +109,29 @@ export function chargingState201(evse: EvseState): ChargingState201 {
   }
 }
 
+/**
+ * One 2.x `MeterValue`: energy, power, voltage, current and (when known) SoC. An OCMF-signed sample carries its
+ * record on the energy register as `signedMeterValue`. While a V2X EV discharges, Power.Active.Import and
+ * Current.Import are negative and Power.Active.Export carries the magnitude; Energy.Active.Export.Register appears
+ * once the meter has exported anything.
+ */
 export function meterValue201(sample: MeterSample, context: SampleContext): MeterValue201 {
+  const register: SampledValue201 = {
+    value: Math.round(sample.energyWh),
+    context,
+    measurand: 'Energy.Active.Import.Register',
+    unitOfMeasure: { unit: 'Wh' },
+  };
+  if (sample.signed) {
+    register.signedMeterValue = {
+      signedMeterData: Buffer.from(sample.signed.ocmf, 'utf8').toString('base64'),
+      signingMethod: OCMF_SIGNING_METHOD,
+      encodingMethod: OCMF_ENCODING,
+      publicKey: sample.signed.publicKey,
+    };
+  }
   const sampledValue: SampledValue201[] = [
-    {
-      value: Math.round(sample.energyWh),
-      context,
-      measurand: 'Energy.Active.Import.Register',
-      unitOfMeasure: { unit: 'Wh' },
-    },
+    register,
     {
       value: Math.round(sample.powerKw * 1000),
       context,
@@ -124,6 +141,22 @@ export function meterValue201(sample: MeterSample, context: SampleContext): Mete
     { value: Number(sample.voltageV.toFixed(1)), context, measurand: 'Voltage', unitOfMeasure: { unit: 'V' } },
     { value: Number(sample.currentA.toFixed(2)), context, measurand: 'Current.Import', unitOfMeasure: { unit: 'A' } },
   ];
+  if (sample.exportWh !== undefined) {
+    sampledValue.push(
+      {
+        value: Math.round(sample.exportWh),
+        context,
+        measurand: 'Energy.Active.Export.Register',
+        unitOfMeasure: { unit: 'Wh' },
+      },
+      {
+        value: Math.max(0, Math.round(-sample.powerKw * 1000)),
+        context,
+        measurand: 'Power.Active.Export',
+        unitOfMeasure: { unit: 'W' },
+      },
+    );
+  }
   if (sample.soc !== undefined) {
     sampledValue.push({
       value: Number((sample.soc * 100).toFixed(1)),
@@ -226,7 +259,21 @@ function txEvent(
     meterValue: [meterValue201(sample, context)],
   };
   if (!st.connected) payload.offline = true;
+  // Only when a phase switch or a 1-phase EV makes it differ from the wiring, so a plain session is unchanged.
+  if (sample.phases !== undefined) payload.numberOfPhasesUsed = sample.phases;
+  const cable = evse.ev?.config.cableMaxA;
+  if (cable !== undefined) payload.cableMaxCurrent = Math.round(cable);
+  if (tx.cost && st.version === 'ocpp2.1') {
+    const p21 = payload as unknown as v21.TransactionEventRequest;
+    p21.transactionInfo.tariffId = tx.cost.tariffId;
+    p21.costDetails = tx.cost.details(Date.parse(sample.timestamp));
+  }
   return payload;
+}
+
+/** Remember the running cost a CSMS reports in a TransactionEventResponse. */
+function noteCost(tx: TransactionState, res: v201.TransactionEventResponse | undefined): void {
+  if (res?.totalCost !== undefined) tx.csmsTotalCost = res.totalCost;
 }
 
 function meterValuesPayload(evse: EvseState, sample: MeterSample, context: SampleContext): v201.MeterValuesRequest {
@@ -266,6 +313,14 @@ const VARIABLES: Record<string, VariableEntry> = {
       const s = parseSeconds(v);
       if (s === undefined) return false;
       st.setMeterIntervalMs(s * 1000);
+      return true;
+    },
+  },
+  'ClockCtrlr.TimeZone': {
+    get: (st) => st.timeZone,
+    set: (st, v) => {
+      if (!isTimeZone(v)) return false;
+      st.timeZone = v;
       return true;
     },
   },
@@ -494,11 +549,79 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
     }
     case 'GetBaseReport':
       return { result: { status: 'Accepted' } satisfies v201.GetBaseReportResponse };
-    case 'CostUpdated':
-      // Cost display is not modelled; acknowledging is what a conformant station does.
+    case 'CostUpdated': {
+      // The running cost is kept on the transaction (there is no display to show it on).
+      const p = call.payload as v201.CostUpdatedRequest;
+      const tx = st.evses.find((e) => e.tx?.id === p.transactionId)?.tx;
+      if (tx) tx.csmsTotalCost = p.totalCost;
       return { result: {} satisfies v201.CostUpdatedResponse };
+    }
     default:
-      return handleSecurity2x(st, call);
+      return (st.version === 'ocpp2.1' ? handleTariff21(st, call) : null) ?? handleSecurity2x(st, call);
+  }
+}
+
+type StatusInfo = { reasonCode: string; additionalInfo?: string };
+
+function info(reasonCode: string, additionalInfo?: string): StatusInfo {
+  const out: StatusInfo = { reasonCode };
+  if (additionalInfo) out.additionalInfo = additionalInfo.slice(0, 1024);
+  return out;
+}
+
+/** `statusInfo.reasonCode` (at most 20 characters) for a tariff status other than Accepted. */
+function reasonCode(status: string): string {
+  if (status === 'Rejected') return 'InvalidValue';
+  return status.length <= 20 ? status : 'UnsupportedParam';
+}
+
+/** 2.1 tariff messages (I07-I11); null for any other action. */
+function handleTariff21(st: StationContext, call: CallFrame): CallOutcome {
+  switch (call.action) {
+    case 'SetDefaultTariff': {
+      const p = call.payload as v21.SetDefaultTariffRequest;
+      const r = st.tariffs.setDefault(p.evseId, p.tariff);
+      const result: v21.SetDefaultTariffResponse = { status: r.status };
+      if (r.reason) result.statusInfo = info(reasonCode(r.status), r.reason);
+      return { result };
+    }
+    case 'GetTariffs': {
+      const p = call.payload as v21.GetTariffsRequest;
+      if (p.evseId !== 0 && !st.evse(p.evseId)) {
+        return { result: { status: 'Rejected', statusInfo: info('UnknownEvse') } satisfies v21.GetTariffsResponse };
+      }
+      const assignments = st.tariffs.assignments(p.evseId);
+      for (const evse of st.evses) {
+        const tx = evse.tx;
+        if (!tx?.cost || !tx.driverTariff || (p.evseId !== 0 && evse.id !== p.evseId)) continue;
+        assignments.push({
+          tariffId: tx.cost.tariffId,
+          tariffKind: 'DriverTariff',
+          evseIds: [evse.id],
+          idTokens: [tx.idTag],
+        });
+      }
+      if (assignments.length === 0) return { result: { status: 'NoTariff' } satisfies v21.GetTariffsResponse };
+      return { result: { status: 'Accepted', tariffAssignments: assignments } satisfies v21.GetTariffsResponse };
+    }
+    case 'ClearTariffs': {
+      const p = call.payload as v21.ClearTariffsRequest;
+      const clearTariffsResult = st.tariffs.clear(p.tariffIds, p.evseId);
+      return { result: { clearTariffsResult } satisfies v21.ClearTariffsResponse };
+    }
+    case 'ChangeTransactionTariff': {
+      const p = call.payload as v21.ChangeTransactionTariffRequest;
+      const r = st.changeTransactionTariff(p.transactionId, p.tariff);
+      // SetDefaultTariff's DuplicateTariffId cannot happen for a transaction tariff.
+      const status = (
+        r.status === 'DuplicateTariffId' ? 'Rejected' : r.status
+      ) as v21.ChangeTransactionTariffResponse['status'];
+      const result: v21.ChangeTransactionTariffResponse = { status };
+      if (r.reason) result.statusInfo = info(reasonCode(status), r.reason);
+      return { result };
+    }
+    default:
+      return null;
   }
 }
 
@@ -565,6 +688,7 @@ const ocpp2xAdapter: Omit<VersionAdapter, 'version'> = {
     payload.idToken = { idToken: idTag, type: (tx.idTokenType ?? 'ISO14443') as IdTokenType201 };
     if (tx.remoteStartId !== undefined) payload.transactionInfo.remoteStartId = tx.remoteStartId;
     const res = (await st.request('TransactionEvent', payload)) as v201.TransactionEventResponse;
+    noteCost(tx, res);
     return res.idTokenInfo === undefined || res.idTokenInfo.status === 'Accepted';
   },
 
@@ -583,7 +707,13 @@ const ocpp2xAdapter: Omit<VersionAdapter, 'version'> = {
     const tx = txOf(evse);
     const context: SampleContext =
       trigger === 'MeterValuePeriodic' ? 'Sample.Periodic' : trigger === 'Trigger' ? 'Trigger' : 'Other';
-    await st.request('TransactionEvent', txEvent(st, evse, tx, 'Updated', trigger, sample, context));
+    // TariffChanged is 2.1-only; the station only sends it on 2.1.
+    const reason = trigger as TriggerReason201;
+    const res = (await st.request(
+      'TransactionEvent',
+      txEvent(st, evse, tx, 'Updated', reason, sample, context),
+    )) as v201.TransactionEventResponse;
+    noteCost(tx, res);
   },
 
   meterValuesPayload(evse: EvseState, sample: MeterSample, context: SampleContext = 'Sample.Periodic') {

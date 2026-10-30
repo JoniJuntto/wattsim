@@ -39,7 +39,22 @@ bun run build                                   # also builds the browser app in
 bun packages/cli/src/index.ts ui                # serves it on http://127.0.0.1:7700 and opens the browser
 ```
 
-One local process, no login. Add charge points (one, or a numbered range like `CP-{i}`) pointed at your CSMS, or switch on the built-in test CSMS to try it with nothing else running. Per station you get EVSE cards to plug in an EV and start or stop charging with live power, energy and state of charge; a live message log with every CALL paired to its reply and schema violations highlighted; a panel to send any OCPP message with live schema validation; and fault injection rules. **Export session** downloads everything you clicked as a `.ws` scenario that `wattsim run` replays. Flags: `--port`, `--host` (default `127.0.0.1`), `--no-open`.
+One local process, no login. Add charge points (one, or a numbered range like `CP-{i}`) pointed at your CSMS, or switch on the built-in test CSMS to try it with nothing else running. Per station you get EVSE cards to plug in an EV and start or stop charging with live power, energy and state of charge; a live message log with every CALL paired to its reply and schema violations highlighted; a panel to send any OCPP message with live schema validation; and fault injection rules. **Export** downloads everything you clicked as a `.ws` scenario that `wattsim run` replays, or the frames as an Open OCPP Trace. Flags: `--port`, `--host` (default `127.0.0.1`), `--no-open`, `--data`, `--csms-port`.
+
+The **Scenarios** page is a `.ws` editor with highlighting, completion and the checker's diagnostics as you type. **Run** executes the scenario in the server process against the built-in test CSMS or a URL, on a virtual clock (a 30 min charge takes milliseconds) or in real time (cancellable, with a speed factor), and shows per-station results, asserts and events live. Every run stays in the history with its trace and JUnit report. The **CSMS** page shows what the built-in test CSMS sees: connected stations, their boot and connector state, and its conformance findings grouped by rule with the spec reference. Each finding links to the frame it is about, on the station's page or, for stations the UI did not create, in the CSMS-side log. Download the report as JSON or JUnit, or save it.
+
+## Server mode and Docker
+
+`wattsim ui` keeps run history, saved scenarios, recordings (Open OCPP Trace) and CSMS conformance reports in SQLite under `--data <dir>`, default `~/.wattsim`. The schema is applied from the SQL migrations in `packages/server/drizzle` on start. The library call `startServer()` without `dataDir`, which `wattsim mcp` uses, keeps the same database in memory and writes nothing to disk.
+
+The test CSMS saves its report when it stops (the server stopping, or **Stop** on the CSMS page). Its port is random unless you pass `--csms-port`. Runs on the virtual clock against it collect `time.skew` warnings, because the stations' clocks run ahead of the CSMS's wall clock. Scenarios from the browser may `import` quirk files relative to the data directory but not `use plugin`, which would execute a module from the server's disk; run those with `wattsim run`.
+
+```sh
+docker build -t wattsim .
+docker run -p 7700:7700 -p 7701:7701 -v wattsim-data:/data wattsim
+```
+
+The image runs `wattsim ui --host 0.0.0.0 --no-open --data /data --csms-port 7701` as the unprivileged `bun` user, with a health check on `/api/health`. Point external charge points at `ws://<host>:7701/<id>` to have the test CSMS check them. There is no authentication: put the container behind a reverse proxy that adds it before exposing it beyond your machine. CI builds the image on every push (`.github/workflows/docker.yml`); nothing is published.
 
 ## Use it from an AI agent
 
@@ -124,11 +139,11 @@ The complete reference is in [docs/dsl.md](docs/dsl.md). More examples:
 
 | Layer | Faults | In the DSL |
 |---|---|---|
-| Transport | drop, delay, jitter, reorder, duplicate, corrupt bytes, half-open socket, slow read, reconnect storms | `chaos drop`, `chaos delay 2s`, `chaos duplicate`, `chaos corrupt`, `net drop 10s` |
-| Protocol | wrong CALLRESULT id, CALLERROR, never respond, invalid enum, missing field, future/past timestamps, oversized payload | `chaos wrongId`, `chaos callError`, `chaos noResponse`, `clock skew -2s` |
-| Behavioural | boot loop, ignore remote commands, spontaneous Faulted, meter backwards/reset, reset mid-transaction, offline queue replay with duplicates | `repeat`, `status evse 1 Faulted`, `disconnect` / `connect`, `net drop` inside `at +d { }`, `on RemoteStartTransaction always { reply {status: "Rejected"} }` |
+| Transport | drop, delay, jitter, reorder, duplicate, corrupt bytes, half-open socket, slow read, reconnect storms | `chaos drop`, `chaos delay 2s`, `chaos jitter 50ms..2s`, `chaos reorder after 2`, `chaos duplicate`, `chaos corrupt`, `chaos halfOpen for 2min`, `chaos slowRead 100ms`, `chaos reconnectStorm 5 within 1min`, `net drop 10s` |
+| Protocol | wrong CALLRESULT id, CALLERROR, never respond, invalid enum, missing field, future/past timestamps, oversized payload | `chaos wrongId`, `chaos callError`, `chaos noResponse`, `chaos invalidEnum`, `chaos missingField idTag`, `chaos timestamp -10min`, `chaos oversized 64kB`, `clock skew -2s` |
+| Behavioural | boot loop, ignore remote commands, spontaneous Faulted, meter backwards/reset, reset mid-transaction, offline queue replay with duplicates | `bootLoop 3`, `on RemoteStartTransaction always { reply {status: "Rejected"} }`, `fault evse 1 GroundFailure`, `meter backwards 2kWh`, `meter reset`, `reset hard`, `reset soft`, `net drop 2min duplicate` |
 
-Milestone 1 ships the faults named in the third column; the rest of each row is roadmap.
+Each `chaos` rule takes the usual filters (direction, action, `nth`, `every`, `probability`, `once`) and is reproducible under `--seed`. The protocol faults are the only way wattsim sends a schema-breaking payload: they apply after strict validation and are reported as chaos, and `@wattsim/csms` flags each one (`schema.request`, `time.skew`). The DSL reference, [docs/dsl.md](docs/dsl.md), describes each fault.
 
 ## CSMS simulator
 
@@ -221,6 +236,59 @@ SecurityEventNotification starts once a station has security state: from boot wh
 
 The CSMS side of the test CA: `signCsr(ca, csrPem, { identity })` returns the chain for CertificateSigned. `ocspResponse(ca, hashData)` answers GetCertificateStatus with a signed OCSP response built from the CA's revocation table (`revokeCertificate`). `cannedEv15118Response()` answers Get15118EVCertificate. `certificateHashData(pem, issuerPem)`, `verifyChain`, `fingerprint`, `createCsr` and `generateKeyPair` (`'ec'` or `'rsa'`) cover the rest. Certificates are backdated an hour and valid for ten years by default; pass `now` to line them up with a virtual clock.
 
+## Realism
+
+Power, current and energy on the wire come from one model and stay consistent with each other: P = V × I × phases, and the energy register integrates P on the station's clock. The power an EV gets is the minimum of every limit in force:
+
+| Limit | Where it comes from |
+|---|---|
+| EVSE rating | `maxCurrentA` (per phase) × `phases` × `voltageV` of the station |
+| Smart charging | the composite of the installed profiles. A limit in A is per phase and follows the phases in use; one in W is taken as is |
+| Phases | min(station `phases`, EV `phases`, `numberPhases` of the binding schedule period). A period with `numberPhases: 1` switches the EVSE to one phase; 2.x TransactionEvents then carry `numberOfPhasesUsed` |
+| Cable | EV `cableMaxA`, reported as 2.x `cableMaxCurrent` |
+| EV | `maxCurrentA` × charge curve(soc) × temperature derating |
+
+```ts
+await station.plugIn(1, {
+  batteryKwh: 77, initialSoc: 0.3, targetSoc: 0.8, phases: 3, maxCurrentA: 32,
+  cableMaxA: 20,                    // cable rating, A per phase
+  ambientC: -5, batteryTempC: 2,    // a cold pack charges at the derated power
+  v2x: true, minDischargeSoc: 0.4,  // bidirectional (2.1)
+  iso15118: true, departureMs: 8 * 3_600_000, energyRequestKwh: 30,
+  emaid: 'FI-WSM-C12345678-X',      // Plug & Charge contract id
+});
+```
+
+New EV properties (`EvConfig`; all optional):
+
+| Property | Unit | Default | Effect |
+|---|---|---|---|
+| `ambientC` | °C | 20 | ambient temperature the pack cools towards |
+| `batteryTempC` | °C | `ambientC` | pack temperature at plug-in |
+| `heatPerHourC` | °C/h at 1C | 6 | heating, grows with the square of the power |
+| `coolingPerHour` | 1/h | 0.5 | share of the excess over ambient lost per hour |
+| `temperatureDerate` | function | 20% at -20 °C, 50% at 0 °C, 100% from 15 to 40 °C, 50% at 50 °C, 0 from 60 °C | power factor from the pack temperature |
+| `cableMaxA` | A per phase | none | caps the current |
+| `v2x` | boolean | false | follows negative 2.1 setpoints and limits by discharging |
+| `maxDischargeCurrentA` | A per phase | `maxCurrentA` | discharge limit |
+| `minDischargeSoc` | 0..1 | 0.2 | stops discharging at this soc |
+| `resumeAfterMs` | ms | none | an EV that paused (`suspendAt`, `suspend`) asks for energy again after this long |
+| `iso15118` | boolean | false | 2.x: NotifyEVChargingNeeds when the transaction starts |
+| `departureMs` | ms after plug-in | none | ISO 15118 departure time |
+| `energyRequestKwh` | kWh | to `targetSoc` | ISO 15118 energy request |
+| `minCurrentA` | A per phase | 6 | `evMinCurrent` |
+| `emaid` | string | none | contract id for `station.plugAndCharge(evseId)` |
+
+**V2X (2.1).** A schedule period with a negative `setpoint` makes a `v2x` EV discharge at that rate, bounded by `dischargeLimit`, the EVSE rating and the EV's own discharge current. A positive setpoint is a charging target. A negative `limit` without a setpoint (the pre-2.1 convention) is read as a discharge too. While discharging, Power.Active.Import and Current.Import are negative, Power.Active.Export carries the magnitude, and Energy.Active.Export.Register grows while the import register stays put. A unidirectional EV, or any 1.6 / 2.0.1 station, offers nothing for a negative limit (SuspendedEVSE).
+
+**ISO 15118.** `station.plugAndCharge(evseId)` sends Authorize with idToken type eMAID and, when a V2G certificate chain is installed (SignCertificate `V2GCertificate`, then CertificateSigned), `iso15118CertificateHashData` for the chain's certificates. It starts the transaction under the eMAID when the CSMS accepts both the token and the certificate. `station.notifyEvChargingNeeds(evseId)` sends the EV's needs on demand; on 2.1 a V2X EV asks for `AC_BPT` with its charge and discharge power.
+
+**Signed meter values.** `signedMeterValues: true` signs every energy register reading as OCMF (`OCMF|{payload}|{"SA":"ECDSA-secp256r1-SHA256","SD":...}`) with a per-station P-256 key. The key is generated on first use, or you can pass `meterSigningKey` (PKCS#8 PEM). 2.x puts the record, base64, in the register's `signedMeterValue` (`encodingMethod: OCMF`, `publicKey`: base64 SPKI). 1.6 adds a second register value with `format: SignedData`. `station.meterSigner.publicKeyBase64` is the key a CSMS verifies against.
+
+**Tariffs and cost (2.1).** The station handles SetDefaultTariff, GetTariffs, ClearTariffs and ChangeTransactionTariff, and computes the running cost locally. A transaction takes the default tariff in force when it starts (the EVSE's own, else the station's). Every TransactionEvent then carries `transactionInfo.tariffId` and `costDetails`: totals per dimension with and without tax, `totalUsage`, and one charging period per change of applicable prices. Energy, charging-time and idle-time prices are evaluated with their conditions (time of day, weekday, dates, energy, power, current, durations) on the virtual clock. Local time comes from the station's IANA `timeZone` (default UTC, also `ClockCtrlr.TimeZone` via SetVariables), so 22:00 or midnight lands on the right instant on both sides of a DST change. A price boundary inside a meter interval is charged exactly. Fixed fees apply at the start. Stacked tax rates and `minCost` / `maxCost` are applied. Elements whose power, current or energy bounds are negative price discharging; the others price charging only. On 2.0.1 the station keeps the CSMS's running cost (CostUpdated, TransactionEventResponse `totalCost`) as `tx.csmsTotalCost`.
+
+**Models.** `meterModel: 'constant'` draws one constant power per transaction (the EV's limit at its initial soc, capped by the offer) and leaves soc and temperature alone. Use it for load runs. `evFactory` and `meterFactory` in `StationConfig` build the `EvModel` / `MeterModel` for each EV and EVSE, so a subclass can replace either model.
+
 ## Record, replay and proxy
 
 ```sh
@@ -269,6 +337,27 @@ Code-level quirks are plugins. `use plugin "./my-quirk.ts"` imports the module w
 
 `quirks/` holds six generic examples (`slow-boot`, `lossy-meter`, `chatty-heartbeat`, `ignores-remote-stop`, `clock-drift`, `late-status`) and [how to contribute one](quirks/README.md). The project ships no profiles named after vendors.
 
+## Editor support
+
+`packages/vscode` is a VS Code extension for `.ws` files, backed by a language server in `packages/lsp`. Build and install it locally:
+
+```sh
+bun run --cwd packages/vscode package            # writes packages/vscode/wattsim.vsix
+code --install-extension packages/vscode/wattsim.vsix
+```
+
+It gives you:
+
+- highlighting from a TextMate grammar that `packages/vscode/scripts/grammar.ts` generates from the lexer's keyword list, the parser's sub-words and the OCPP action names, so new syntax is highlighted after a rebuild;
+- diagnostics as you type: parse errors on the offending token, and quirk errors from `link` (unknown quirk, a `use quirk` cycle, an unreadable import, a missing plugin) at their location. Imports are read from open editors first, so unsaved changes count;
+- Format Document, the same output as `wattsim fmt` (a file that does not parse is left alone);
+- hover text for keywords, taken from [docs/dsl.md](docs/dsl.md) at build time, and for OCPP actions: who initiates each one, in the station's `version`;
+- completion for keywords, OCPP actions after `send`, `expect`, `on` and `chaos`, quirk names after `use quirk` and procedure names after `call`;
+- go to definition on `call NAME`, `use quirk "NAME"` (also into imported files), `use plugin` and `import`;
+- snippets for stations, fleets, procs, quirks and common statements.
+
+The extension runs the server under Bun when `bun` is on PATH or in `~/.bun/bin`, and otherwise under the Node runtime built into VS Code; both run the same bundle (`bun build --target node`). The `wattsim.server.runtime` setting (`auto`, `bun`, `node`) overrides the choice. Other editors can run the server directly: `bun packages/lsp/src/bin.ts --stdio`.
+
 ## Development
 
 ```sh
@@ -286,6 +375,9 @@ Packages, all Bun workspaces under `packages/`:
 - `pki`: the built-in test certificate authority (certificates, CSR signing, OCSP)
 - `csms`: the CSMS simulator and conformance checker
 - `mcp`: the MCP server for AI agents (`wattsim mcp`)
+- `lsp`: the language server for `.ws` files
+- `vscode`: the VS Code extension (TextMate grammar generated from the parser, plus the language server)
+- `docs`: the documentation site (Fumadocs, static export; references generated from the code)
 - `trace`: Open OCPP Trace reading and writing, the recording proxy, replay, and trace-to-scenario conversion
 - `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`, `mcp`, `proxy`, `replay`, `quirk`)
 

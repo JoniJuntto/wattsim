@@ -19,7 +19,15 @@ export type RecurrencyKind = 'Daily' | 'Weekly';
 /** 2.0.1 `chargingLimitSource`. Profiles the CSMS sets are `CSO`. */
 export type ChargingLimitSource = 'EMS' | 'Other' | 'SO' | 'CSO';
 
-export type SchedulePeriod = { startPeriod: number; limit?: number; numberPhases?: number };
+export type SchedulePeriod = {
+  startPeriod: number;
+  limit?: number;
+  numberPhases?: number;
+  /** 2.1: the most the EV may discharge, as a negative rate in the schedule's unit. */
+  dischargeLimit?: number;
+  /** 2.1: the rate the EV should follow; negative discharges. */
+  setpoint?: number;
+};
 
 export type ChargingProfile = {
   id: number;
@@ -98,8 +106,19 @@ function isCap(cls: PurposeClass): boolean {
   return cls === 'max' || cls === 'external';
 }
 
-/** A limit in kW and the `numberPhases` of the schedule period that set it (undefined: the station's phases). */
-type Limit = { kw: number; phases?: number };
+/**
+ * A limit in kW and the `numberPhases` of the schedule period that set it (undefined: the station's phases). A limit
+ * written in A also keeps its per-phase current, so a station that switches phases can rescale it (`amps`).
+ */
+export type Limit = { kw: number; phases?: number; amps?: number };
+
+/** 2.1 V2X values in force for one EVSE: the setpoint of the transaction profile and the tightest discharge limit. */
+export type V2xLimits = { setpoint?: Limit; dischargeLimit?: Limit };
+
+/** True when a period uses the 2.1 bidirectional fields or a (legacy) negative limit. */
+function isV2xPeriod(q: SchedulePeriod): boolean {
+  return q.setpoint !== undefined || q.dischargeLimit !== undefined || (q.limit !== undefined && q.limit < 0);
+}
 
 /** The lower of two limits, keeping its phases. */
 function minLimit(a: Limit | undefined, b: Limit | undefined): Limit | undefined {
@@ -176,6 +195,11 @@ export class ProfileStore {
     return true;
   }
 
+  /** True while some installed profile has a 2.1 V2X period; `v2xAt` is only worth calling then. */
+  get hasV2x(): boolean {
+    return this.profiles.some((q) => q.periods.some(isV2xPeriod));
+  }
+
   /** How many profiles would be installed after `set(p, 'replace')`: `p` plus every profile it does not replace. */
   sizeAfterSet(p: ChargingProfile): number {
     let kept = 0;
@@ -218,6 +242,47 @@ export class ProfileStore {
    */
   limitAt(evseId: number, t: number, anchor: number = t): number | undefined {
     return this.limit(evseId, t, anchor)?.kw;
+  }
+
+  /** `limitAt` with the `numberPhases` of the binding period and, for a limit in A, its per-phase current. */
+  limitDetail(evseId: number, t: number, anchor: number = t): Limit | undefined {
+    return this.limit(evseId, t, anchor);
+  }
+
+  /**
+   * 2.1 V2X values for `evseId` at `t`: the setpoint of the profile that sets the transaction limit (TxProfile, else
+   * TxDefaultProfile), and the discharge limit closest to zero among that profile and the Max / ExternalConstraints
+   * caps. A station-level discharge limit is shared like a station-level limit. Empty when nothing applies.
+   */
+  v2xAt(evseId: number, t: number, anchor: number = t): V2xLimits {
+    const out: V2xLimits = {};
+    if (!this.hasV2x) return out;
+    const hasTx = this.env.txStartedAt(evseId) !== undefined;
+    const pick = (cls: PurposeClass, on: number, field: 'setpoint' | 'dischargeLimit') =>
+      this.bestValue(cls, on, evseId, t, anchor, field);
+    const setpoint =
+      (hasTx ? pick('tx', evseId, 'setpoint') : undefined) ??
+      pick('txDefault', evseId, 'setpoint') ??
+      pick('txDefault', 0, 'setpoint');
+    if (setpoint) out.setpoint = setpoint;
+    let discharge: Limit | undefined;
+    const tighter = (l: Limit | undefined) => {
+      if (l && (discharge === undefined || l.kw > discharge.kw)) discharge = l;
+    };
+    tighter(
+      (hasTx ? pick('tx', evseId, 'dischargeLimit') : undefined) ??
+        pick('txDefault', evseId, 'dischargeLimit') ??
+        pick('txDefault', 0, 'dischargeLimit'),
+    );
+    tighter(pick('max', evseId, 'dischargeLimit'));
+    tighter(pick('external', evseId, 'dischargeLimit'));
+    // Discharge limits are negative: the tighter of two is the one closer to zero.
+    const a = pick('max', 0, 'dischargeLimit');
+    const b = pick('external', 0, 'dischargeLimit');
+    const cap = a && b ? (a.kw > b.kw ? a : b) : (a ?? b);
+    if (cap) tighter(this.share(evseId, cap));
+    if (discharge) out.dischargeLimit = discharge;
+    return out;
   }
 
   /**
@@ -318,6 +383,25 @@ export class ProfileStore {
     t: number,
     fallback: number,
   ): Limit | undefined {
+    const found = this.periodAt(p, cls, evseId, t, fallback);
+    if (found?.limit === undefined) return undefined;
+    return this.toLimit(p, found.limit, found.numberPhases);
+  }
+
+  private toLimit(p: ChargingProfile, value: number, numberPhases: number | undefined): Limit {
+    const lim: Limit = { kw: periodKw(p.unit, value, numberPhases, this.env), phases: numberPhases };
+    if (p.unit === 'A') lim.amps = value;
+    return lim;
+  }
+
+  /** The schedule period of `p` in force at `t` for `evseId`, undefined outside its validity or schedule. */
+  private periodAt(
+    p: ChargingProfile,
+    cls: PurposeClass,
+    evseId: number,
+    t: number,
+    fallback: number,
+  ): SchedulePeriod | undefined {
     if (p.validFrom !== undefined && t < p.validFrom) return undefined;
     if (p.validTo !== undefined && t >= p.validTo) return undefined;
     let start = this.anchorOf(p, cls, evseId, fallback);
@@ -334,8 +418,34 @@ export class ProfileStore {
       if (q.startPeriod * 1000 > offsetMs) break;
       found = q;
     }
-    if (found?.limit === undefined) return undefined;
-    return { kw: periodKw(p.unit, found.limit, found.numberPhases, this.env), phases: found.numberPhases };
+    return found;
+  }
+
+  /** Like `best`, for a 2.1 V2X field: the highest-stack profile of `cls` on `onEvse` whose period sets it. */
+  private bestValue(
+    cls: PurposeClass,
+    onEvse: number,
+    forEvse: number,
+    t: number,
+    fallback: number,
+    field: 'setpoint' | 'dischargeLimit',
+  ): Limit | undefined {
+    for (const p of this.profiles) {
+      if (p.evseId !== onEvse || classOf(p.purpose) !== cls) continue;
+      const q = this.periodAt(p, cls, forEvse, t, fallback);
+      const v = q?.[field];
+      if (v !== undefined) return this.toLimit(p, v, q?.numberPhases);
+    }
+    return undefined;
+  }
+
+  /** A station-level limit's share for `evseId`: divided by the EVSEs with a transaction, counting `evseId`. */
+  private share(evseId: number, cap: Limit): Limit {
+    let sharing = this.env.txStartedAt(evseId) === undefined ? 1 : 0;
+    for (let id = 1; id <= this.env.evses; id++) if (this.env.txStartedAt(id) !== undefined) sharing++;
+    const out: Limit = { kw: cap.kw / sharing, phases: cap.phases };
+    if (cap.amps !== undefined) out.amps = cap.amps / sharing;
+    return out;
   }
 
   /** Highest-stack limit among the profiles of class `cls` installed on `onEvse`, evaluated for `forEvse`. */
@@ -354,9 +464,7 @@ export class ProfileStore {
     const own = this.ownLimit(evseId, t, anchor);
     const cap = this.stationCap(t);
     if (cap === undefined) return own;
-    let sharing = this.env.txStartedAt(evseId) === undefined ? 1 : 0;
-    for (let id = 1; id <= this.env.evses; id++) if (this.env.txStartedAt(id) !== undefined) sharing++;
-    return minLimit(own, { kw: cap.kw / sharing, phases: cap.phases });
+    return minLimit(own, this.share(evseId, cap));
   }
 
   /** The EVSE's own limit: transaction limit capped by caps installed on the EVSE itself. */

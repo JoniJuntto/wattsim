@@ -65,6 +65,13 @@
  *   point as if they were written there (configuration after the station exists fails it, as usual), so later
  *   statements override earlier ones and `chaos` / `on` rules accumulate in the order they run. Quirks given in
  *   `RunOptions.quirks` / `quirkFiles` run first in every station, before its own statements.
+ * - Fault statements (see core's `faults.ts`): `bootLoop N`, `fault evse N [code]`, `meter backwards|reset` and
+ *   `reset hard|soft` call the core functions of the same names on the station; `net drop d duplicate` adds, on
+ *   reconnect, a chaos `duplicate` rule for outbound CALLs that is removed once as many distinct CALLs as were
+ *   pending at the reconnect have gone out. `chaos` with a milestone-4 fault adds a core `ChaosFaultEffect` rule;
+ *   its duration and count arguments are resolved once, like `chaos delay`.
+ * - `ev plug` properties set `EvConfig` fields through the `EV_PROPS` table (ev-props.ts), converting units; an
+ *   unknown property fails the station with the list of valid names.
  * - `use plugin "p"` modules are imported when the run starts. The module's default export is called with the
  *   station when it is created (at once when it already exists), in statement order with `on` handlers; the
  *   function it returns is called, last plugin first, when the run disconnects the station. A plugin that throws
@@ -74,18 +81,28 @@ import { resolve } from 'node:path';
 import type {
   CallAnswer,
   ChaosEffect,
+  ChaosFaultEffect,
   ChaosMatch,
   Clock,
   ConnectorStatus,
   EvConfig,
+  EvseState,
   StationConfig,
   Timer,
 } from '@wattsim/core';
 import {
+  bootLoop,
   CallError,
   ChaosEngine,
+  DEFAULT_FAULT_CODE,
+  ERROR_CODES_16,
+  faultEvse,
   lcg,
+  MAX_TECH_CODE_LENGTH,
+  meterBackwards,
+  meterReset,
   RequestTimeoutError,
+  resetStation,
   SkewedClock,
   Station,
   ViolationError,
@@ -95,6 +112,8 @@ import {
 import type { Frame, Violation } from '@wattsim/protocol';
 import { CALL_ERROR_CODES, MessageType } from '@wattsim/protocol';
 import type {
+  ChaosFaultStmt,
+  ChaosFilters,
   ChaosStmt,
   ClockStmt,
   DistExpr,
@@ -105,6 +124,7 @@ import type {
   JsonValue,
   LetDecl,
   Loc,
+  MeterStmt,
   NetStmt,
   NumExpr,
   OnStmt,
@@ -116,6 +136,8 @@ import type {
   StringExpr,
   UseStmt,
 } from './ast';
+import type { EvPropInput } from './ev-props';
+import { EV_LABEL_PROP, EV_PROPS, evPropNames, evPropValue } from './ev-props';
 import { formatDuration, formatDurExpr } from './format';
 import { ParseError } from './lexer';
 import type { Linked, QuirkPlugin, QuirkSource } from './quirks';
@@ -965,7 +987,7 @@ class InstanceRunner {
         return;
       }
       case 'ev':
-        await this.race(this.ev(stmt));
+        await this.race(this.ev(stmt, branch.scope));
         return;
       case 'authorize':
         await this.race(this.ensureStation('authorize').authorize(this.text(stmt.tag, stmt.loc)));
@@ -1036,8 +1058,9 @@ class InstanceRunner {
         return;
       }
       case 'net':
-        if (stmt.op === 'drop') await this.netDrop(this.ms(stmt.duration, stmt.loc, "'net drop'", branch.scope));
-        else this.netDelay(stmt, branch.scope);
+        if (stmt.op === 'drop') {
+          await this.netDrop(this.ms(stmt.duration, stmt.loc, "'net drop'", branch.scope), stmt.duplicate ?? false);
+        } else this.netDelay(stmt, branch.scope);
         return;
       case 'on':
         if (this.station) this.intercept(this.station, stmt);
@@ -1048,6 +1071,27 @@ class InstanceRunner {
         return;
       case 'chaos':
         this.addChaos(stmt, branch.scope);
+        return;
+      case 'chaosFault':
+        this.addChaosFault(stmt, branch.scope);
+        return;
+      case 'bootLoop': {
+        const n = this.num(stmt.count, stmt.loc, "'bootLoop' count", 0);
+        await this.race(bootLoop(this.ensureStation('bootLoop'), n));
+        return;
+      }
+      case 'fault': {
+        const station = this.ensureStation('fault');
+        const evse = this.num(stmt.evse, stmt.loc, 'EVSE id', 1);
+        this.checkFaultCode(station, stmt.code, stmt.loc);
+        await this.race(faultEvse(station, evse, stmt.code));
+        return;
+      }
+      case 'meter':
+        this.meter(stmt);
+        return;
+      case 'reset':
+        await this.race(resetStation(this.ensureStation('reset'), stmt.mode));
         return;
       case 'clock':
         this.clockStmt(stmt, branch.scope);
@@ -1318,12 +1362,12 @@ class InstanceRunner {
     }
   }
 
-  private async ev(stmt: EvStmt): Promise<void> {
+  private async ev(stmt: EvStmt, scope: DrawScope): Promise<void> {
     const station = this.ensureStation('ev');
     const evse = this.num(stmt.evse, stmt.loc, 'EVSE id', 1);
     switch (stmt.action) {
       case 'plug':
-        await station.plugIn(evse, this.evConfig(stmt.props));
+        await station.plugIn(evse, this.evConfig(stmt.props, scope));
         return;
       case 'unplug':
         await station.unplug(evse);
@@ -1340,43 +1384,55 @@ class InstanceRunner {
     }
   }
 
-  /** `battery 60kWh soc 20% target 80% phases 3 maxCurrent 32A`; `%` (or a value > 1) is a percentage. */
-  private evConfig(props: Prop[]): Partial<EvConfig> {
-    const cfg: Partial<EvConfig> = {};
-    const num = (p: Prop): number => {
-      if (p.value.kind === 'ref') return this.num(p.value, p.loc, `ev property '${p.name}'`);
-      if (p.value.kind !== 'number') throw new StationFailure(`ev property '${p.name}' must be a number`);
-      return p.value.value;
-    };
-    const fraction = (p: Prop): number => {
-      const v = num(p);
-      return (p.value.kind === 'number' && p.value.unit === '%') || v > 1 ? v / 100 : v;
-    };
+  /**
+   * `battery 60kWh soc 20% target 80% phases 3 maxCurrent 32A cableMax 16A ambient -5°C v2x true`: each property sets
+   * the `EvConfig` field `EV_PROPS` names, converted to its unit. `name` is a label and sets nothing.
+   */
+  private evConfig(props: Prop[], scope: DrawScope): Partial<EvConfig> {
+    const cfg: Record<string, unknown> = {};
     for (const p of props) {
-      switch (p.name) {
-        case 'battery':
-          cfg.batteryKwh = num(p);
-          break;
-        case 'soc':
-          cfg.initialSoc = fraction(p);
-          break;
-        case 'target':
-          cfg.targetSoc = fraction(p);
-          break;
-        case 'phases': {
-          const v = num(p);
-          if (v !== 1 && v !== 3) throw new StationFailure(`ev property 'phases' must be 1 or 3, got ${v}`);
-          cfg.phases = v;
-          break;
-        }
-        case 'maxCurrent':
-          cfg.maxCurrentA = num(p);
-          break;
-        default:
-          break; // `name` and unknown properties are accepted and ignored
+      if (p.name === EV_LABEL_PROP) continue;
+      const prop = Object.hasOwn(EV_PROPS, p.name) ? EV_PROPS[p.name] : undefined;
+      if (!prop) {
+        throw new StationFailure(`${at(p.loc)}: unknown ev property '${p.name}' (known: ${evPropNames().join(', ')})`);
       }
+      let value: number | string | boolean;
+      try {
+        value = evPropValue(p.name, prop, this.evPropInput(p, prop.unit === 'ms', scope));
+      } catch (err) {
+        if (err instanceof StationFailure) throw err;
+        throw new StationFailure(`${at(p.loc)}: ${toError(err).message}`);
+      }
+      if (prop.field === 'phases' && value !== 1 && value !== 3) {
+        throw new StationFailure(`ev property 'phases' must be 1 or 3, got ${value}`);
+      }
+      cfg[prop.field] = value;
     }
-    return cfg;
+    return cfg as Partial<EvConfig>;
+  }
+
+  /** Resolve a property value. `true` / `false` are booleans unless a variable has that name. */
+  private evPropInput(p: Prop, duration: boolean, scope: DrawScope): EvPropInput {
+    const v = p.value;
+    if (v.kind === 'number') return { kind: 'number', value: v.value, unit: v.unit };
+    if (v.kind === 'string') return { kind: 'string', value: this.str(v) };
+    if ((v.name === 'true' || v.name === 'false') && !this.isVariable(v.name)) {
+      return { kind: 'boolean', value: v.name === 'true' };
+    }
+    if (duration) return { kind: 'duration', ms: this.ms(v, p.loc, `ev property '${p.name}'`, scope) };
+    const r = this.lookup(v.name, p.loc);
+    if (typeof r === 'string') return { kind: 'string', value: r };
+    if (typeof r === 'number') return { kind: 'number', value: r };
+    return { kind: 'duration', ms: 'ms' in r ? r.ms : this.ms(v, p.loc, `ev property '${p.name}'`, scope) };
+  }
+
+  private isVariable(name: string): boolean {
+    try {
+      this.run.lookup(name, this.inst.vars);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async expect(stmt: ExpectStmt, branch: Branch): Promise<void> {
@@ -1436,11 +1492,30 @@ class InstanceRunner {
     this.emit({ type: 'assert', station: this.name, ...a, at: this.clock.now() });
   }
 
-  private async netDrop(ms: number): Promise<void> {
+  private async netDrop(ms: number, duplicate: boolean): Promise<void> {
     const station = this.ensureStation('net drop');
     await this.race(station.disconnect());
     await this.sleep(this.scaled(ms));
+    if (duplicate) this.duplicateBacklog(station);
     await this.race(station.connect());
+  }
+
+  /**
+   * `net drop ... duplicate`: every CALL pending now (queued while offline, or requeued) goes out twice with the same
+   * message id. The rule comes off once that many distinct CALLs have been sent.
+   */
+  private duplicateBacklog(station: Station): void {
+    const backlog = station.pendingRequests;
+    if (backlog === 0) return;
+    const id = this.chaos.add({ match: { direction: 'out', messageType: 'call' }, effect: { kind: 'duplicate' } });
+    const seen = new Set<string>();
+    const off = station.on('frame', (direction, frame) => {
+      if (direction !== 'out' || frame.type !== MessageType.Call) return;
+      seen.add(frame.id);
+      if (seen.size < backlog) return;
+      this.chaos.remove(id);
+      off();
+    });
   }
 
   private netDelay(stmt: Extract<NetStmt, { op: 'delay' }>, scope: DrawScope): void {
@@ -1456,7 +1531,7 @@ class InstanceRunner {
     this.branches.push(task);
   }
 
-  private addChaos(stmt: ChaosStmt, scope: DrawScope): void {
+  private chaosMatch(stmt: ChaosFilters & { loc: Loc }): ChaosMatch {
     const match: ChaosMatch = { direction: stmt.direction, action: stmt.action };
     const t = stmt.trigger;
     if (t?.kind === 'nth') match.nth = this.num(t.n, stmt.loc, "'nth'", 1);
@@ -1465,6 +1540,95 @@ class InstanceRunner {
       if (t.from) match.from = this.num(t.from, stmt.loc, "'from'", 1);
     }
     if (stmt.probability) match.probability = this.num(stmt.probability, stmt.loc, "'probability'") / 100;
+    return match;
+  }
+
+  private addChaosFault(stmt: ChaosFaultStmt, scope: DrawScope): void {
+    const f = stmt.fault;
+    const loc = stmt.loc;
+    const ms = (e: DurExpr, what: string, signed = false) => this.ms(e, loc, what, scope, signed);
+    let effect: ChaosFaultEffect;
+    switch (f.kind) {
+      case 'jitter': {
+        const minMs = ms(f.min, "'jitter' minimum");
+        const maxMs = ms(f.max, "'jitter' maximum");
+        if (maxMs < minMs) {
+          throw new StationFailure(
+            `${at(loc)}: jitter MIN..MAX needs MAX >= MIN, got ${formatDuration({ ms: minMs })}..${formatDuration({ ms: maxMs })}`,
+          );
+        }
+        effect = { kind: 'jitter', minMs, maxMs };
+        break;
+      }
+      case 'reorder':
+        effect = { kind: 'reorder', after: f.after ? this.num(f.after, loc, "'reorder after'", 1) : 1 };
+        break;
+      case 'halfOpen':
+        effect = f.for ? { kind: 'halfOpen', ms: ms(f.for, "'halfOpen for'") } : { kind: 'halfOpen' };
+        break;
+      case 'slowRead':
+        effect = { kind: 'slowRead', stepMs: ms(f.step, "'slowRead'") };
+        break;
+      case 'reconnectStorm':
+        effect = {
+          kind: 'reconnectStorm',
+          count: this.num(f.count, loc, "'reconnectStorm' count", 1),
+          windowMs: ms(f.within, "'reconnectStorm ... within'"),
+        };
+        break;
+      case 'invalidEnum':
+      case 'missingField':
+        effect = f.path === undefined ? { kind: f.kind } : { kind: f.kind, path: f.path };
+        break;
+      case 'timestamp':
+        effect = { kind: 'timestamp', shiftMs: ms(f.shift, "'timestamp'", true) };
+        break;
+      case 'oversized': {
+        const kb = this.num(f.kb, loc, "'oversized' size");
+        if (!(kb > 0)) throw new StationFailure(`${at(loc)}: 'oversized' size must be > 0 kB, got ${kb}`);
+        effect = { kind: 'oversized', bytes: Math.round(kb * 1024) };
+        break;
+      }
+    }
+    this.chaos.add({ match: this.chaosMatch(stmt), effect, once: stmt.once });
+  }
+
+  /** 1.6: the code must be a ChargePointErrorCode; 2.x: it becomes NotifyEvent's techCode (at most 50 characters). */
+  private checkFaultCode(station: Station, code: string | undefined, loc: Loc): void {
+    if (code === undefined) return;
+    if (station.version === 'ocpp1.6') {
+      if (!ERROR_CODES_16.includes(code)) {
+        throw new StationFailure(
+          `${at(loc)}: '${code}' is not an OCPP 1.6 error code (${ERROR_CODES_16.join(', ')}); default ${DEFAULT_FAULT_CODE}`,
+        );
+      }
+    } else if (code.length > MAX_TECH_CODE_LENGTH) {
+      throw new StationFailure(`${at(loc)}: fault code '${code}' is longer than ${MAX_TECH_CODE_LENGTH} characters`);
+    }
+  }
+
+  /** `meter backwards E` / `meter reset` on one EVSE or, without `evse`, on every EVSE. */
+  private meter(stmt: MeterStmt): void {
+    const station = this.ensureStation('meter');
+    let targets: EvseState[] = station.evses;
+    if (stmt.evse) {
+      const id = this.num(stmt.evse, stmt.loc, 'EVSE id', 1);
+      const evse = station.evse(id);
+      if (!evse) throw new StationFailure(`${at(stmt.loc)}: no EVSE ${id} (have 1..${station.evses.length})`);
+      targets = [evse];
+    }
+    if (stmt.op === 'reset') {
+      for (const evse of targets) meterReset(evse);
+      return;
+    }
+    const e = stmt.energy;
+    const wh = e.kind === 'energy' ? e.wh : this.num(e, stmt.loc, "'meter backwards' energy (Wh)");
+    if (!(wh >= 0)) throw new StationFailure(`${at(stmt.loc)}: 'meter backwards' energy must be >= 0 Wh, got ${wh}`);
+    for (const evse of targets) meterBackwards(evse, wh);
+  }
+
+  private addChaos(stmt: ChaosStmt, scope: DrawScope): void {
+    const match = this.chaosMatch(stmt);
     const effect: ChaosEffect =
       stmt.fault === 'delay'
         ? { kind: 'delay', ms: stmt.delay ? this.ms(stmt.delay, stmt.loc, "'chaos delay'", scope) : 0 }

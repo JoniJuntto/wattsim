@@ -85,4 +85,36 @@ describe('MeterModel', () => {
     expect(() => new MeterModel({ voltageV: 0 })).toThrow();
     expect(() => new MeterModel({ noise: -1 })).toThrow();
   });
+
+  test('negative power (V2X discharge) fills the export register; the import register never goes down', () => {
+    const m = new MeterModel();
+    const c = new VirtualClock(0);
+    m.tick(3_600_000, 11);
+    expect(m.sample(c).exportWh).toBeUndefined();
+    m.tick(1_800_000, -7);
+    expect(m.energy).toBeCloseTo(11_000, 9);
+    expect(m.exported).toBeCloseTo(3500, 9);
+    const s = m.sample(c);
+    expect(s.powerKw).toBe(-7);
+    expect(s.currentA).toBeCloseTo(-7000 / (3 * 230), 9);
+    expect(s.exportWh).toBeCloseTo(3500, 9);
+    m.tick(60_000, 5);
+    expect(m.sample(c).exportWh).toBeCloseTo(3500, 9); // stays once something was exported
+  });
+
+  test('phases in use change the derived current, not the energy, and show in the sample', () => {
+    const m = new MeterModel({ phases: 3 });
+    const c = new VirtualClock(0);
+    m.setActivePhases(1);
+    m.tick(3_600_000, 3.68);
+    const s = m.sample(c);
+    expect(s.currentA).toBeCloseTo(16, 9);
+    expect(s.phases).toBe(1);
+    expect(m.energy).toBeCloseTo(3680, 9);
+    m.setActivePhases(3);
+    expect(m.sample(c).phases).toBeUndefined();
+    const single = new MeterModel({ phases: 1 });
+    single.setActivePhases(3);
+    expect(single.phasesInUse).toBe(1);
+  });
 });

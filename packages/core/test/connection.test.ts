@@ -5,6 +5,7 @@ import {
   CallError,
   ChaosEngine,
   Connection,
+  lcg,
   QueueOverflowError,
   RequestTimeoutError,
   ViolationError,
@@ -583,6 +584,217 @@ describe('Connection: chaos', () => {
     await clock.advance(30_000);
     expect(await second).toBeInstanceOf(RequestTimeoutError);
     await expect(conn.request('Heartbeat', {})).resolves.toHaveProperty('currentTime');
+  });
+});
+
+describe('Connection: milestone-4 transport faults', () => {
+  test('jitter holds each frame for a seeded delay within the range', async () => {
+    const chaos = new ChaosEngine(lcg(9));
+    chaos.add({ match: { direction: 'out', action: 'Heartbeat' }, effect: { kind: 'jitter', minMs: 200, maxMs: 400 } });
+    const expected = new ChaosEngine(lcg(9));
+    expected.add({
+      match: { direction: 'out', action: 'Heartbeat' },
+      effect: { kind: 'jitter', minMs: 200, maxMs: 400 },
+    });
+    const ms = (expected.decide('out', { type: 2, id: 'x', action: 'Heartbeat', payload: {} }).effect as { ms: number })
+      .ms;
+    const conn = await connected({ chaos });
+    const p = conn.request('Heartbeat', {});
+    await Bun.sleep(20);
+    await clock.advance(ms - 1);
+    await Bun.sleep(20);
+    expect(csms.receivedFrom('CP1').length).toBe(0);
+    await clock.advance(1);
+    await expect(p).resolves.toHaveProperty('currentTime');
+  });
+
+  test('reorder out: a held CALLRESULT goes out after the next one', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ match: { direction: 'out', messageType: 'result', nth: 1 }, effect: { kind: 'reorder' } });
+    const conn = make({ chaos });
+    conn.on('call', (_c, reply) => reply({ status: 'Unlocked' }));
+    await openConn(conn);
+    await until(() => csms.isConnected('CP1'));
+    const first = csms.call('CP1', 'UnlockConnector', { connectorId: 1 });
+    await Bun.sleep(30);
+    expect(csms.receivedFrom('CP1').length).toBe(0);
+    const second = csms.call('CP1', 'UnlockConnector', { connectorId: 2 });
+    await Promise.all([first, second]);
+    const ids = csms.receivedFrom('CP1').map((f) => f.id);
+    expect(ids).toEqual(csms.sent.map((f) => f.id).reverse());
+  });
+
+  test('reorder in: a held reply is delivered after the next inbound frame', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ match: { direction: 'in', action: 'Heartbeat' }, effect: { kind: 'reorder', after: 1 } });
+    const conn = make({ chaos });
+    const order: string[] = [];
+    conn.on('call', (c, reply) => {
+      order.push(c.action);
+      reply({ status: 'Unlocked' });
+    });
+    await openConn(conn);
+    const hb = conn.request('Heartbeat', {}).then(() => order.push('Heartbeat result'));
+    await until(() => csms.callsFrom('CP1', 'Heartbeat').length === 1);
+    await Bun.sleep(30);
+    expect(order).toEqual([]);
+    await csms.call('CP1', 'UnlockConnector', { connectorId: 1 });
+    await hb;
+    expect(order).toEqual(['UnlockConnector', 'Heartbeat result']);
+  });
+
+  test('halfOpen: nothing is written or read, the socket stays open, disconnect leaves no timers', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ match: { direction: 'out', action: 'Heartbeat' }, effect: { kind: 'halfOpen' } });
+    const conn = make({ chaos });
+    let dispatched = 0;
+    conn.on('call', (_c, reply) => {
+      dispatched++;
+      reply({ status: 'Unlocked' });
+    });
+    await openConn(conn);
+    await until(() => csms.isConnected('CP1'));
+    const hb = outcome(conn.request('Heartbeat', {}));
+    const unlock = csms.call('CP1', 'UnlockConnector', { connectorId: 1 });
+    void unlock.catch(() => {});
+    await Bun.sleep(50);
+    expect(csms.receivedFrom('CP1')).toEqual([]);
+    expect(dispatched).toBe(0);
+    expect(csms.isConnected('CP1')).toBe(true);
+    expect(conn.state).toBe('Connected');
+    await clock.advance(30_000);
+    expect(await hb).toBeInstanceOf(RequestTimeoutError);
+    await conn.disconnect();
+    await until(() => !csms.isConnected('CP1'));
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  test('halfOpen with a duration: the station gives up, drops the socket and reconnects', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ match: { direction: 'out', action: 'Heartbeat' }, effect: { kind: 'halfOpen', ms: 5000 }, once: true });
+    const conn = make({ chaos });
+    const states: ConnectionState[] = [];
+    conn.on('state', (s) => states.push(s));
+    await openConn(conn);
+    const hb = conn.request('Heartbeat', {});
+    await Bun.sleep(30);
+    expect(csms.receivedFrom('CP1')).toEqual([]);
+    await clock.advance(4999);
+    expect(states).toEqual(['Connecting', 'Connected']);
+    await clock.advance(1);
+    expect(states).toEqual(['Connecting', 'Connected', 'Disconnected']);
+    await clock.advance(1000); // reconnect backoff
+    await until(() => conn.state === 'Connected');
+    // The CALL was requeued when the socket dropped and goes out on the new one.
+    await expect(hb).resolves.toHaveProperty('currentTime');
+  });
+
+  test('slowRead: the n-th inbound frame waits n steps', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ match: { direction: 'in' }, effect: { kind: 'slowRead', stepMs: 100 } });
+    const conn = await connected({ chaos });
+    for (const step of [100, 200, 300]) {
+      let done = false;
+      const p = conn.request('Heartbeat', {}).then(() => {
+        done = true;
+      });
+      await until(() => csms.callsFrom('CP1').length === step / 100);
+      await Bun.sleep(20);
+      await clock.advance(step - 1);
+      await Bun.sleep(10);
+      expect(done).toBe(false);
+      await clock.advance(1);
+      await p;
+    }
+  });
+
+  test('reconnectStorm: K drops in T, each followed by an immediate reconnect', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({
+      match: { direction: 'out', action: 'Heartbeat' },
+      effect: { kind: 'reconnectStorm', count: 3, windowMs: 3000 },
+      once: true,
+    });
+    const conn = make({ chaos });
+    let opened = 0;
+    conn.on('state', (s) => {
+      if (s === 'Connected') opened++;
+    });
+    await openConn(conn);
+    await expect(conn.request('Heartbeat', {})).resolves.toHaveProperty('currentTime');
+    expect(opened).toBe(1);
+    for (let i = 2; i <= 4; i++) {
+      await clock.advance(1000);
+      await until(() => opened === i);
+    }
+    await clock.advance(10_000);
+    await Bun.sleep(30);
+    expect(opened).toBe(4);
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  test('reconnectStorm: disconnect mid-storm cancels the drops still to come', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({
+      match: { direction: 'out' },
+      effect: { kind: 'reconnectStorm', count: 5, windowMs: 10_000 },
+      once: true,
+    });
+    const conn = await connected({ chaos });
+    await conn.request('Heartbeat', {});
+    await clock.advance(2000);
+    await until(() => conn.state === 'Connected');
+    await conn.disconnect();
+    expect(clock.pendingTimers()).toBe(0);
+  });
+
+  test('a delayed inbound frame is discarded when the socket closes', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ match: { direction: 'in' }, effect: { kind: 'delay', ms: 500 } });
+    const conn = await connected({ chaos });
+    const p = outcome(conn.request('Heartbeat', {}));
+    await until(() => csms.callsFrom('CP1').length === 1);
+    await Bun.sleep(20);
+    await conn.disconnect();
+    expect(clock.pendingTimers()).toBe(0);
+    void p;
+  });
+});
+
+describe('Connection: protocol faults', () => {
+  test('invalidEnum, missingField, timestamp and oversized reach the CSMS as mutated, with no violation', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ match: { action: 'StatusNotification', nth: 1 }, effect: { kind: 'invalidEnum' } });
+    chaos.add({ match: { action: 'StatusNotification', nth: 2 }, effect: { kind: 'missingField', path: 'status' } });
+    chaos.add({ match: { action: 'StatusNotification', nth: 3 }, effect: { kind: 'timestamp', shiftMs: -3_600_000 } });
+    chaos.add({ match: { action: 'StatusNotification', nth: 4 }, effect: { kind: 'oversized', bytes: 2048 } });
+    const conn = make({ chaos });
+    const violations: Violation[] = [];
+    const rules: string[] = [];
+    conn.on('violation', (v) => violations.push(v));
+    conn.on('chaos', (rule) => rules.push(rule.effect.kind));
+    await openConn(conn);
+    const status = { connectorId: 1, errorCode: 'NoError', status: 'Available', timestamp: '2026-01-01T01:00:00.000Z' };
+    for (let i = 0; i < 4; i++) await conn.request('StatusNotification', status);
+    const got = csms.callsFrom('CP1', 'StatusNotification').map((c) => c.payload as Record<string, unknown>);
+    expect(got[0]).toEqual({ ...status, errorCode: 'wattsim-invalid-enum' });
+    expect(got[1]).toEqual({ connectorId: 1, errorCode: 'NoError', timestamp: status.timestamp });
+    expect(got[2]).toEqual({ ...status, timestamp: '2026-01-01T00:00:00.000Z' });
+    expect(JSON.stringify(got[3]).length).toBe(2048);
+    expect(rules).toEqual(['invalidEnum', 'missingField', 'timestamp', 'oversized']);
+    expect(violations).toEqual([]);
+  });
+
+  test('a protocol fault on a CALLRESULT uses the response schema', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ match: { direction: 'out', action: 'UnlockConnector' }, effect: { kind: 'invalidEnum' } });
+    const conn = make({ chaos });
+    conn.on('call', (_c, reply) => reply({ status: 'Unlocked' }));
+    await openConn(conn);
+    await until(() => csms.isConnected('CP1'));
+    await expect(csms.call('CP1', 'UnlockConnector', { connectorId: 1 })).resolves.toEqual({
+      status: 'wattsim-invalid-enum',
+    });
   });
 });
 

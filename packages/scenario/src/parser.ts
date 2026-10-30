@@ -2,6 +2,9 @@ import type {
   AtStmt,
   ChaosDirection,
   ChaosFault,
+  ChaosFaultSpec,
+  ChaosFaultStmt,
+  ChaosFilters,
   ChaosStmt,
   ChaosTrigger,
   ChooseBranch,
@@ -12,6 +15,7 @@ import type {
   DurationLit,
   DurationUnit,
   DurExpr,
+  EnergyExpr,
   EvAction,
   ExpectFrame,
   ExpectStmt,
@@ -21,6 +25,7 @@ import type {
   JsonValue,
   LetDecl,
   Loc,
+  MeterStmt,
   NetStmt,
   NumExpr,
   OcppVersion,
@@ -48,7 +53,7 @@ const DURATION_UNITS: Record<string, [ms: number, unit: DurationUnit]> = {
 };
 const DISTRIBUTIONS: ReadonlySet<string> = new Set(['normal', 'uniform', 'exp']);
 /** Units that may follow an ev property number after a space (`battery 60 kWh`); attached ones may be any word. */
-const PROP_UNITS: ReadonlySet<string> = new Set(['kWh', 'Wh', 'kW', 'W', 'A', 'V']);
+const PROP_UNITS: ReadonlySet<string> = new Set(['kWh', 'Wh', 'kW', 'W', 'A', 'V', '°C']);
 const EXPECT_FRAMES: ReadonlySet<string> = new Set(['call', 'result', 'error']);
 const OCPP_VERSIONS: ReadonlySet<string> = new Set(['1.6', '2.0.1', '2.1']);
 /** `clock set` needs an explicit zone so a run means the same instant everywhere. */
@@ -63,7 +68,24 @@ const CHAOS_FAULTS: ReadonlySet<string> = new Set([
   'callError',
   'noResponse',
 ]);
+/** Chaos faults added in milestone 4: they parse to `ChaosFaultStmt`. */
+export const CHAOS_FAULTS_M4: readonly string[] = [
+  'jitter',
+  'reorder',
+  'halfOpen',
+  'slowRead',
+  'reconnectStorm',
+  'invalidEnum',
+  'missingField',
+  'timestamp',
+  'oversized',
+];
+const CHAOS_FAULTS_NEW: ReadonlySet<string> = new Set(CHAOS_FAULTS_M4);
+/** Protocol faults mutate what the station sends; `slowRead` delays what it reads. */
+const CHAOS_OUT_ONLY: ReadonlySet<string> = new Set(['invalidEnum', 'missingField', 'timestamp', 'oversized']);
+const CHAOS_ALL_FAULTS = [...CHAOS_FAULTS, ...CHAOS_FAULTS_M4];
 const CHAOS_TAIL_WORDS: ReadonlySet<string> = new Set(['nth', 'every', 'from', 'probability', 'once']);
+const ENERGY_UNITS: Record<string, [wh: number, unit: 'Wh' | 'kWh']> = { Wh: [1, 'Wh'], kWh: [1000, 'kWh'] };
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** What a quirk block may hold: statements that describe behaviour. Everything else acts on the session. */
 const QUIRK_STMTS: ReadonlySet<string> = new Set([
@@ -76,6 +98,7 @@ const QUIRK_STMTS: ReadonlySet<string> = new Set([
   'connectors',
   'auth',
   'chaos',
+  'chaosFault',
   'on',
   'clock',
   'log',
@@ -729,6 +752,27 @@ class Parser {
         return this.parseOn(loc);
       case 'chaos':
         return this.parseChaos(loc);
+      case 'bootLoop': {
+        this.advance();
+        return { kind: 'bootLoop', count: this.parseNum("count after 'bootLoop'", { int: true }), loc };
+      }
+      case 'fault': {
+        this.advance();
+        this.expectWord('evse', "after 'fault'");
+        const node: Stmt = { kind: 'fault', evse: this.parseNum('EVSE id', { int: true }), loc };
+        if (Parser.isWord(this.peek())) node.code = this.advance().value;
+        return node;
+      }
+      case 'meter':
+        return this.parseMeter(loc);
+      case 'reset': {
+        this.advance();
+        const mode = this.peek();
+        if (!this.atWord('hard') && !this.atWord('soft')) {
+          this.fail(`expected 'hard' or 'soft' after 'reset', got ${Parser.describe(mode)}`);
+        }
+        return { kind: 'reset', mode: this.advance().value as 'hard' | 'soft', loc };
+      }
       case 'clock':
         return this.parseClock(loc);
       case 'call': {
@@ -810,20 +854,31 @@ class Parser {
       this.advance();
       return { kind: 'ref', name: t.value, loc };
     }
-    if (t.type === 'int' || t.type === 'number') {
-      this.advance();
-      const value: PropValue = { kind: 'number', value: Number(t.value), loc };
-      const u = this.peek();
-      if (u.type === 'punct' && u.value === '%' && u.line === t.line) {
-        this.advance();
-        value.unit = '%';
-      } else if (Parser.isWord(u) && u.line === t.line && this.isPropUnit(u, t)) {
-        this.advance();
-        value.unit = u.value;
-      }
-      return value;
+    let sign = 1;
+    if (this.atPunct('-') || this.atPunct('+')) {
+      const n = this.peek(1);
+      if (n.type !== 'int' && n.type !== 'number')
+        this.fail(`expected number after '${t.value}' for property '${name}'`, n);
+      sign = this.advance().value === '-' ? -1 : 1;
+      return this.propNumber(this.peek(), loc, sign);
     }
+    if (t.type === 'int' || t.type === 'number') return this.propNumber(t, loc, 1);
     return this.fail(`expected number or string for property '${name}', got ${Parser.describe(t)}`);
+  }
+
+  /** A property number (the current token `t`, after any sign) and its optional unit. */
+  private propNumber(t: Token, loc: Loc, sign: number): PropValue {
+    this.advance();
+    const value: PropValue = { kind: 'number', value: sign * Number(t.value), loc };
+    const u = this.peek();
+    if (u.type === 'punct' && u.value === '%' && u.line === t.line) {
+      this.advance();
+      value.unit = '%';
+    } else if (Parser.isWord(u) && u.line === t.line && this.isPropUnit(u, t)) {
+      this.advance();
+      value.unit = u.value;
+    }
+    return value;
   }
 
   /**
@@ -861,7 +916,12 @@ class Parser {
     const op = this.peek();
     if (this.atWord('drop')) {
       this.advance();
-      return { kind: 'net', op: 'drop', duration: this.parseDur("after 'net drop'"), loc };
+      const node: NetStmt = { kind: 'net', op: 'drop', duration: this.parseDur("after 'net drop'"), loc };
+      if (this.atWord('duplicate')) {
+        this.advance();
+        node.duplicate = true;
+      }
+      return node;
     }
     if (!this.atWord('delay')) this.fail(`unknown net operation ${Parser.describe(op)}, expected 'drop' or 'delay'`);
     this.advance();
@@ -961,29 +1021,182 @@ class Parser {
     return withEnd<ChooseStmt>({ kind: 'choose', branches, loc }, end);
   }
 
-  private parseChaos(loc: Loc): ChaosStmt {
+  private parseChaos(loc: Loc): ChaosStmt | ChaosFaultStmt {
     this.advance();
     const faultTok = this.peek();
+    if (Parser.isWord(faultTok) && CHAOS_FAULTS_NEW.has(faultTok.value)) return this.parseChaosFault(loc);
     if (!Parser.isWord(faultTok) || !CHAOS_FAULTS.has(faultTok.value)) {
       this.fail(
-        `unknown chaos fault ${Parser.describe(faultTok)}, expected drop, delay, duplicate, corrupt, wrongId, callError or noResponse`,
+        `unknown chaos fault ${Parser.describe(faultTok)}, expected ${CHAOS_ALL_FAULTS.slice(0, -1).join(', ')} or ${CHAOS_ALL_FAULTS.at(-1)}`,
       );
     }
     this.advance();
     const node: ChaosStmt = { kind: 'chaos', fault: faultTok.value as ChaosFault, once: false, loc };
     if (node.fault === 'delay') node.delay = this.parseDur("after 'chaos delay'");
+    this.parseChaosFilters(node);
+    return node;
+  }
+
+  /** `[in|out] [ACTION]` and the trigger tail of a chaos rule. */
+  private parseChaosFilters(node: ChaosFilters): void {
     if (this.atWord('in') || this.atWord('out')) node.direction = this.advance().value as ChaosDirection;
     const t = this.peek();
     if (Parser.isWord(t) && !CHAOS_TAIL_WORDS.has(t.value)) node.action = this.advance().value;
     this.parseChaosTail(node);
+  }
+
+  /** A milestone-4 chaos fault: its arguments, then the usual filters. */
+  private parseChaosFault(loc: Loc): ChaosFaultStmt {
+    const tok = this.advance();
+    const what = `after 'chaos ${tok.value}'`;
+    let fault: ChaosFaultSpec;
+    switch (tok.value) {
+      case 'jitter': {
+        const min = this.parseDur(what);
+        this.expectPunct('..', "between the jitter bounds, as in 'jitter 100ms..2s'");
+        const max = this.parseDur("after 'jitter MIN..'");
+        if (min.kind === 'duration' && max.kind === 'duration' && max.ms < min.ms) {
+          this.fail(`jitter MIN..MAX needs MAX >= MIN, got ${min.ms}ms..${max.ms}ms`, min.loc);
+        }
+        fault = { kind: 'jitter', min, max };
+        break;
+      }
+      case 'reorder':
+        fault = { kind: 'reorder' };
+        if (this.atWord('after')) {
+          this.advance();
+          fault.after = this.parseNum("count after 'reorder after'", { int: true });
+        }
+        break;
+      case 'halfOpen':
+        fault = { kind: 'halfOpen' };
+        if (this.atWord('for')) {
+          this.advance();
+          fault.for = this.parseDur("after 'halfOpen for'");
+        }
+        break;
+      case 'slowRead':
+        fault = { kind: 'slowRead', step: this.parseDur(what) };
+        break;
+      case 'reconnectStorm': {
+        const count = this.parseNum(`count ${what}`, { int: true });
+        this.expectWord('within', "after the reconnectStorm count, as in 'reconnectStorm 5 within 1min'");
+        fault = { kind: 'reconnectStorm', count, within: this.parseDur("after 'within'") };
+        break;
+      }
+      case 'invalidEnum':
+      case 'missingField': {
+        const mutation: Extract<ChaosFaultSpec, { path?: string }> = { kind: tok.value };
+        const path = this.parsePayloadPath();
+        if (path !== undefined) mutation.path = path;
+        fault = mutation;
+        break;
+      }
+      case 'timestamp':
+        fault = { kind: 'timestamp', shift: this.parseDur(what, true) };
+        break;
+      default: {
+        const kb = this.parseNum(`size in kB ${what}`);
+        if (kb.kind === 'number') {
+          const unit = this.peek();
+          if (!this.atWord('kB') || unit.line !== kb.loc.line) {
+            this.fail(`expected 'kB' after the oversized size, as in 'oversized 64kB', got ${Parser.describe(unit)}`);
+          }
+          this.advance();
+        } else if (this.atWord('kB')) {
+          this.advance();
+        }
+        fault = { kind: 'oversized', kb };
+      }
+    }
+    const node: ChaosFaultStmt = { kind: 'chaosFault', fault, once: false, loc };
+    const dirTok = this.peek();
+    this.parseChaosFilters(node);
+    if (node.direction === 'in' && CHAOS_OUT_ONLY.has(tok.value)) {
+      this.fail(`'${tok.value}' mutates payloads the station sends: use 'out' or no direction`, dirTok);
+    }
+    if (node.direction === 'out' && tok.value === 'slowRead') {
+      this.fail("'slowRead' delays frames the station reads: use 'in' or no direction", dirTok);
+    }
     return node;
+  }
+
+  /**
+   * An optional payload path for `invalidEnum` / `missingField`: `idTag`, `idTagInfo.status`, `meterValue.0.timestamp`.
+   * It starts with a lower-case letter (payload keys do; actions start upper-case) and is written without spaces.
+   */
+  private parsePayloadPath(): string | undefined {
+    const first = this.peek();
+    const isPathStart =
+      Parser.isWord(first) &&
+      /^[a-z]/.test(first.value) &&
+      first.value !== 'in' &&
+      first.value !== 'out' &&
+      !CHAOS_TAIL_WORDS.has(first.value);
+    if (!isPathStart) return undefined;
+    this.advance();
+    const parts = [first.value];
+    let prev = first;
+    const adjacent = (a: Token, b: Token) => b.line === a.line && b.col === a.col + a.value.length;
+    for (;;) {
+      const dot = this.peek();
+      const seg = this.peek(1);
+      if (!(dot.type === 'punct' && dot.value === '.' && adjacent(prev, dot) && adjacent(dot, seg))) break;
+      if (!Parser.isWord(seg) && seg.type !== 'int' && seg.type !== 'number') break;
+      this.advance();
+      this.advance();
+      // `a.0.1` lexes `0.1` as one number: both are array positions.
+      parts.push(...seg.value.split('.'));
+      prev = seg;
+    }
+    return parts.join('.');
+  }
+
+  /** `meter backwards ENERGY [evse N]` or `meter reset [evse N]`. */
+  private parseMeter(loc: Loc): MeterStmt {
+    this.advance();
+    const op = this.peek();
+    let node: MeterStmt;
+    if (this.atWord('backwards')) {
+      this.advance();
+      node = { kind: 'meter', op: 'backwards', energy: this.parseEnergy("after 'meter backwards'"), loc };
+    } else if (this.atWord('reset')) {
+      this.advance();
+      node = { kind: 'meter', op: 'reset', loc };
+    } else {
+      return this.fail(`unknown meter operation ${Parser.describe(op)}, expected 'backwards' or 'reset'`);
+    }
+    if (this.atWord('evse')) {
+      this.advance();
+      node.evse = this.parseNum('EVSE id', { int: true });
+    }
+    return node;
+  }
+
+  /** `500Wh`, `2 kWh` or a variable holding Wh. */
+  private parseEnergy(what: string): EnergyExpr {
+    const t = this.peek();
+    const loc = Parser.loc(t);
+    if (Parser.isWord(t)) {
+      this.advance();
+      return { kind: 'ref', name: t.value, loc };
+    }
+    if (t.type !== 'int' && t.type !== 'number') this.fail(`expected energy ${what}, got ${Parser.describe(t)}`);
+    this.advance();
+    const unit = this.peek();
+    const known = Parser.isWord(unit) && unit.line === t.line ? ENERGY_UNITS[unit.value] : undefined;
+    if (!known) this.fail(`expected energy unit (Wh or kWh) after '${t.value}'`, unit.type === 'eof' ? t : unit);
+    this.advance();
+    const exact = Number(t.value) * known[0];
+    const wh = Math.round(exact * 1000) / 1000;
+    return { kind: 'energy', wh, unit: known[1], loc };
   }
 
   /**
    * `nth N` | `every N [from M]`, `probability P%` and `once`, each at most once and in any order (the formatter
    * puts them in that order). `nth` and `every` exclude each other; `from` belongs to `every`.
    */
-  private parseChaosTail(node: ChaosStmt): void {
+  private parseChaosTail(node: ChaosFilters): void {
     const seen = new Map<string, Loc>();
     for (;;) {
       const t = this.peek();

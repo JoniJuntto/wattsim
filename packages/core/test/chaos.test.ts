@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { CallFrame, CallResultFrame } from '@wattsim/protocol';
-import { ChaosEngine, lcg } from '../src/index';
+import { ChaosEngine, isFault, lcg } from '../src/index';
 
 function call(action: string, id = 'm1'): CallFrame {
   return { type: 2, id, action, payload: {} };
@@ -175,6 +175,88 @@ describe('ChaosEngine', () => {
     expect(engine.decide('in', call('Heartbeat')).effect).toBeNull();
     expect(engine.decide('out', call('Heartbeat')).effect).toEqual({ kind: 'drop' });
     expect(engine.decide('in', call('Heartbeat')).effect).toEqual({ kind: 'drop' });
+  });
+});
+
+describe('ChaosEngine: milestone-4 faults', () => {
+  test('jitter draws a delay in its range from the seeded RNG, the same for the same seed', () => {
+    const draws = (seed: number) => {
+      const engine = new ChaosEngine(lcg(seed));
+      engine.add({ match: { direction: 'out' }, effect: { kind: 'jitter', minMs: 100, maxMs: 500 } });
+      return Array.from({ length: 20 }, () => engine.decide('out', call('Heartbeat')).effect);
+    };
+    const a = draws(3);
+    expect(draws(3)).toEqual(a);
+    expect(draws(4)).not.toEqual(a);
+    for (const e of a) {
+      expect(e?.kind).toBe('delay');
+      const ms = (e as { ms: number }).ms;
+      expect(ms).toBeGreaterThanOrEqual(100);
+      expect(ms).toBeLessThanOrEqual(500);
+      expect(Number.isInteger(ms)).toBe(true);
+    }
+    expect(new Set(a.map((e) => (e as { ms: number }).ms)).size).toBeGreaterThan(5);
+  });
+
+  test('slowRead delays the n-th inbound frame it matches by n steps and ignores outbound frames', () => {
+    const engine = new ChaosEngine();
+    engine.add({ match: {}, effect: { kind: 'slowRead', stepMs: 100 } });
+    expect(engine.decide('in', result()).effect).toEqual({ kind: 'delay', ms: 100 });
+    expect(engine.decide('out', call('Heartbeat')).effect).toBeNull();
+    expect(engine.decide('in', result()).effect).toEqual({ kind: 'delay', ms: 200 });
+    expect(engine.decide('in', call('Reset')).effect).toEqual({ kind: 'delay', ms: 300 });
+  });
+
+  test('protocol faults match outbound frames only, even without a direction', () => {
+    const engine = new ChaosEngine();
+    engine.add({ match: { action: 'Heartbeat' }, effect: { kind: 'missingField' }, once: true });
+    expect(engine.decide('in', call('Heartbeat')).fault).toBeUndefined();
+    const d = engine.decide('out', call('Heartbeat'));
+    expect(d.effect).toBeNull();
+    expect(d.fault).toEqual({ kind: 'missingField' });
+    expect(engine.size).toBe(0); // the inbound frame did not spend `once`
+  });
+
+  test('a non-delay fault is reported in `fault` and composes with a delay declared before it', () => {
+    const engine = new ChaosEngine(lcg(1));
+    engine.add({ id: 'net', match: {}, effect: { kind: 'jitter', minMs: 10, maxMs: 10 } });
+    engine.add({ id: 'r', match: { direction: 'in' }, effect: { kind: 'reorder', after: 2 } });
+    const d = engine.decide('in', result());
+    expect(d.effect).toBeNull();
+    expect(d.fault).toEqual({ kind: 'reorder', after: 2 });
+    expect(d.rule?.id).toBe('r');
+    expect(d.delayed).toEqual({ ms: 10, rule: expect.objectContaining({ id: 'net' }) });
+    // First match among the other faults: an older rule wins over a newer one.
+    engine.add({ id: 'drop', match: { direction: 'in' }, effect: { kind: 'drop' } });
+    expect(engine.decide('in', result()).rule?.id).toBe('r');
+  });
+
+  test('a delay-class rule takes the delay slot: a later delay rule does not apply', () => {
+    const engine = new ChaosEngine();
+    engine.add({ id: 'slow', match: {}, effect: { kind: 'slowRead', stepMs: 50 } });
+    engine.add({ id: 'delay', match: {}, effect: { kind: 'delay', ms: 1000 } });
+    expect(engine.decide('in', result())).toEqual({
+      effect: { kind: 'delay', ms: 50 },
+      rule: expect.objectContaining({ id: 'slow' }),
+    });
+    expect(engine.decide('out', call('Heartbeat')).rule?.id).toBe('delay');
+  });
+
+  test('messageType selects CALLs, results or errors', () => {
+    const engine = new ChaosEngine();
+    engine.add({ match: { messageType: 'result' }, effect: { kind: 'drop' } });
+    expect(engine.decide('out', call('Heartbeat')).effect).toBeNull();
+    expect(engine.decide('out', result()).effect).toEqual({ kind: 'drop' });
+    expect(
+      engine.decide('out', { type: 4, id: 'e', code: 'InternalError', description: '', details: {} }).effect,
+    ).toBeNull();
+  });
+
+  test('isFault tells milestone-4 faults from the original effects', () => {
+    expect(isFault({ kind: 'drop' })).toBe(false);
+    expect(isFault({ kind: 'mutate', fn: (p) => p })).toBe(false);
+    expect(isFault({ kind: 'halfOpen' })).toBe(true);
+    expect(isFault({ kind: 'oversized', bytes: 10 })).toBe(true);
   });
 });
 

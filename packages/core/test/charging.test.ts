@@ -44,6 +44,63 @@ function prof(over: Partial<ChargingProfile> & Pick<ChargingProfile, 'id' | 'pur
   };
 }
 
+describe('ProfileStore: per-phase limits and 2.1 V2X values', () => {
+  test('limitDetail keeps the A limit per phase and the numberPhases of the binding period', () => {
+    const store = new ProfileStore(env());
+    store.set(
+      prof({
+        id: 1,
+        purpose: 'TxDefaultProfile',
+        unit: 'A',
+        periods: [{ startPeriod: 0, limit: 16, numberPhases: 1 }],
+      }),
+    );
+    expect(store.limitDetail(1, T0)).toEqual({ kw: 3.68, phases: 1, amps: 16 });
+    store.clear({ id: 1 });
+    store.set(prof({ id: 2, purpose: 'TxDefaultProfile', periods: [{ startPeriod: 0, limit: 7000 }] }));
+    expect(store.limitDetail(1, T0)).toEqual({ kw: 7, phases: undefined });
+  });
+
+  test('v2xAt: the transaction profile sets the setpoint; the discharge limit closest to zero wins', () => {
+    const e = env();
+    const store = new ProfileStore(e);
+    expect(store.hasV2x).toBe(false);
+    expect(store.v2xAt(1, T0)).toEqual({});
+    store.set(
+      prof({
+        id: 1,
+        purpose: 'TxDefaultProfile',
+        periods: [
+          { startPeriod: 0, setpoint: -9000, dischargeLimit: -11_000 },
+          { startPeriod: 600, limit: 11_000 },
+        ],
+      }),
+    );
+    store.set(
+      prof({
+        id: 2,
+        evseId: 0,
+        purpose: 'ChargingStationMaxProfile',
+        periods: [{ startPeriod: 0, limit: 22_000, dischargeLimit: -8000 }],
+      }),
+    );
+    expect(store.hasV2x).toBe(true);
+    // The station-level discharge cap is shared like a limit: one EVSE asking (2 EVSEs, none charging) gets all of it.
+    expect(store.v2xAt(1, T0)).toEqual({
+      setpoint: { kw: -9, phases: undefined },
+      dischargeLimit: { kw: -8, phases: undefined },
+    });
+    e.tx.set(1, T0);
+    e.tx.set(2, T0);
+    expect(store.v2xAt(1, T0).dischargeLimit?.kw).toBe(-4);
+    expect(store.v2xAt(1, T0 + 600_000).setpoint).toBeUndefined();
+    expect(store.nextChange(T0)).toBe(T0 + 600_000);
+    store.clear({ id: 1 });
+    store.clear({ id: 2 });
+    expect(store.hasV2x).toBe(false);
+  });
+});
+
 describe('ProfileStore: composite limit', () => {
   test('within one purpose the highest stackLevel valid at t wins', () => {
     const e = env();

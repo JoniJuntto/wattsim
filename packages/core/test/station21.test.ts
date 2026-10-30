@@ -228,7 +228,7 @@ describe('Station 2.1: transactions', () => {
 
   test('a 2.1-only action the station does not implement gets CALLERROR NotImplemented', async () => {
     await booted();
-    await expect(call('GetTariffs', { evseId: 1 })).rejects.toThrow(/NotImplemented/);
+    await expect(call('GetDERControl', { requestId: 1 })).rejects.toThrow(/NotImplemented/);
     expect(wireViolations()).toEqual([]);
   });
 });
