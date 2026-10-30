@@ -237,6 +237,32 @@ station "CP-{i}" for i in 2..3 {
     expect(logs).toContain('done FLEET 2 1');
   });
 
+  test('an expect after `call` sees frames produced by the proc body, from the call statement onwards', async () => {
+    const src = `${header}
+proc charge {
+  ev plug evse 1
+  start evse 1 tag "TAG-1"
+  wait 1min
+  stop evse 1
+  ev unplug evse 1
+}
+
+station "CP-1" {
+  version 1.6
+  boot
+  call charge
+  expect StopTransaction within 10s
+  expect StatusNotification {status: "Available"} within 5s
+}
+`;
+    const { result } = await runVirtual(src);
+    expect(result.stations[0]?.asserts.map((a) => [a.ok, a.message ?? ''])).toEqual([
+      [true, ''],
+      [true, ''],
+    ]);
+    expect(result.ok).toBe(true);
+  });
+
   test('unknown proc and unknown variable fail the station', async () => {
     const a = await runVirtual(station('CP-1', '  version 1.6\n  call nope'));
     expect(a.result.stations[0]?.error).toMatch(/proc 'nope'/);

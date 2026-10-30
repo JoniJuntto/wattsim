@@ -146,7 +146,7 @@ ev unplug evse 1
 | Action | Effect |
 |---|---|
 | `plug` | Cable inserted (state B). Optional property block configures the EV model. |
-| `ready` | EV requests energy (state C). |
+| `ready` | EV explicitly requests energy (state C). Optional: `start` readies a plugged EV automatically; use `ev suspend` for an EV that refuses energy. |
 | `suspend` | EV pauses itself (SuspendedEV). |
 | `resume` | EV asks for energy again. |
 | `unplug` | Cable removed (state A). |

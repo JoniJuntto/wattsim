@@ -174,12 +174,26 @@ describe('Station 1.6: EV and transaction flow', () => {
     expect(order.indexOf('StartTransaction')).toBeLessThan(order.lastIndexOf('StatusNotification'));
   });
 
-  test('start without a ready EV is SuspendedEV; evReady moves to Charging', async () => {
+  test('start readies a plugged EV automatically: Charging without evReady, and 1 h draws about 22 kWh', async () => {
+    const station = await booted();
+    await station.plugIn(1, { batteryKwh: 100 });
+    await station.startTransaction(1, 'TAG-1');
+    expect(station.evse(1)?.ev?.state).toBe('Charging');
+    expect(station.evse(1)?.status).toBe('Charging');
+    await advanceSettled(station, HOUR);
+    await station.stopTransaction(1);
+    const stop = payload<v16.StopTransactionRequest>(calls('StopTransaction')[0]);
+    expect(Math.abs(stop.meterStop - 22_000) / 22_000).toBeLessThan(0.02);
+  });
+
+  test('start leaves a suspended EV in SuspendedEV; resumeEv moves to Charging', async () => {
     const station = await booted();
     await station.plugIn(1);
+    await station.evReady(1);
+    await station.suspendEv(1);
     await station.startTransaction(1);
     expect(station.evse(1)?.status).toBe('SuspendedEV');
-    await station.evReady(1);
+    await station.resumeEv(1);
     expect(station.evse(1)?.status).toBe('Charging');
   });
 
@@ -478,7 +492,7 @@ describe('Station 1.6: inbound CALLs', () => {
     expect(await call('ChangeAvailability', { connectorId: 0, type: 'Inoperative' })).toEqual({
       status: 'Scheduled',
     });
-    expect(station.evse(1)?.status).toBe('SuspendedEV');
+    expect(station.evse(1)?.status).toBe('Charging');
     await station.stopTransaction(1);
     expect(station.evse(1)?.status).toBe('Unavailable'); // the scheduled change applies even with the EV plugged in
     await station.unplug(1);

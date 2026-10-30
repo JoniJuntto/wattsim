@@ -10,8 +10,11 @@
  *   a matching value, arrays match by length and element-wise, primitives by `===`.
  * - "Next frame" means: the first matching frame observed since the start of the statement that precedes the
  *   `expect` in the same block (so frames a statement emits after it has resolved still count), or any later
- *   frame. Consecutive `expect`s each match a frame after the one matched by the previous `expect`. Each `at`
- *   branch has its own cursor. The default timeout without `within` is `DEFAULT_EXPECT_TIMEOUT_MS` (30 s).
+ *   frame. Consecutive `expect`s each match a frame after the one matched by the previous `expect`. A compound
+ *   statement (`call`, `repeat`, `choose`) counts as one statement: an `expect` after `call charge` matches from
+ *   the start of the `call`, so frames the proc's last statements produced are seen; inside the body the
+ *   `expect`s advance their own cursor. Each `at` branch has its own cursor, starting when the branch fires.
+ *   The default timeout without `within` is `DEFAULT_EXPECT_TIMEOUT_MS` (30 s).
  * - `choose` draws from an LCG seeded with FNV-1a(instance name) XOR `opts.seed ?? 0`. The station's
  *   `ChaosEngine` (for `probability` rules) uses the same seed salted, so chaos draws never shift choices.
  * - `at +d { }` branches are awaited before the station counts as finished; a failure inside one fails the
@@ -632,6 +635,15 @@ class InstanceRunner {
     }
   }
 
+  /**
+   * Cursor for the body of a compound statement (`call`, `repeat`, `choose`). It starts where the compound
+   * statement starts and advances with the body's own statements, while the enclosing cursor stays at the
+   * compound statement's start: for a following `expect` the compound statement is a single statement.
+   */
+  private nested(branch: Branch): Branch {
+    return { cursor: branch.cursor };
+  }
+
   private async exec(stmt: Stmt, branch: Branch, blockStart: number): Promise<void> {
     const vars = this.inst.vars;
     switch (stmt.kind) {
@@ -743,7 +755,7 @@ class InstanceRunner {
         return;
       }
       case 'repeat':
-        for (let i = 0; i < stmt.count; i++) await this.runBlock(stmt.body, branch);
+        for (let i = 0; i < stmt.count; i++) await this.runBlock(stmt.body, this.nested(branch));
         return;
       case 'choose': {
         const draw = this.rng() * 100;
@@ -756,7 +768,7 @@ class InstanceRunner {
             break;
           }
         }
-        if (chosen) await this.runBlock(chosen.body, branch);
+        if (chosen) await this.runBlock(chosen.body, this.nested(branch));
         return;
       }
       case 'net':
@@ -774,7 +786,7 @@ class InstanceRunner {
         if (this.callDepth > 32) throw new StationFailure(`proc '${stmt.proc}' recurses too deeply`);
         this.callDepth++;
         try {
-          await this.runBlock(body, branch);
+          await this.runBlock(body, this.nested(branch));
         } finally {
           this.callDepth--;
         }

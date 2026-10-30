@@ -545,6 +545,10 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     evse.tx = tx;
     evse.idTag = tx.idTag;
     if (opts.limitKw !== undefined) this.applyLimit(evse, opts.limitKw, 'TxProfile');
+    // A plugged EV (IEC 61851 state B) requests energy as soon as the EVSE offers it, so the transaction starts
+    // Charging and draws power without an explicit `evReady`. A scenario that wants an EV that refuses energy
+    // suspends it (`ev suspend`) before `start`; that EV stays SuspendedEV.
+    if (evse.ev?.state === 'Plugged') evse.ev.ready();
     // Close the contactor first so the start message carries the real charging state, then send it, then the
     // StatusNotification: the wire order is StartTransaction -> StatusNotification(Charging).
     const prev = evse.status;

@@ -14,9 +14,8 @@ station "CP-SMART" {
   start evse 1 tag "TAG-SMART"
   expect TransactionEvent {eventType: "Started"} within 5s
   wait 2min
-  log "SetChargingProfile comes from the CSMS; the station only applies the limit and reports it"
-  expect SetChargingProfile {evseId: 1} within 10min
-  expect TransactionEvent {eventType: "Updated"} within 5min
+  log "A SetChargingProfile comes from the CSMS, not the station: the station applies the limit and reports it in the next Updated event"
+  expect TransactionEvent {eventType: "Updated"} within 3min
   wait 30min
   stop evse 1
   expect TransactionEvent {eventType: "Ended"} within 5s

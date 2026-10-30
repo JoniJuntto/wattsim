@@ -241,21 +241,19 @@ describe('Station 2.0.1: transactions', () => {
     const station = await booted();
     await station.plugIn(1);
     await station.startTransaction(1);
-    expect(txEvents()[0]?.transactionInfo.chargingState).toBe('SuspendedEV');
-    await station.evReady(1);
+    // `start` readies a plugged EV, so the Started event already reports Charging.
+    expect(txEvents()[0]?.transactionInfo.chargingState).toBe('Charging');
+    await station.suspendEv(1);
     await until(() => txEvents().length === 2);
     expect(txEvents()[1]).toMatchObject({
       eventType: 'Updated',
       seqNo: 1,
       triggerReason: 'ChargingStateChanged',
-      transactionInfo: { chargingState: 'Charging' },
+      transactionInfo: { chargingState: 'SuspendedEV' },
     });
-    await station.suspendEv(1);
-    await until(() => txEvents().length === 3);
-    expect(txEvents()[2]?.transactionInfo.chargingState).toBe('SuspendedEV');
     await station.resumeEv(1);
-    await until(() => txEvents().length === 4);
-    expect(txEvents()[3]?.transactionInfo.chargingState).toBe('Charging');
+    await until(() => txEvents().length === 3);
+    expect(txEvents()[2]?.transactionInfo.chargingState).toBe('Charging');
     expect(calls('StatusNotification').length).toBe(2);
   });
 
