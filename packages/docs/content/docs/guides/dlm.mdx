@@ -287,7 +287,7 @@ Your controller should treat that timeout as "this board is dead", not as "this 
 
 A local controller still needs a way to limit the chargers. If it is an OCPP local controller that the chargers connect to, give its OCPP endpoint as `--csms` as above, with `--controller none`.
 
-Meters in a `wattsim run` listen on 127.0.0.1 only, and `run` has no flag to change that. A controller in a container can share the host's network (`docker run --network host`). To serve the meters on another interface, start the site from TypeScript with `startSite({ ..., modbus: { host: '0.0.0.0', meters } })`. `bun packages/modbus/src/cli.ts serve --host 0.0.0.0` serves a meter with fixed values on any interface, which is enough to develop a driver before you test the control loop.
+Meters in a `wattsim run` listen on 127.0.0.1 by default. To let a controller on another machine (or in a container) read them, pass `--modbus-host 0.0.0.0`, or the address of one interface; the meters then accept connections from anyone who can reach that interface, so do this on a test network. `bun packages/modbus/src/cli.ts serve --host 0.0.0.0` serves a meter with fixed values, which is enough to develop a driver before you test the control loop.
 
 ## Watch it on the Site page
 

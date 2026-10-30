@@ -48,3 +48,12 @@ test('--controller needs a site', async () => {
   expect(r.code).toBe(2);
   expect(r.stderr).toContain('need a scenario with a site block');
 });
+
+test('--modbus-host binds the site meters to that interface, and is refused without a site', async () => {
+  const depot = join(repoRoot, 'examples/dlm-depot.ws');
+  const res = await cli('run', depot, '--virtual', '--modbus-host', '0.0.0.0');
+  expect(res.stdout + res.stderr).toContain('on modbus 0.0.0.0:');
+  const plain = join(repoRoot, 'packages/scenario/test/fixtures/basic.ws');
+  const bad = await cli('run', plain, '--virtual', '--modbus-host', '0.0.0.0');
+  expect(bad.code).toBe(2);
+});

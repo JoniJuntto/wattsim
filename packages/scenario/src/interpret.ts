@@ -188,6 +188,8 @@ export type RunOptions = {
   siteController?: 'reference' | 'none';
   /** The site's Modbus meters: on their ports (default), on free ports, or off (`SiteRunOptions.modbus`). */
   siteModbus?: 'on' | 'free' | 'off';
+  /** Interface the site's Modbus meters listen on (`wattsim run --modbus-host`); default 127.0.0.1. */
+  siteModbusHost?: string;
   /** Called with the site runtime once it started (before any station), for live views and `--site-report`. */
   onSite?: (site: SiteRun) => void;
   /**
@@ -667,6 +669,7 @@ class Run {
         ...(externalUrl !== undefined ? { externalUrl } : {}),
         ...(this.opts.siteController ? { controller: this.opts.siteController } : {}),
         ...(this.opts.siteModbus ? { modbus: this.opts.siteModbus } : {}),
+        ...(this.opts.siteModbusHost ? { modbusHost: this.opts.siteModbusHost } : {}),
         ...(this.wallClock && this.speed !== 1 ? { speed: this.speed } : {}),
         log: (message) => this.emit({ type: 'log', message, at: this.clock.now() }),
       });

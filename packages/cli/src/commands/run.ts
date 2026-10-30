@@ -213,6 +213,11 @@ export const run = defineCommand({
       type: 'string',
       description: 'Write the site time series, events, allocations and DLM score to this JSON file',
     },
+    'modbus-host': {
+      type: 'string',
+      description:
+        "Interface the site's Modbus meters listen on (default 127.0.0.1); 0.0.0.0 lets a DLM controller on another host read them",
+    },
     quirk: {
       type: 'string',
       description:
@@ -227,8 +232,11 @@ export const run = defineCommand({
     if (siteController !== undefined && siteController !== 'reference' && siteController !== 'none') {
       await badFlag(`invalid --controller: ${siteController} (expected reference or none)`);
     }
-    if ((siteController !== undefined || args['site-report'] !== undefined) && !scenario.site) {
-      await badFlag('--controller and --site-report need a scenario with a site block');
+    if (
+      (siteController !== undefined || args['site-report'] !== undefined || args['modbus-host'] !== undefined) &&
+      !scenario.site
+    ) {
+      await badFlag('--controller, --site-report and --modbus-host need a scenario with a site block');
     }
     const speed = await parseNumber('speed', args.speed, (n) => n > 0);
     const seed = await parseNumber('seed', args.seed, Number.isInteger);
@@ -282,6 +290,7 @@ export const run = defineCommand({
 
     let site: SiteRun | undefined;
     const opts: RunOptions = {
+      ...(args['modbus-host'] ? { siteModbusHost: args['modbus-host'] } : {}),
       ...(siteController ? { siteController: siteController as 'reference' | 'none' } : {}),
       onSite: (s) => {
         site = s;

@@ -13,9 +13,11 @@
  * - Site assertions in a station block check the run so far when they run; those in the site block check the whole
  *   run once it ended.
  */
+
 import { resolve } from 'node:path';
 import { type Clock, VirtualClock } from '@wattsim/core';
 import { type Csms, startCsms } from '@wattsim/csms';
+import type { CheckIssue } from '@wattsim/grid';
 import { type DlmScore, type ViolationKind, validateSite } from '@wattsim/grid';
 import { type SiteRuntime, startSite } from '@wattsim/site';
 import type { Loc, Scenario, SiteCheck, SiteExpectStmt, StationBlock, StrExpr, StringExpr } from './ast';
@@ -60,6 +62,8 @@ export type SiteRunOptions = {
    * of a site that pins a port can coexist), `off` serves none (e.g. runs started from the UI).
    */
   modbus?: 'on' | 'free' | 'off';
+  /** Interface the site's Modbus meters listen on (default 127.0.0.1); 0.0.0.0 lets a controller on another host read them. */
+  modbusHost?: string;
   log: (message: string) => void;
 };
 
@@ -180,7 +184,13 @@ export class SiteRun {
             }
           : null,
       ...(setup.modbus.length > 0 && opts.modbus !== 'off'
-        ? { modbus: { meters: setup.modbus, ...(opts.modbus === 'free' ? { freePorts: true } : {}) } }
+        ? {
+            modbus: {
+              meters: setup.modbus,
+              ...(opts.modbus === 'free' ? { freePorts: true } : {}),
+              ...(opts.modbusHost ? { host: opts.modbusHost } : {}),
+            },
+          }
         : {}),
       seriesMs: opts.seriesMs ?? scaled(10_000, opts.speed),
       loadStepMs: opts.loadStepMs ?? scaled(10_000, opts.speed),
@@ -195,7 +205,7 @@ export class SiteRun {
     runtime.on('reclose', (e) => opts.log(`site: ${e.nodeId} reclosed${e.auto ? ' (automatic)' : ''}`));
     for (const m of runtime.modbus)
       opts.log(`site: meter ${m.meterId} (${m.map}) on modbus ${m.host}:${m.port} unit ${m.unitId}`);
-    for (const i of runtime.site.check()) opts.log(`site check: ${i.message}`);
+    for (const line of summariseChecks(runtime.site.check())) opts.log(`site check: ${line}`);
     const run = new SiteRun(setup as SiteSetup, runtime, csms, csmsUrl, controller, modelStartMs, modelTime);
     for (const [k, v] of byStation) run.byStation.set(k, v);
     return run;
@@ -299,4 +309,36 @@ export function describeCheck(c: SiteCheck, node?: string): string {
     case 'imbalance':
       return `site imbalance <= ${c.maxA}A`;
   }
+}
+
+/**
+ * One line per check issue, except that partial-selectivity findings with the same upstream device and selectivity
+ * limit collapse into one line naming the downstream devices: twenty chargers' breakers under one sub-board breaker
+ * are one finding, not twenty.
+ */
+export function summariseChecks(issues: readonly CheckIssue[]): string[] {
+  const out: string[] = [];
+  const groups = new Map<string, CheckIssue[]>();
+  for (const i of issues) {
+    if (i.kind !== 'selectivity') {
+      out.push(i.message);
+      continue;
+    }
+    const key = `${i.nodeId}|${i.currentA ?? ''}`;
+    const list = groups.get(key);
+    if (list) list.push(i);
+    else groups.set(key, [i]);
+  }
+  for (const list of groups.values()) {
+    const first = list[0] as CheckIssue;
+    const m = /^(".*?" \(.*?\)) over ".*?" \((.*?)\): (partial selectivity, Is [^ ]+ [^ ]+)/.exec(first.message);
+    if (list.length === 1 || !m) {
+      for (const i of list) out.push(i.message);
+      continue;
+    }
+    const names = list.map((i) => `"${i.relatedId}"`);
+    const shown = names.length > 4 ? `${names.slice(0, 3).join(', ')} and ${names.length - 3} more` : names.join(', ');
+    out.push(`${m[1]} over ${list.length} devices (${m[2]}: ${shown}): ${m[3]}`);
+  }
+  return out;
 }
