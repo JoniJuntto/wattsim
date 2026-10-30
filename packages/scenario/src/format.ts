@@ -10,6 +10,12 @@ import type {
   NumExpr,
   PropValue,
   Scenario,
+  SiteArg,
+  SiteBlock,
+  SiteCheck,
+  SiteItem,
+  SiteNode,
+  SiteValue,
   Stmt,
   StrExpr,
   StringExpr,
@@ -281,7 +287,135 @@ function formatStmtLines(s: Stmt, depth: number, pad: string): string[] {
       return line(`${s.kind} ${strExpr(s.message)}`);
     case 'use':
       return line(`use ${s.target} ${str(s.name)}`);
+    case 'site': {
+      const parts = ['site', str(s.site), 'at', strExpr(s.at)];
+      if (s.evse !== undefined) parts.push('evse', num(s.evse));
+      if (s.phases) parts.push('phases', s.phases);
+      if (s.maxA !== undefined) parts.push('max', `${num(s.maxA)}A`);
+      if (s.breaker) parts.push('breaker', s.breaker.curve, `${num(s.breaker.ratingA)}A`);
+      if (s.cable) {
+        parts.push('cable', `${num(s.cable.mm2)}mm2`);
+        if (s.cable.material) parts.push(s.cable.material);
+        parts.push(`${num(s.cable.lengthM)}m`);
+        if (s.cable.method) parts.push(s.cable.method);
+      }
+      return line(parts.join(' '));
+    }
+    case 'trip':
+      return line(`trip ${strExpr(s.node)}${s.phases ? ` phases ${s.phases.join(' ')}` : ''}`);
+    case 'reclose':
+      return line(`reclose ${strExpr(s.node)}`);
+    case 'load':
+      if (s.op === 'set') {
+        const scale = s.unit === 'kW' ? 1000 : s.unit === 'MW' ? 1_000_000 : 1;
+        return line(
+          `load ${strExpr(s.node)} set ${num(s.watts / scale)}${s.unit}${s.pf !== undefined ? ` pf ${num(s.pf)}` : ''}`,
+        );
+      }
+      if (s.op === 'profile') {
+        const tail = [s.interpolation, s.loop ? `loop ${s.loop}` : undefined].filter(Boolean).join(' ');
+        return line(`load ${strExpr(s.node)} profile ${str(s.file)}${tail ? ` ${tail}` : ''}`);
+      }
+      return line(`load ${strExpr(s.node)} ${s.op}`);
+    case 'controller':
+      return line(formatController(s));
+    case 'siteExpect':
+      return line(`expect ${formatCheck(s.check)}`);
   }
+}
+
+function formatController(s: Extract<Stmt, { kind: 'controller' }>): string {
+  const parts = ['controller', s.mode];
+  if (s.every) parts.push('every', formatDuration(s.every));
+  if (s.marginPct !== undefined) parts.push('margin', `${num(s.marginPct)}%`);
+  if (s.minA !== undefined) parts.push('min', `${num(s.minA)}A`);
+  return parts.join(' ');
+}
+
+function formatCheck(c: SiteCheck): string {
+  switch (c.kind) {
+    case 'noTrip':
+      return `no trip${c.node ? ` ${str(c.node)}` : ''}`;
+    case 'noViolation':
+      return `no violation${c.violation ? ` ${c.violation}` : ''}${c.node ? ` ${str(c.node)}` : ''}`;
+    case 'current':
+      return `${str(c.node)} current <= ${num(c.maxA)}A${c.phase ? ` phase ${c.phase}` : ''}`;
+    case 'imbalance':
+      return `site imbalance <= ${num(c.maxA)}A`;
+  }
+}
+
+function formatSiteValue(v: SiteValue): string {
+  switch (v.kind) {
+    case 'number':
+      return `${num(v.value)}${v.unit ?? ''}`;
+    case 'word':
+      return v.value;
+    case 'string':
+      return str(v.value);
+    case 'duration':
+      return `${v.signed && v.ms >= 0 ? '+' : ''}${formatDuration(v)}`;
+    case 'system':
+      return `${v.phases}x${num(v.voltageV)}V`;
+    case 'phases':
+      return v.words.join(' ');
+    case 'flag':
+      return '';
+  }
+}
+
+function formatSiteArgs(args: readonly SiteArg[]): string {
+  return args
+    .map((a) =>
+      a.positional
+        ? formatSiteValue(a.value)
+        : a.value.kind === 'flag'
+          ? a.key
+          : `${a.key} ${formatSiteValue(a.value)}`,
+    )
+    .map((t) => ` ${t}`)
+    .join('');
+}
+
+function formatSiteNode(n: SiteNode, depth: number): string[] {
+  const pad = INDENT.repeat(depth);
+  const head = `${pad}${n.type}${n.id ? ` ${str(n.id)}` : ''}${formatSiteArgs(n.args)}`;
+  if (!n.children) return withComments([head], n.comments, pad);
+  const inner = n.children.flatMap((c) => formatSiteNode(c, depth + 1));
+  return withComments(
+    [`${head} {`, ...inner, ...endLines(n.endComments, INDENT.repeat(depth + 1)), `${pad}}`],
+    n.comments,
+    pad,
+  );
+}
+
+function formatSiteItem(item: SiteItem, depth: number): string[] {
+  const pad = INDENT.repeat(depth);
+  switch (item.kind) {
+    case 'node':
+      return formatSiteNode(item, depth);
+    case 'supply':
+      return withComments([`${pad}supply${formatSiteArgs(item.args)}`], item.comments, pad);
+    case 'tolerance':
+      return withComments([`${pad}tolerance seed ${num(item.seed)}`], item.comments, pad);
+    case 'time':
+      return withComments([`${pad}time ${str(item.time)}`], item.comments, pad);
+    case 'controller':
+      return withComments([`${pad}${formatController(item)}`], item.comments, pad);
+    case 'siteExpect':
+      return withComments([`${pad}expect ${formatCheck(item.check)}`], item.comments, pad);
+  }
+}
+
+/** The site block: its lines as written, nested two spaces per level. */
+export function formatSite(site: SiteBlock): string[] {
+  const lines = [
+    `site ${str(site.name)} {`,
+    ...site.body.flatMap((i) => formatSiteItem(i, 1)),
+    ...endLines(site.endComments, INDENT),
+    '}',
+  ];
+  return withComments(lines, site.comments, '');
 }
 
 /**
@@ -302,6 +436,10 @@ export function format(s: Scenario): string {
   if (preamble.length) {
     out.push('');
     out.push(...preamble);
+  }
+  if (s.site) {
+    out.push('');
+    out.push(...formatSite(s.site));
   }
   for (const q of s.quirks) {
     out.push('');

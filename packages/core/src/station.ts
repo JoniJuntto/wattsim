@@ -41,6 +41,7 @@ import {
   CallError,
   Connection,
   HandshakeError,
+  PowerLossError,
   QueueOverflowError,
   RequestTimeoutError,
   ViolationError,
@@ -121,6 +122,52 @@ export type StationConfig = {
   meterSigningKey?: string;
   /** IANA time zone of the station (2.x `ClockCtrlr.TimeZone`); tariff times of day are local to it. Default UTC. */
   timeZone?: string;
+  /** Socket factory, see `ConnectionOptions.socket`. */
+  socket?: ConnectionOptions['socket'];
+  /**
+   * Where each EVSE's power comes from (an electrical site model): its live phases and voltages, `null` when it has
+   * none, `undefined` for an EVSE the source does not feed (it gets the nominal supply). Read at construction and
+   * whenever `supplyChanged()` is called. Without it the station is always powered. See `Station.supplyChanged`.
+   */
+  supply?: SupplySource;
+  /** Called with an EVSE's per-phase draw after every integration step and every change of what it offers. */
+  onDraw?: (draw: EvseDraw) => void;
+};
+
+/** What feeds one EVSE: its live phases, in the EVSE's own phase order (structurally a grid `LeafSupply`). */
+export type EvseSupply = {
+  /** Site phases (e.g. `L2`) of the live EVSE phases, EVSE phase order. */
+  phases: readonly string[];
+  /** Phase-to-neutral voltage of each, V. */
+  voltageV: readonly number[];
+  /** The EVSE's own phase number (1..3) of each. */
+  leafPhases: readonly number[];
+};
+
+export type SupplySource = (evseId: number) => EvseSupply | null | undefined;
+
+/** One EVSE's draw: total power and the current on each of its own phases L1, L2, L3 (rotation applies upstream). */
+export type EvseDraw = {
+  evseId: number;
+  /** Signed: negative while discharging (V2X). */
+  kw: number;
+  /** A per EVSE phase, signed like `kw`. */
+  amps: [number, number, number];
+  /** Phases carrying current. */
+  phases: number;
+};
+
+/** Supply bookkeeping of a station fed by a `SupplySource`. */
+type SupplyState = {
+  source: SupplySource;
+  onDraw: ((draw: EvseDraw) => void) | undefined;
+  /** Per EVSE (index id - 1): the supply last read. */
+  evse: Array<EvseSupply | null | undefined>;
+  powered: boolean;
+  /** `connect()` was called (and not `disconnect()`): the station comes back after a power loss. */
+  wanted: boolean;
+  /** EVSEs whose transaction died with the power, ended once it is back. */
+  lost: Set<number>;
 };
 
 export type ResolvedStationConfig = {
@@ -199,6 +246,8 @@ export type StationEvents = Omit<ConnectionEvents, 'state'> & {
   transaction: [kind: 'started' | 'stopped', evseId: number, transactionId: string | number];
   /** Every meter sample taken (periodic, transaction begin/end, trigger). */
   meter: [evseId: number, sample: MeterSample];
+  /** The station lost (false) or regained (true) its power supply, see `StationConfig.supply`. */
+  power: [powered: boolean];
   /** Snapshot after any change: connection, boot, status, transaction, tick. */
   state: [StationState];
 };
@@ -226,7 +275,7 @@ export type CallAnswer = { result: unknown } | { error: [code: string, descripti
 export type CallInterceptor = (call: CallFrame) => CallAnswer;
 
 /** Base64 placeholder for an EV's EXI CertificateInstallationReq (no ISO 15118 stack). */
-const CANNED_EXI_REQUEST = Buffer.from('wattsim-canned-15118-exi-request').toString('base64');
+const CANNED_EXI_REQUEST = btoa('wattsim-canned-15118-exi-request');
 
 const ADAPTERS: Record<OcppVersion, VersionAdapter> = { 'ocpp1.6': ocpp16, 'ocpp2.0.1': ocpp201, 'ocpp2.1': ocpp21 };
 
@@ -264,8 +313,24 @@ function alreadyReported(err: unknown): boolean {
     err instanceof RequestTimeoutError ||
     err instanceof CallError ||
     err instanceof ViolationError ||
-    err instanceof QueueOverflowError
+    err instanceof QueueOverflowError ||
+    err instanceof PowerLossError
   );
+}
+
+/** Same live phases (voltages aside: they move with the load and are read when sampled). */
+function sameSupply(a: EvseSupply | null | undefined, b: EvseSupply | null | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.leafPhases.length === b.leafPhases.length && a.leafPhases.every((p, i) => p === b.leafPhases[i]);
+}
+
+/** Average of the voltages, or undefined for none. */
+function meanVoltage(v: readonly number[]): number | undefined {
+  if (v.length === 0) return undefined;
+  let sum = 0;
+  for (const x of v) sum += x;
+  return sum / v.length;
 }
 
 export class Station extends TypedEmitter<StationEvents> implements StationContext {
@@ -315,6 +380,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   private startupReported = false;
   /** EV / meter / tariff state beyond the defaults; one field, created on first need, so plain stations stay small. */
   private rx: Realism | undefined;
+  /** Power supply state; undefined without `StationConfig.supply`, so plain stations pay one check. */
+  private sup: SupplyState | undefined;
 
   constructor(cfg: StationConfig) {
     super();
@@ -387,6 +454,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       requestTimeoutMs: cfg.requestTimeoutMs,
       reconnect: cfg.reconnect,
       maxQueue: cfg.maxQueue,
+      socket: cfg.socket,
     });
     this.conn.on('state', (s) => {
       if (s === 'Connected') this.handshakeReported = undefined;
@@ -402,6 +470,171 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     this.conn.on('chaos', (rule, frame) => this.emit('chaos', rule, frame));
     this.conn.on('call', (call, reply, error) => this.onCall(call, reply, error));
     this.conn.on('send', (message) => this.emit('send', message));
+    if (cfg.supply) this.setSupply(cfg.supply, cfg.onDraw);
+  }
+
+  // ---- power supply ----------------------------------------------------------------------------------------
+
+  /** False while the supply (`StationConfig.supply`) feeds none of the EVSEs. Always true without a supply. */
+  get powered(): boolean {
+    return this.sup?.powered ?? true;
+  }
+
+  /** What feeds `evseId` as last read: undefined without a supply (or for an EVSE it does not feed), null when dead. */
+  supplyOf(evseId: number): EvseSupply | null | undefined {
+    return this.sup?.evse[evseId - 1];
+  }
+
+  /** Install or replace the supply source (as `StationConfig.supply` / `onDraw` do), then read it. */
+  setSupply(source: SupplySource, onDraw?: (draw: EvseDraw) => void): void {
+    if (this.sup) {
+      this.sup.source = source;
+      this.sup.onDraw = onDraw;
+    } else {
+      this.sup = {
+        source,
+        onDraw,
+        evse: this.evses.map(() => undefined),
+        powered: true,
+        wanted: this.conn.state !== 'Disconnected' || this.booted,
+        lost: new Set(),
+      };
+    }
+    this.supplyChanged();
+  }
+
+  /**
+   * Re-read the supply of every EVSE. When none has any: a power loss. The socket dies without a closing handshake,
+   * every timer stops, the EVs stop drawing (the meters keep their registers) and the running transactions are lost;
+   * nothing is sent. When the supply is back: the station reconnects and boots with reason PowerUp, as after a hard
+   * reset, and ends the lost transactions with reason PowerLoss (EVDisconnected when the EV was unplugged
+   * meanwhile); their messages go out once the boot is accepted. An EVSE that keeps only some of its phases charges
+   * on those (fewer phases in use); one that keeps none offers nothing.
+   */
+  supplyChanged(): void {
+    const sup = this.sup;
+    if (!sup) return;
+    const next = this.evses.map((e) => sup.source(e.id));
+    const powered = next.some((s) => s !== null);
+    if (sup.powered && !powered) {
+      this.powerLoss(next);
+      return;
+    }
+    if (!sup.powered && powered) {
+      this.powerRestore(next);
+      return;
+    }
+    for (const evse of this.evses) {
+      const cur = next[evse.id - 1];
+      if (sameSupply(sup.evse[evse.id - 1], cur)) continue;
+      this.integrate(evse);
+      sup.evse[evse.id - 1] = cur;
+      if (!sup.powered) continue;
+      this.reoffer(evse);
+      this.refresh(evse);
+    }
+  }
+
+  private powerLoss(next: Array<EvseSupply | null | undefined>): void {
+    const sup = this.sup as SupplyState;
+    for (const evse of this.evses) this.integrate(evse);
+    sup.evse = next;
+    sup.powered = false;
+    for (const evse of this.evses) {
+      if (evse.tx && !evse.tx.ending) sup.lost.add(evse.id);
+      this.reoffer(evse);
+      evse.meter.tick(0, 0);
+      this.report(evse);
+    }
+    this.booted = false;
+    this.bootHold = true;
+    this.stopHeartbeat();
+    for (const timer of [this.mvTimer, this.bootRetry, this.resetTimer, this.limitTimer]) timer?.cancel();
+    this.mvTimer = undefined;
+    this.bootRetry = undefined;
+    this.resetTimer = undefined;
+    this.limitTimer = undefined;
+    this.conn.powerOff();
+    this.emit('power', false);
+    this.emitState();
+  }
+
+  private powerRestore(next: Array<EvseSupply | null | undefined>): void {
+    const sup = this.sup as SupplyState;
+    // Nothing flowed during the outage; integrating now closes it, so the lost transactions end on the register
+    // of the power loss.
+    for (const evse of this.evses) this.integrate(evse);
+    sup.evse = next;
+    sup.powered = true;
+    // Their stop messages wait in the boot hold until the boot is accepted.
+    const lost = [...sup.lost];
+    sup.lost.clear();
+    for (const id of lost) {
+      const evse = this.evses[id - 1];
+      if (evse?.tx && !evse.tx.ending) fire(this.endTransaction(id, evse.ev ? 'PowerLoss' : 'EVDisconnected'));
+    }
+    for (const evse of this.evses) {
+      this.reoffer(evse);
+      this.refresh(evse);
+    }
+    this.updateLimits();
+    this.emit('power', true);
+    this.emitState();
+    if (sup.wanted) fire(this.restart());
+  }
+
+  /** Back from a power loss: connect and boot with reason PowerUp. */
+  private async restart(): Promise<void> {
+    try {
+      await this.conn.connect();
+      await this.boot('PowerUp');
+    } catch (err) {
+      if (!alreadyReported(err)) this.emit('error', toError(err));
+    }
+  }
+
+  /** The EVSE has no supply now (the station is dark, or this EVSE lost every phase). */
+  private dead(evse: EvseState): boolean {
+    const sup = this.sup;
+    return sup !== undefined && (!sup.powered || sup.evse[evse.id - 1] === null);
+  }
+
+  /**
+   * Phases the supply lets the EVSE use, at most `want`: a one-phase EV (or one phase in use) needs the EVSE's own
+   * phase 1; otherwise the live ones count. Undefined without a supply for this EVSE.
+   */
+  private livePhases(evse: EvseState, want: number): number | undefined {
+    const s = this.sup?.evse[evse.id - 1];
+    if (s === undefined) return undefined;
+    if (s === null || this.dead(evse)) return 0;
+    if (want === 1 || evse.ev?.config.phases === 1) return s.leafPhases.includes(1) ? 1 : 0;
+    let n = 0;
+    for (const p of s.leafPhases) if (p <= this.cfg.phases) n++;
+    return Math.min(n, want);
+  }
+
+  /** The EVSE's own phases (1..3) carrying its current now. */
+  private phasesCarrying(evse: EvseState): number[] {
+    const n = evse.phases ?? this.cfg.phases;
+    const s = this.sup?.evse[evse.id - 1];
+    const live =
+      s === undefined ? [1, 2, 3].slice(0, this.cfg.phases) : s === null ? [] : s.leafPhases.filter((p) => p <= 3);
+    if (n === 1 || evse.ev?.config.phases === 1) return live.includes(1) ? [1] : [];
+    return live.slice(0, n);
+  }
+
+  /** Report the EVSE's draw to `onDraw` (stations with a supply only). */
+  private report(evse: EvseState): void {
+    const onDraw = this.sup?.onDraw;
+    if (!onDraw) return;
+    const kw = this.dead(evse) ? 0 : evse.meter.power;
+    const amps: [number, number, number] = [0, 0, 0];
+    const used = this.phasesCarrying(evse);
+    if (kw !== 0 && used.length > 0) {
+      const a = (kw * 1000) / (used.length * this.cfg.voltageV);
+      for (const p of used) amps[p - 1] = a;
+    }
+    onDraw({ evseId: evse.id, kw, amps, phases: used.length });
   }
 
   // ---- public state ----------------------------------------------------------------------------------------
@@ -491,6 +724,11 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
         `${this.id}: security profile 3 needs a client certificate (set security.clientCert and security.clientKey)`,
       );
     }
+    if (this.sup) {
+      this.sup.wanted = true;
+      // A dark station connects when its power comes back.
+      if (!this.sup.powered) return;
+    }
     await this.conn.connect();
     if (this.booted) this.startHeartbeat();
     this.ensureMeterTimer();
@@ -502,6 +740,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
    * Connection and flush in order on the next `connect()`.
    */
   async disconnect(): Promise<void> {
+    if (this.sup) this.sup.wanted = false;
     this.stopHeartbeat();
     this.bootRetry?.cancel();
     this.bootRetry = undefined;
@@ -516,6 +755,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
    * `Pending`/`Rejected`: sends nothing else and retries after the interval (60 s when the CSMS gives none).
    */
   async boot(reason: BootReason = 'PowerUp'): Promise<void> {
+    // A dark station boots (PowerUp) when its power comes back.
+    if (this.sup && !this.sup.powered) return;
     this.bootRetry?.cancel();
     this.bootRetry = undefined;
     const raw = await this.request('BootNotification', this.adapter.bootPayload(this.cfg, reason));
@@ -536,6 +777,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     }
     this.booted = true;
     this.bootHold = false;
+    // After a power loss the connection lets only the boot through until now.
+    this.conn.ungate();
     for (const send of this.held.splice(0)) send();
     this.hbMs = this.cfg.heartbeatMs ?? res.intervalMs;
     this.startHeartbeat();
@@ -869,6 +1112,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   // ---- StationContext (used by adapters and the public methods above) ---------------------------------------
 
   request(action: string, payload: unknown): Promise<unknown> {
+    // A dark station sends nothing; what it would have sent is lost (its transactions end after the power is back).
+    if (this.sup && !this.sup.powered) return Promise.reject(new PowerLossError(action));
     this.pending++;
     const p =
       this.bootHold && action !== 'BootNotification'
@@ -881,7 +1126,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       (err: unknown) => {
         this.pending--;
         // A queue overflow was already reported by the Connection's own `error` event.
-        if (!(err instanceof QueueOverflowError)) this.emit('error', toError(err));
+        // A power loss is not an error of the request: the station was dark.
+        if (!(err instanceof QueueOverflowError) && !(err instanceof PowerLossError)) this.emit('error', toError(err));
       },
     );
     return p;
@@ -998,6 +1244,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     const tx = evse.tx;
     if (!tx) throw new Error(`EVSE ${evseId} has no active transaction`);
     if (tx.ending) return tx.ending;
+    // Lost in a power loss: it ends (PowerLoss or EVDisconnected) when the power is back.
+    if (this.sup && !this.sup.powered && this.sup.lost.has(evseId)) return;
     tx.ending = this.finish(evse, tx, reason);
     return tx.ending;
   }
@@ -1134,6 +1382,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
    */
   private drawKw(evse: EvseState): number {
     if (!evse.tx || evse.tx.ending || !evse.ev) return 0;
+    if (this.sup && this.dead(evse)) return 0;
     return evse.ev.drawKw(evse.offeredKw, evse.meter.voltageV, evse.phases ?? this.cfg.phases, evse.targetKw);
   }
 
@@ -1168,15 +1417,17 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       if (kw === 0 && trackIdle) tx.idleMs = (tx.idleMs ?? 0) + dt;
       t = dt === now - t ? now : t + dt;
       tx.cost?.advance(t, kw, voltageV);
-      if (t >= now) return;
+      if (t >= now) break;
       kw = this.drawKw(evse);
     }
+    if (this.sup) this.report(evse);
   }
 
   /** Apply the current offer to the EV, update the meter's power reading and return the derived status. */
   private settle(evse: EvseState): ConnectorStatus {
     const kw = this.drawKw(evse);
     evse.meter.tick(0, kw);
+    if (this.sup) this.report(evse);
     return this.deriveStatus(evse);
   }
 
@@ -1196,16 +1447,22 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   private reoffer(evse: EvseState): void {
     const inputs = this.rx?.limits?.get(evse.id);
     const ev = evse.ev;
+    // The supply's live phases cap the phases in use the way the EV's own phase count does.
+    const live = this.sup ? this.livePhases(evse, ev?.config.phases ?? 3) : undefined;
     const r = resolvePower({
       voltageV: this.cfg.voltageV,
       stationPhases: this.cfg.phases,
       evseMaxA: this.cfg.maxCurrentA,
-      evPhases: ev?.config.phases,
+      evPhases: live ? Math.min(ev?.config.phases ?? 3, live) : ev?.config.phases,
       cableMaxA: ev?.config.cableMaxA,
       limit: inputs?.limit,
       v2x: inputs?.v2x,
       bidirectional: this.version === 'ocpp2.1' && ev?.config.v2x === true,
     });
+    if (live === 0) {
+      r.offerKw = 0;
+      r.targetKw = undefined;
+    }
     evse.offeredKw = r.offerKw;
     // Written only once they differ from the defaults, so a plain EVSE keeps its small shape.
     if (r.phases !== this.cfg.phases || evse.phases !== undefined) evse.phases = r.phases;
@@ -1316,6 +1573,12 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   /** A meter sample; OCMF-signed when `signedMeterValues` is on. */
   private sampleOf(evse: EvseState, tx: TransactionState | undefined, context: SampleContext): MeterSample {
     const sample = evse.meter.sample(this.clock, evse.ev?.soc);
+    if (this.sup) {
+      // The voltage the site delivers right now (it moves with the load), not the nominal one.
+      const s = this.sup.source(evse.id);
+      const v = s ? meanVoltage(s.voltageV) : undefined;
+      if (v !== undefined) sample.voltageV = v;
+    }
     const signer = this.meterSigner;
     if (signer) {
       const reason: OcmfReason | undefined =
@@ -1363,6 +1626,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     // only the stop message waits for the transaction id. A failed start has rolled the transaction back by then.
     this.integrate(evse);
     evse.meter.tick(0, 0);
+    if (this.sup) this.report(evse);
     const end = this.takeSample(evse, tx, 'Transaction.End');
     if (tx.starting) {
       await tx.starting.catch(() => {});

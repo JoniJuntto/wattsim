@@ -12,7 +12,10 @@
   },
   "dependencies": {
     "@wattsim/core": "workspace:*",
-    "@wattsim/protocol": "workspace:*"
+    "@wattsim/csms": "workspace:*",
+    "@wattsim/grid": "workspace:*",
+    "@wattsim/protocol": "workspace:*",
+    "@wattsim/site": "workspace:*"
   },
   "devDependencies": {
     "typescript": "catalog:",

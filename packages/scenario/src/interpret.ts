@@ -101,6 +101,7 @@ import {
   MAX_TECH_CODE_LENGTH,
   meterBackwards,
   meterReset,
+  PowerLossError,
   RequestTimeoutError,
   resetStation,
   SkewedClock,
@@ -123,6 +124,7 @@ import type {
   ExpectStmt,
   JsonValue,
   LetDecl,
+  LoadStmt,
   Loc,
   MeterStmt,
   NetStmt,
@@ -130,6 +132,7 @@ import type {
   OnStmt,
   Prop,
   Scenario,
+  SiteExpectStmt,
   StationBlock,
   Stmt,
   StrExpr,
@@ -142,6 +145,7 @@ import { formatDuration, formatDurExpr } from './format';
 import { ParseError } from './lexer';
 import type { Linked, QuirkPlugin, QuirkSource } from './quirks';
 import { fleetTooLarge, link, loadPlugins, refusePlugins } from './quirks';
+import { type SiteResult, SiteRun } from './site-run';
 
 // ---- public types ----------------------------------------------------------------------------------------------
 
@@ -180,6 +184,10 @@ export type RunOptions = {
   root?: string;
   /** False: any `use plugin` fails the run before a station starts, and no plugin is imported (default true). */
   allowPlugins?: boolean;
+  /** Overrides the site block's `controller` (`wattsim run --controller`). */
+  siteController?: 'reference' | 'none';
+  /** Called with the site runtime once it started (before any station), for live views and `--site-report`. */
+  onSite?: (site: SiteRun) => void;
   /**
    * The most stations the expanded fleet may have; a larger fleet fails the run with a `ParseError` at the range
    * that passes the limit, before any station is allocated. Default: no limit (`select` shards a big fleet).
@@ -224,7 +232,14 @@ export type RunEvent =
 
 export type AssertResult = { ok: boolean; expect: string; message?: string };
 export type StationResult = { name: string; ok: boolean; asserts: AssertResult[]; error?: string; durationMs: number };
-export type RunResult = { ok: boolean; stations: StationResult[]; violations: Violation[]; durationMs: number };
+export type RunResult = {
+  ok: boolean;
+  stations: StationResult[];
+  violations: Violation[];
+  durationMs: number;
+  /** The electrical site: its score, trips and site-block assertions (scenarios with a `site` block). */
+  site?: SiteResult;
+};
 
 export const DEFAULT_EXPECT_TIMEOUT_MS = 30_000;
 
@@ -346,7 +361,12 @@ const CONNECTOR_STATUSES: ReadonlySet<string> = new Set<ConnectorStatus>([
 
 /** Rejections the Station already reported through its `error` event. */
 function isRequestFailure(err: unknown): boolean {
-  return err instanceof RequestTimeoutError || err instanceof CallError || err instanceof ViolationError;
+  return (
+    err instanceof RequestTimeoutError ||
+    err instanceof CallError ||
+    err instanceof ViolationError ||
+    err instanceof PowerLossError
+  );
 }
 
 function toError(err: unknown): Error {
@@ -589,6 +609,8 @@ class Run {
   private readonly runners: InstanceRunner[] = [];
   private linked: Linked | undefined;
   private plugins = new Map<string, QuirkPlugin>();
+  /** The electrical site, once the run started it (scenarios with a `site` block). */
+  site: SiteRun | undefined;
   /** Quirk resolution and plugin loading, started at construction. */
   readonly ready: Promise<void>;
 
@@ -611,8 +633,10 @@ class Run {
   }
 
   async execute(): Promise<RunResult> {
-    const csmsUrl = this.opts.csmsUrl ?? this.scenarioCsms();
-    if (!csmsUrl) throw new Error('scenario has no csms URL: add `csms "ws://..."` or pass RunOptions.csmsUrl');
+    const externalUrl = this.opts.csmsUrl ?? this.scenarioCsms();
+    if (!externalUrl && !this.scenario.site) {
+      throw new Error('scenario has no csms URL: add `csms "ws://..."` or pass RunOptions.csmsUrl');
+    }
     const select = this.opts.select;
     const problem = select && selectionProblem(select);
     if (problem) throw new RangeError(problem);
@@ -630,6 +654,21 @@ class Run {
     for (const inst of instances) {
       for (const name of mentionedBarriers(inst.block.body, this.procs)) this.barriers.declare(name, inst.index);
     }
+    let csmsUrl = externalUrl as string;
+    const site = this.scenario.site;
+    if (site) {
+      this.site = SiteRun.start({ site }, instances, (inst, e) => this.textOf(e, inst.vars), {
+        clock: this.clock,
+        ...(this.opts.file !== undefined ? { file: this.opts.file } : {}),
+        dir: this.dir,
+        profiles: this.linked?.profiles ?? new Map(),
+        ...(externalUrl !== undefined ? { externalUrl } : {}),
+        ...(this.opts.siteController ? { controller: this.opts.siteController } : {}),
+        log: (message) => this.emit({ type: 'log', message, at: this.clock.now() }),
+      });
+      csmsUrl = this.site.csmsUrl;
+      this.opts.onSite?.(this.site);
+    }
     for (const inst of instances) this.runners.push(new InstanceRunner(this, inst, csmsUrl));
     const onAbort = () => {
       for (const r of this.runners) r.abort(new StationFailure('aborted'));
@@ -639,14 +678,24 @@ class Run {
     try {
       const results = await Promise.all(this.runners.map((r) => r.execute()));
       await Promise.all(this.runners.map((r) => r.shutdown()));
+      const siteResult = await this.site?.finish();
+      for (const a of siteResult?.asserts ?? []) {
+        this.emit({ type: 'assert', station: `site ${siteResult?.name}`, ...a, at: this.clock.now() });
+      }
       return {
-        ok: results.every((r) => r.ok),
+        ok: results.every((r) => r.ok) && (siteResult?.ok ?? true),
         stations: results,
         violations: this.violations,
         durationMs: this.clock.now() - start,
+        ...(siteResult ? { site: siteResult } : {}),
       };
     } finally {
       this.opts.signal?.removeEventListener('abort', onAbort);
+      if (this.site) {
+        // A run that failed half way still frees the Modbus ports and the CSMS.
+        await this.site.runtime.stop().catch(() => {});
+        await this.site.csms?.stop().catch(() => {});
+      }
     }
   }
 
@@ -761,6 +810,24 @@ class Run {
         return out;
       }
     }
+  }
+
+  /** A string argument: the literal filled in, or a variable holding a string. Throws `ParseError`. */
+  textOf(e: StrExpr, vars: Vars): string {
+    try {
+      if (e.kind === 'string') return this.interpolate(e, vars);
+      const v = this.lookup(e.name, vars);
+      if (typeof v !== 'string') throw new StationFailure(`expected a string, but '${e.name}' is ${describeValue(v)}`);
+      return v;
+    } catch (err) {
+      if (err instanceof StationFailure) throw new ParseError(err.message, e.loc.line, e.loc.col, this.opts.file);
+      throw err;
+    }
+  }
+
+  /** The text of a load profile file the run read, by the path as written. */
+  profile(path: string): string | undefined {
+    return this.linked?.profiles?.get(resolve(this.dir, path));
   }
 
   // ---- setup ---------------------------------------------------------------------------------------------------
@@ -1251,7 +1318,91 @@ class InstanceRunner {
         return;
       case 'fail':
         throw new StationFailure(this.text(stmt.message, stmt.loc));
+      case 'site':
+        // Wiring: applied to the site before the run started.
+        return;
+      case 'trip':
+      case 'reclose': {
+        const site = this.site(stmt.kind);
+        const id = this.text(stmt.node, stmt.loc);
+        located(stmt.loc, () =>
+          this.siteCall(() =>
+            stmt.kind === 'trip' ? site.trip(id, stmt.phases ? { phases: stmt.phases } : {}) : site.reclose(id),
+          ),
+        );
+        return;
+      }
+      case 'load':
+        this.load(stmt);
+        return;
+      case 'controller': {
+        const site = this.site('controller');
+        located(stmt.loc, () =>
+          this.siteCall(() =>
+            site.setController(stmt.mode, {
+              ...(stmt.every ? { intervalMs: stmt.every.ms } : {}),
+              ...(stmt.marginPct !== undefined ? { marginPct: stmt.marginPct } : {}),
+              ...(stmt.minA !== undefined ? { minA: stmt.minA } : {}),
+            }),
+          ),
+        );
+        return;
+      }
+      case 'siteExpect':
+        this.siteExpect(stmt);
+        return;
     }
+  }
+
+  // ---- the site --------------------------------------------------------------------------------------------
+
+  private site(kind: string) {
+    const site = this.run.site?.runtime;
+    if (!site) throw new StationFailure(`'${kind}' needs a site block`);
+    return site;
+  }
+
+  /** A site operation; what it rejects (an unknown node, a controller without the CSMS) fails the station. */
+  private siteCall(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      throw new StationFailure(toError(err).message);
+    }
+  }
+
+  private load(stmt: LoadStmt): void {
+    const site = this.site('load');
+    const id = this.text(stmt.node, stmt.loc);
+    located(stmt.loc, () =>
+      this.siteCall(() => {
+        if (stmt.op === 'set')
+          site.setLoad(id, { watts: stmt.watts, ...(stmt.pf !== undefined ? { pf: stmt.pf } : {}) });
+        else if (stmt.op === 'on' || stmt.op === 'off') site.setLoad(id, { on: stmt.op === 'on' });
+        else if (stmt.op === 'profile') {
+          const path = stmt.file.parts.join('');
+          const csv = this.run.profile(path);
+          if (csv === undefined) throw new Error(`load profile "${path}" was not read`);
+          site.setLoad(id, {
+            spec: {
+              type: 'profile',
+              csv,
+              ...(stmt.interpolation ? { interpolation: stmt.interpolation } : {}),
+              ...(stmt.loop ? { loop: stmt.loop } : {}),
+              startMs: this.clock.now() + site.timeOffsetMs,
+            },
+          });
+        }
+      }),
+    );
+  }
+
+  private siteExpect(stmt: SiteExpectStmt): void {
+    const run = this.run.site;
+    if (!run) throw new StationFailure(`${at(stmt.loc)}: site assertions need a site block`);
+    const c = stmt.check;
+    const node = 'node' in c && c.node ? this.str(c.node) : undefined;
+    this.assert(run.check(c, node));
   }
 
   // ---- statement helpers -----------------------------------------------------------------------------------
@@ -1391,8 +1542,16 @@ class InstanceRunner {
       heartbeatMs: this.cfg.heartbeatMs,
       meterIntervalMs: this.cfg.meterIntervalMs,
     };
+    const wiring = this.run.site?.wiring(this.name);
+    if (wiring && this.run.site) {
+      const hooks = this.run.site.runtime.hooks(this.name);
+      config.supply = hooks.supply;
+      config.onDraw = hooks.onDraw;
+      if (wiring.maxA !== undefined) config.maxCurrentA = wiring.maxA;
+    }
     const station = this.run.stationFactory(config);
     this.station = station;
+    if (wiring && this.run.site) for (const leaf of wiring.leaves) this.run.site.runtime.register(leaf, station);
     for (const install of this.pendingInstall.splice(0)) install(station);
     station.on('frame', (direction, frame) => this.onFrame(direction, frame));
     station.on('violation', (v) => {

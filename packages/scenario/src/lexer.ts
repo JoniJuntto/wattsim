@@ -68,9 +68,14 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   'fault',
   'meter',
   'reset',
+  'site',
+  'trip',
+  'reclose',
+  'load',
+  'controller',
 ]);
 
-const PUNCT2 = ['..'];
+const PUNCT2 = ['..', '<='];
 const PUNCT1 = new Set(['{', '}', '[', ']', '(', ')', ':', ',', '=', '+', '-', '%', '.', ';']);
 
 const isDigit = (c: string) => c >= '0' && c <= '9';

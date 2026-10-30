@@ -45,6 +45,25 @@ export type ConnectionEndpoint = {
   tls?: ConnectionTls;
 };
 
+/** What `Connection` uses of a WebSocket; `ConnectionOptions.socket` returns one for a non-network transport. */
+export type SocketLike = {
+  readonly protocol: string;
+  /** WebSocket ready states: 0 connecting, 1 open, 2 closing, 3 closed. */
+  readonly readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  onopen: ((ev: Event) => void) | null;
+  onmessage: ((ev: MessageEvent) => void) | null;
+  onerror: ((ev: ErrorEvent) => void) | null;
+  onclose: ((ev: CloseEvent) => void) | null;
+};
+
+/** Bun's WebSocket takes an options object (headers, TLS); DOM typings, when present, only know the protocols form. */
+const BunWebSocket = WebSocket as unknown as new (
+  url: string,
+  opts: { protocols: string[]; headers: Record<string, string>; tls?: ConnectionTls },
+) => SocketLike;
+
 export type ConnectionOptions = {
   /** CSMS endpoint; the identity is appended as the last path segment. */
   url: string;
@@ -66,6 +85,8 @@ export type ConnectionOptions = {
    * `QueueOverflowError`; when every queued message is a transaction message, the oldest one goes.
    */
   maxQueue?: number;
+  /** Opens the socket instead of `new WebSocket` (an in-memory transport, e.g. a CSMS in the same page). */
+  socket?: (url: string, protocols: string[]) => SocketLike;
 };
 
 export type ConnectionEvents = {
@@ -99,6 +120,20 @@ export class QueueOverflowError extends Error {
     this.name = 'QueueOverflowError';
   }
 }
+
+/**
+ * The station lost its power supply (`Connection.powerOff`): the CALL in flight or queued was lost with it. Only
+ * transaction messages (and MeterValues) survive a power loss; everything else rejects with this.
+ */
+export class PowerLossError extends Error {
+  constructor(readonly action: string) {
+    super(`${action}: lost in a power loss`);
+    this.name = 'PowerLossError';
+  }
+}
+
+/** What a station keeps through a power loss: the transaction messages and meter values it must deliver later. */
+const SURVIVES_POWER_LOSS: ReadonlySet<string> = new Set([...TRANSACTION_ACTIONS, 'MeterValues']);
 
 /**
  * Why opening the socket failed, from what Bun reports. `server-certificate`: the CSMS certificate did not verify
@@ -217,9 +252,10 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   private readonly chaos: ChaosEngine | undefined;
   private readonly strict: boolean;
   private readonly maxQueue: number;
+  private readonly socket: ConnectionOptions['socket'];
 
   private currentState: ConnectionState = 'Disconnected';
-  private ws: WebSocket | undefined;
+  private ws: SocketLike | undefined;
   private readonly queue: Pending[] = [];
   private inflight: Pending | undefined;
   /** Wanted-connected flag: true from `connect()` until `disconnect()`. */
@@ -242,6 +278,8 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   private stormTimers: Timer[] | undefined;
   /** Closes after which to reconnect at once instead of backing off (sockets a storm dropped). */
   private reconnectNow = 0;
+  /** After a power loss: only BootNotification goes out until `ungate()` (the boot was accepted). */
+  private gated = false;
 
   constructor(opts: ConnectionOptions) {
     super();
@@ -258,6 +296,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
     const maxQueue = opts.maxQueue ?? DEFAULT_MAX_QUEUE;
     if (!Number.isInteger(maxQueue) || maxQueue < 1) throw new RangeError(`maxQueue must be >= 1, got ${maxQueue}`);
     this.maxQueue = maxQueue;
+    this.socket = opts.socket;
   }
 
   get state(): ConnectionState {
@@ -324,6 +363,43 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   }
 
   /**
+   * The station lost its power: the socket dies without a closing handshake (the CSMS sees 1006), nothing
+   * reconnects, and what was in memory is gone except the transaction messages and meter values a station keeps
+   * through a power loss. They wait, with everything sent later, until `ungate()`: once powered again only a
+   * BootNotification goes out before the boot is accepted.
+   */
+  powerOff(): void {
+    this.wantConnected = false;
+    this.gated = true;
+    this.cancelReconnectTimer();
+    this.stopStorm();
+    this.rejectOpenWaiters(new PowerLossError('connect'));
+    const ws = this.ws;
+    if (ws) {
+      this.ws = undefined;
+      try {
+        const terminate = (ws as { terminate?: () => void }).terminate;
+        if (terminate) terminate.call(ws);
+        else ws.close(1001, 'power loss');
+      } catch {
+        // A socket that is still connecting may refuse; it is detached either way.
+      }
+    }
+    if (this.currentState !== 'Disconnected') this.onClosed(1006, 'power loss');
+    const lost = this.queue.filter((p) => !SURVIVES_POWER_LOSS.has(p.action));
+    if (lost.length === 0) return;
+    this.queue.splice(0, this.queue.length, ...this.queue.filter((p) => SURVIVES_POWER_LOSS.has(p.action)));
+    for (const p of lost) p.reject(new PowerLossError(p.action));
+  }
+
+  /** The boot after a power loss was accepted: everything queued may go out again. */
+  ungate(): void {
+    if (!this.gated) return;
+    this.gated = false;
+    this.pump();
+  }
+
+  /**
    * Send a CALL and await its CALLRESULT payload. Queues while offline and flushes in order on reconnect.
    * Rejects with `CallError`, `RequestTimeoutError`, or `ViolationError` (strict mode, invalid response).
    */
@@ -356,9 +432,11 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
 
   private open(): void {
     this.setState('Connecting');
-    const ws = this.tls
-      ? new WebSocket(this.url, { protocols: [this.version], headers: this.headers, tls: this.tls })
-      : new WebSocket(this.url, { protocols: [this.version], headers: this.headers });
+    const ws: SocketLike = this.socket
+      ? this.socket(this.url, [this.version])
+      : this.tls
+        ? new BunWebSocket(this.url, { protocols: [this.version], headers: this.headers, tls: this.tls })
+        : new BunWebSocket(this.url, { protocols: [this.version], headers: this.headers });
     this.ws = ws;
     ws.onopen = () => {
       if (this.ws !== ws) return;
@@ -456,7 +534,12 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   /** Send the next queued CALL if connected and nothing is in flight. */
   private pump(): void {
     if (this.currentState !== 'Connected' || this.inflight || this.queue.length === 0) return;
-    const p = this.queue.shift() as Pending;
+    let p: Pending;
+    if (this.gated) {
+      const boot = this.queue.findIndex((q) => q.action === 'BootNotification');
+      if (boot < 0) return;
+      p = this.queue.splice(boot, 1)[0] as Pending;
+    } else p = this.queue.shift() as Pending;
     this.inflight = p;
     p.timer = this.clock.setTimeout(() => {
       if (this.inflight !== p) return;

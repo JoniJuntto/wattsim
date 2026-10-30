@@ -172,7 +172,10 @@
       "version": "0.0.1",
       "dependencies": {
         "@wattsim/core": "workspace:*",
+        "@wattsim/csms": "workspace:*",
+        "@wattsim/grid": "workspace:*",
         "@wattsim/protocol": "workspace:*",
+        "@wattsim/site": "workspace:*",
       },
       "devDependencies": {
         "@types/bun": "catalog:",
@@ -196,6 +199,21 @@
       "devDependencies": {
         "@types/bun": "catalog:",
         "drizzle-kit": "0.31.11",
+        "typescript": "catalog:",
+      },
+    },
+    "packages/site": {
+      "name": "@wattsim/site",
+      "version": "0.0.1",
+      "dependencies": {
+        "@wattsim/core": "workspace:*",
+        "@wattsim/csms": "workspace:*",
+        "@wattsim/grid": "workspace:*",
+        "@wattsim/modbus": "workspace:*",
+        "@wattsim/protocol": "workspace:*",
+      },
+      "devDependencies": {
+        "@types/bun": "catalog:",
         "typescript": "catalog:",
       },
     },
@@ -977,6 +995,8 @@
     "@wattsim/scenario": ["@wattsim/scenario@workspace:packages/scenario"],
 
     "@wattsim/server": ["@wattsim/server@workspace:packages/server"],
+
+    "@wattsim/site": ["@wattsim/site@workspace:packages/site"],
 
     "@wattsim/trace": ["@wattsim/trace@workspace:packages/trace"],
 

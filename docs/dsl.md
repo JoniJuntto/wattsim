@@ -21,7 +21,7 @@ station "CP-1" {
 }
 ```
 
-Order of the top-level declarations is free, but the formatter always emits them in this order: header, `import`s, `csms`, `let`s, quirks, procs, stations. See [Quirk profiles](#quirk-profiles) for `import` and `quirk`.
+Order of the top-level declarations is free, but the formatter always emits them in this order: header, `import`s, `csms`, `let`s, the `site` block, quirks, procs, stations. See [Quirk profiles](#quirk-profiles) for `import` and `quirk`.
 
 ### Lexical rules
 
@@ -194,6 +194,61 @@ export default plugin;
 ```
 
 The path is resolved like an `import`: relative to the file the `use plugin` statement is in, which for a quirk from a quirk file is that file. The module's default export is `(station: Station, ctx: { clock, log }) => void | (() => void)`. `station` is the core `Station` (its events, `interceptCall`, setters and actions), `ctx.clock` is the station's clock (skewed when the station's is) and `ctx.log(message)` emits a log line for the station. Plugins are imported when the run starts, before any station connects; `check` only verifies the file exists and never runs it. The function is called when the station is created (at its first `connect`, `boot` or other statement that needs it), in statement order together with `on` handlers, or at once when `use plugin` runs after that. The function it returns is called when the run disconnects the station, last plugin first. A plugin that throws fails its station with the statement's `line:col`. A plugin is code you run with your own permissions, like the scenario that names it; see DECISIONS.md.
+
+## `site`
+
+A scenario may describe one electrical site: the grid connection, transformer, fuses, breakers, boards, cables and meters behind the chargers, and the loads that share them. The stations hang from it (see [Electrical site](#electrical-site) for the statements), it is evaluated on the run's clock as they draw, and its protective devices trip on their real time-current curves. This is the test environment for dynamic load management (DLM): the DLM under test is the scenario's CSMS (smart charging) or a local controller that reads the site's Modbus meters; `controller reference` runs wattsim's own baseline instead. The model behind it is `@wattsim/grid`'s (README, "Electrical site model").
+
+```
+site "Depot" {
+  supply 3x400V 250A
+  time "2026-06-15T07:00:00Z"
+  transformer "T1" 400kVA uk 4% {
+    fuse "F0" gG 250A {
+      meter "M0" sdm630 port 1502 unit 1 {
+        board "MDB" 250A {
+          breaker "Q1" C 125A {
+            cable "W1" 50mm2 Cu 30m C {
+              board "SB1" 125A
+            }
+          }
+          load "HVAC" profile "hvac.csv" linear loop daily pf 0.9
+          load "Office" shape office 30kW pf 0.95
+          pv "Roof" 60kW sunrise 5h sunset 21h clouds 30% seed 7
+        }
+      }
+    }
+  }
+  controller reference every 10s margin 5%
+  expect no trip
+}
+```
+
+Each line is a node kind, its id (a plain string; a cable may leave it out), and its settings; a block in braces holds the nodes below it. Settings written as a number with a unit or as a bare word need no key (`250A` is a fuse's rating, `gG` its class); the others are a key and a value (`uk 4%`). Units: A; VA, kVA, MVA; W, kW, MW; Wh, kWh, MWh; mm2; m, km; Hz; `%`; `3p` poles; durations as everywhere. `phases L1` (or `phases L2 L3`) makes a node carry only some of its parent's phases; on a load it is the wiring, a phase (`L2`) or a rotation (`L2L3L1`).
+
+| Line | Settings |
+|---|---|
+| `supply 3x400V [250A] [50Hz] [imbalance 16A]` | Phases and line-to-line voltage (`1x230V` for single phase), the connection's rating per phase (tracked as a limit), frequency, imbalance limit. Required. |
+| `transformer "T1" 400kVA uk 4% [ur 1%]` | Rating and short-circuit impedance. |
+| `fuse "F0" [gG] 250A [3p] [band 0.5] [cooling 10min]` | A gG fuse; `band` fixes the position in the tolerance band. |
+| `breaker "Q1" [mcb\|rcbo\|mccb] [B\|C\|D] 63A [3p] [reclose 30s [attempts 2]] [ir 0.8] [tr 10s] [isd 6] [tsd 100ms] [ii 10]` | MCB or RCBO curve, or MCCB settings (any of `ir`, `tr`, `isd`, `tsd`, `ii` makes it an MCCB); `reclose` recloses it after a trip. |
+| `board "MDB" 250A [neutral 250A] [imbalance 20A]` | A distribution board or sub-board. |
+| `cable ["W1"] 16mm2 [Cu\|Al] 40m [A1\|B1\|B2\|C\|E] [conductors 3] [neutral 16mm2] [ampacity 80A] [r 1.15] [x 0.08]` | Cross-section, material (Cu), length, installation method (C). |
+| `meter "M0" [sdm630\|em24\|generic] [port 1502] [unit 1] [rating 250A] [imbalance 16A]` | A metering point. With `port`, a Modbus TCP meter with that register map serves its live values (unit id `unit`, default 1); meters on one port share a server. |
+| `load "L" 20kW [pf 0.9] [rated 25kW]` | A constant load. |
+| `load "L" profile "file.csv" [step\|linear] [loop none\|daily\|weekly] [utc +2h] [pf 0.9]` | A `timestamp,power[,pf]` profile; the path is relative to the scenario file. |
+| `load "L" shape office\|residential\|flat 30kW [utc +2h] [pf 0.95]` | A daily shape scaled to its peak. |
+| `pv "P" 60kW [sunrise 6h] [sunset 20h] [exponent 1.5] [clouds 30%] [period 10min] [seed 7] [utc +2h]` | Rooftop PV (exports). |
+| `battery "B" 100kWh 50kW [discharge 50kW] [soc 50%] [min 10%] [max 90%] [efficiency 95%] [setpoint -10kW]` | Stationary storage following a setpoint (positive charges). |
+| `step "S" 9kW [on]` | An on/off load. |
+| `tolerance seed 42` | Seeded positions of the protective devices in their tolerance bands. |
+| `time "2026-06-15T07:00:00Z"` | The instant the load models (profiles, shapes, PV) read when the run starts; the run clock keeps its own time. |
+| `controller reference [every 10s] [margin 5%] [min 6A]` | Run the reference DLM controller (see below). `controller none`, or no line: the scenario's CSMS is the DLM. |
+| `expect ...` | Site assertions, checked once the run is over (see [Electrical site](#electrical-site)). |
+
+The parser validates the topology: an unknown cross-section, a breaker above its parent's phases, a cable whose Iz is below the device protecting it, and so on are errors at the line they come from. Stations wire themselves to the site with `site ... at` (below); a station without it is not on the site.
+
+With `controller reference`, wattsim's CSMS simulator (on a free local port, on the run clock) is the CSMS the stations connect to, because the controller sends its limits through it; `csms` and `--csms` are not used. Without a CSMS line or `--csms`, a run with a site uses wattsim's CSMS too. The reference controller is a baseline to compare a DLM against: every 10 s, when a transaction starts or ends, when a device trips or recloses and when a node nears its rating, it shares each node's rating less the margin, after the non-EV load through it, max-min fairly among the charging EVSEs per phase (phase rotation and single-phase EVs included), pauses the newest sessions when a share would fall below `min`, and sends the shares as TxProfiles in A. Booting stations get a 0 A TxDefaultProfile, so a new session waits for its share.
 
 ## Statements
 
@@ -468,6 +523,35 @@ chaos missingField idTag out Authorize
 chaos timestamp -10min out MeterValues
 chaos oversized 64kB out DataTransfer once
 ```
+
+### Electrical site
+
+Statements for scenarios with a [`site`](#site) block.
+
+```
+site "Depot" at "SB1" phases rotate max 32A breaker C 40A cable 10mm2 Cu 25m C
+trip "Q1"
+reclose "Q1"
+load "HVAC" set 40kW
+controller none
+expect "SB1" current <= 125A
+```
+
+| Statement | Meaning | Example |
+|---|---|---|
+| `site "S" at "N" [evse E] [phases P\|rotate] [max A] [breaker C A] [cable mm2 [Cu\|Al] length [method]]` | Wires the station's EVSE `E` (default 1) to node `N` of site `S`, behind its own MCB and cable when given. `phases` is the rotation (`L2L3L1`) or the single phase (`L2`); `rotate` gives the k-th charger at a node the k-th of `L1L2L3`, `L2L3L1`, `L3L1L2`; `max` is the EVSE's rating per phase. Top level of a station block only: the fleet is wired before the run starts. The station then gets its phases and voltage from the site: a trip upstream is a power loss (the socket dies, the EV stops, the transactions are lost), the reclose a PowerUp boot that ends them with `PowerLoss`. | `site "Depot" at "SB2" phases rotate` |
+| `trip "N" [phases L1]` | Open a protective device now (a fuse can lose single links). | `trip "Q1"` |
+| `reclose "N"` | Close it again (replace the fuse). | `reclose "Q1"` |
+| `load "L" set P [pf 0.9]` | From now on a load draws `P`, a battery follows setpoint `P` (positive charges), a step load turns on at `P` (off at 0), PV generates `P`. | `load "HVAC" set 20kW` |
+| `load "L" profile "file.csv" [step\|linear] [loop daily]` | The load follows a profile from now on (relative timestamps count from now). | `load "HVAC" profile "peak.csv"` |
+| `load "L" on\|off` | Switch a step load. | `load "Heater" on` |
+| `controller reference\|none [every 10s] [margin 5%] [min 6A]` | Switch the reference controller on or off. It needs wattsim's CSMS, so it works in runs that started with it. | `controller none` |
+| `expect no trip ["N"]` | Nothing (or nothing at `N`) has tripped so far. | `expect no trip` |
+| `expect no violation [kind] ["N"]` | No violation so far: `overcurrent`, `cableAmpacity`, `transformerOverload`, `undervoltage`, `overvoltage`, `imbalance`, `neutral`, or any. | `expect no violation overcurrent` |
+| `expect "N" current <= A [phase L2]` | The highest current at `N` so far (on one phase, or any) is at most `A`. | `expect "F0" current <= 250A` |
+| `expect site imbalance <= A` | The largest phase imbalance at the grid connection so far is at most `A`. | `expect site imbalance <= 16A` |
+
+Site assertions in a station block check the run so far when they run and count like any other `expect`; in the site block they check the whole run at its end and appear under `site <name>` in the summary and the JUnit report. A run with a site prints its DLM score (trips, energy, unmet energy, Jain fairness, imbalance, and peak utilisation, seconds and A·s over the limit per rated node), writes it as JUnit properties (`dlm.trips`, `dlm.node.F0.peakUtilisationPct`, ...), and `wattsim run --site-report out.json` writes the whole time series, events, violations and controller allocations. `--controller reference|none` overrides the site block's controller.
 
 ### Faults
 

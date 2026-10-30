@@ -473,6 +473,25 @@ It gives you:
 
 The extension runs the server under Bun when `bun` is on PATH or in `~/.bun/bin`, and otherwise under the Node runtime built into VS Code; both run the same bundle (`bun build --target node`). The `wattsim.server.runtime` setting (`auto`, `bun`, `node`) overrides the choice. Other editors can run the server directly: `bun packages/lsp/src/bin.ts --stdio`.
 
+## DLM test environment
+
+A scenario can put its chargers on an electrical site, so a dynamic load management (DLM) controller meets the measurements, overloads and trips of a real switchboard. The DLM under test is the scenario's CSMS (OCPP smart charging) or a local controller reading the site's Modbus meters; wattsim's reference controller is a baseline to compare against.
+
+```sh
+wattsim run examples/dlm-depot.ws --virtual                      # reference controller: no trip
+wattsim run examples/dlm-depot.ws --virtual --controller none    # same day, no DLM: a sub-board breaker trips
+wattsim run examples/dlm-depot.ws --virtual --site-report depot.json --junit junit.xml
+```
+
+`examples/dlm-depot.ws` is a depot behind a 3x250 A connection: transformer, main gG fuse, an SDM630 site meter on Modbus TCP port 1502, two sub-boards behind C125 breakers with ten chargers each (phase rotation cycling, one single-phase van per board), the workshop HVAC from a CSV profile, the offices and 60 kW of rooftop PV. The `site` block describes the topology, each station wires itself to it with `site "Depot" at "SB1" phases rotate breaker C 40A cable 10mm2 Cu 25m C`, and `trip`, `reclose`, `load ... set` and `controller` operate it during the run (see docs/dsl.md, `site`).
+
+- **Supply.** A station on the site gets its phases and voltage from it. A trip upstream is a power loss: the socket dies without a close, the EV stops, the meter keeps its register. The reclose boots the station with `PowerUp`, and it ends the lost transactions with `PowerLoss`. A fuse that loses one link leaves its chargers on two phases.
+- **Measurements.** Meter nodes with a `port` serve live Modbus values (SDM630, EM24 or the generic map): per-phase voltage, current and power, energy integrated over the run, and the state, rating and thermal memory of the protective device at the meter point.
+- **Reference controller** (`controller reference`, `@wattsim/site`). It runs as wattsim's CSMS. Every 10 s, and on every transaction start or end, trip, reclose or node near its rating, it takes each rating less 5 %, subtracts the non-EV current per phase (PV gives room), and shares the rest max-min fairly among the charging EVSEs on the phases each really uses. It sends the shares as TxProfiles, lower limits first. Each step emits an allocation with the decision trail: budget per node and phase, share per EVSE, and the binding node.
+- **Score.** A run with a site prints its DLM score and adds it to the JUnit report as properties: trips, energy delivered and unmet, Jain fairness, phase imbalance, and peak utilisation and time and A·s over the limit per rated node. `--site-report` writes the time series, events, violations and allocations as JSON for the Site page and its replay.
+
+From TypeScript, `startSite({ site, clock, stations, csms, controller: 'reference', modbus })` binds any grid description to stations. Its events are `node`, `trip`, `reclose`, `violation`, `allocation` and `supply`, and `snapshot()` and `report()` read the state.
+
 ## Emulated Modbus meters
 
 Local DLM controllers read the site and sub-board meters over Modbus TCP. `@wattsim/modbus` serves emulated meters whose registers carry live values from wattsim's electrical model, so a controller can be pointed at wattsim instead of a real switchboard. The server is written from the Modbus Application Protocol v1.1b3 and Messaging on TCP/IP v1.0b specifications on `Bun.listen`, with no Modbus dependency. It supports function codes 03, 04, 06 and 16 where the meter's map allows them, exceptions 01 to 04, many concurrent clients, pipelined requests and requests split across TCP segments.

@@ -1,0 +1,8 @@
+# HVAC of the depot workshop, kW by local time of day (looped daily, linear in between)
+time,kW
+00:00,8
+06:00,12
+09:00,30
+14:00,38
+18:00,20
+22:00,10

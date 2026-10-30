@@ -11,6 +11,7 @@ import type {
   ChooseStmt,
   ClockStmt,
   Comments,
+  ControllerStmt,
   DistExpr,
   DurationLit,
   DurationUnit,
@@ -37,12 +38,21 @@ import type {
   QuirkDecl,
   RepeatStmt,
   Scenario,
+  SiteArg,
+  SiteAttachStmt,
+  SiteBlock,
+  SiteCheck,
+  SiteItem,
+  SiteNode,
+  SiteNodeType,
+  SiteValue,
   StationBlock,
   Stmt,
   StrExpr,
   StringExpr,
 } from './ast';
 import { type Comment, KEYWORDS, lex, ParseError, type Token } from './lexer';
+import { attachPoints, checkSiteBlock, SITE_UNITS, type SiteUnitKind, VIOLATION_WORDS } from './site';
 
 const DURATION_UNITS: Record<string, [ms: number, unit: DurationUnit]> = {
   ms: [1, 'ms'],
@@ -106,6 +116,188 @@ const QUIRK_STMTS: ReadonlySet<string> = new Set([
 ]);
 const QUIRK_ALLOWED =
   'heartbeat <duration>, meterInterval, vendor, model, serial, evses, connectors, auth, chaos, on, clock skew, clock drift, log and use';
+
+// ---- the site block ----------------------------------------------------------------------------------------------
+
+/** What a site setting takes: a number in one of these unit kinds, a word of a set, or one of the special forms. */
+type SiteSpec =
+  | { t: 'num'; units: SiteUnitKind; signed?: boolean }
+  | { t: 'word'; words: readonly string[] }
+  | { t: 'string' }
+  | { t: 'dur'; signed?: boolean }
+  | { t: 'phases' }
+  | { t: 'flag' }
+  | { t: 'system' };
+type LineSpec = { positional: Array<{ key: string; spec: SiteSpec }>; keys: Record<string, SiteSpec> };
+
+const num = (units: SiteUnitKind, signed = false): SiteSpec => ({ t: 'num', units, signed });
+const words = (...w: string[]): SiteSpec => ({ t: 'word', words: w });
+const DUR: SiteSpec = { t: 'dur' };
+const PHASES_SPEC: SiteSpec = { t: 'phases' };
+/** Node kinds of a site tree; their own words, for highlighting. */
+const SITE_NODE_TYPES: ReadonlySet<string> = new Set([
+  'transformer',
+  'fuse',
+  'breaker',
+  'board',
+  'cable',
+  'meter',
+  'load',
+  'pv',
+  'battery',
+  'step',
+]);
+const SITE_LEAVES: ReadonlySet<string> = new Set(['load', 'pv', 'battery', 'step']);
+/** Words of site lines, for highlighting (the line specs below are the grammar). */
+export const SITE_WORDS: ReadonlySet<string> = new Set([
+  'supply',
+  'tolerance',
+  'time',
+  'reference',
+  'none',
+  'rotate',
+  'gG',
+  'mcb',
+  'rcbo',
+  'mccb',
+  'Cu',
+  'Al',
+  'sdm630',
+  'em24',
+  'generic',
+  'profile',
+  'shape',
+  'office',
+  'residential',
+  'flat',
+  'linear',
+  'daily',
+  'weekly',
+  'margin',
+  'imbalance',
+  'current',
+  'violation',
+  'trip',
+  'phase',
+  'phases',
+  'reclose',
+  'attempts',
+  'port',
+  'unit',
+  'rating',
+  'sunrise',
+  'sunset',
+  'clouds',
+  'setpoint',
+  'discharge',
+  'efficiency',
+  'conductors',
+  'ampacity',
+  'neutral',
+  'utc',
+  'pf',
+  'rated',
+  'seed',
+  'set',
+  'off',
+]);
+const COMMON_KEYS: Record<string, SiteSpec> = { phases: PHASES_SPEC };
+const LINE_SPECS: Record<SiteNodeType | 'supply', LineSpec> = {
+  supply: {
+    positional: [
+      { key: 'system', spec: { t: 'system' } },
+      { key: 'rating', spec: num('A') },
+      { key: 'frequency', spec: num('Hz') },
+    ],
+    keys: { imbalance: num('A') },
+  },
+  transformer: { positional: [{ key: 'kva', spec: num('kVA') }], keys: { uk: num('pct'), ur: num('pct') } },
+  fuse: {
+    positional: [
+      { key: 'class', spec: words('gG') },
+      { key: 'rating', spec: num('A') },
+      { key: 'poles', spec: num('poles') },
+    ],
+    keys: { band: num('num'), cooling: DUR },
+  },
+  breaker: {
+    positional: [
+      { key: 'type', spec: words('mcb', 'rcbo', 'mccb') },
+      { key: 'curve', spec: words('B', 'C', 'D') },
+      { key: 'rating', spec: num('A') },
+      { key: 'poles', spec: num('poles') },
+    ],
+    keys: {
+      reclose: DUR,
+      attempts: num('num'),
+      ir: num('num'),
+      tr: DUR,
+      isd: num('num'),
+      tsd: DUR,
+      ii: num('num'),
+      band: num('num'),
+      cooling: DUR,
+    },
+  },
+  board: { positional: [{ key: 'rating', spec: num('A') }], keys: { neutral: num('A'), imbalance: num('A') } },
+  cable: {
+    positional: [
+      { key: 'mm2', spec: num('mm2') },
+      { key: 'material', spec: words('Cu', 'Al') },
+      { key: 'length', spec: num('len') },
+      { key: 'method', spec: words('A1', 'B1', 'B2', 'C', 'E') },
+    ],
+    keys: { conductors: num('num'), neutral: num('mm2'), ampacity: num('A'), r: num('num'), x: num('num') },
+  },
+  meter: {
+    positional: [{ key: 'model', spec: words('sdm630', 'em24', 'generic') }],
+    keys: { port: num('num'), unit: num('num'), rating: num('A'), imbalance: num('A') },
+  },
+  load: {
+    positional: [
+      { key: 'power', spec: num('W') },
+      { key: 'interpolation', spec: words('step', 'linear') },
+    ],
+    keys: {
+      profile: { t: 'string' },
+      shape: words('office', 'residential', 'flat'),
+      loop: words('none', 'daily', 'weekly'),
+      utc: { t: 'dur', signed: true },
+      pf: num('num'),
+      rated: num('W'),
+    },
+  },
+  pv: {
+    positional: [{ key: 'peak', spec: num('W') }],
+    keys: {
+      sunrise: DUR,
+      sunset: DUR,
+      exponent: num('num'),
+      clouds: num('pct'),
+      period: DUR,
+      seed: num('num'),
+      utc: { t: 'dur', signed: true },
+    },
+  },
+  battery: {
+    positional: [
+      { key: 'capacity', spec: num('Wh') },
+      { key: 'power', spec: num('W') },
+    ],
+    keys: {
+      discharge: num('W'),
+      soc: num('pct'),
+      min: num('pct'),
+      max: num('pct'),
+      efficiency: num('pct'),
+      setpoint: num('W', true),
+    },
+  },
+  step: { positional: [{ key: 'power', spec: num('W') }], keys: { on: { t: 'flag' }, pf: num('num') } },
+};
+const PHASE_WORD = /^(L[123])+$/;
+const SITE_CURVES: ReadonlySet<string> = new Set(['B', 'C', 'D']);
+const SITE_CHECK_PHASES: ReadonlySet<string> = new Set(['L1', 'L2', 'L3']);
 
 /**
  * Why `stmt` cannot appear in a quirk block, or undefined when it can. A quirk describes how a station behaves; it
@@ -186,6 +378,22 @@ function setComments(node: { comments?: Comments }, leading: string[], trailing?
 function withEnd<T extends { endComments?: string[] }>(node: T, end: string[]): T {
   if (end.length) node.endComments = end;
   return node;
+}
+
+/** Whether a value written without its key fits a setting. */
+function siteAccepts(spec: SiteSpec, v: SiteValue): boolean {
+  switch (spec.t) {
+    case 'num':
+      return v.kind === 'number' && Object.hasOwn(SITE_UNITS[spec.units], v.unit ?? '');
+    case 'word':
+      return v.kind === 'word' && spec.words.includes(v.value);
+    case 'string':
+      return v.kind === 'string';
+    case 'system':
+      return v.kind === 'system';
+    default:
+      return false;
+  }
 }
 
 class Parser {
@@ -472,6 +680,11 @@ class Parser {
         case 'proc':
           scenario.procs.push(this.parseProc(leading));
           break;
+        case 'site': {
+          if (scenario.site) this.fail(`a scenario has one site (the first is at line ${scenario.site.loc.line})`, t);
+          scenario.site = this.parseSite(leading);
+          break;
+        }
         case 'station': {
           const block = this.parseStation(leading);
           const name = Parser.literal(block.name);
@@ -494,6 +707,7 @@ class Parser {
     const end = this.comments.slice(this.ci).map((c) => c.text);
     if (end.length) comments.end = end;
     if (Object.keys(comments).length) scenario.comments = comments;
+    this.checkAttachments(scenario);
     return scenario;
   }
 
@@ -784,6 +998,24 @@ class Parser {
         this.advance();
         return { kind: t.value, message: this.parseStr(`message after '${t.value}'`), loc };
       }
+      case 'site':
+        return this.parseAttach(loc);
+      case 'trip':
+      case 'reclose': {
+        this.advance();
+        const node = this.parseStr(`device id after '${t.value}'`);
+        if (t.value === 'reclose') return { kind: 'reclose', node, loc };
+        const stmt: Stmt = { kind: 'trip', node, loc };
+        if (this.atWord('phases')) {
+          this.advance();
+          stmt.phases = this.parsePhaseList("after 'trip ... phases'");
+        }
+        return stmt;
+      }
+      case 'load':
+        return this.parseLoad(loc);
+      case 'controller':
+        return this.parseController(loc);
       case 'use': {
         this.advance();
         const what = this.peek();
@@ -796,6 +1028,493 @@ class Parser {
       }
       default:
         return this.fail(`unknown statement '${t.value}'`);
+    }
+  }
+
+  // ---- the site ------------------------------------------------------------------------------------------------
+
+  private parseSite(leading: string[]): SiteBlock {
+    const kw = this.advance();
+    const name = this.expectPlain("site name after 'site'");
+    this.expectPunct('{', `to open site "${name.raw}"`);
+    const [body, end] = this.parseSiteBody('site', kw, true);
+    const node = withEnd<SiteBlock>({ kind: 'site', name, body, loc: Parser.loc(kw) }, end);
+    this.attach(node, leading);
+    if (!body.some((i) => i.kind === 'supply')) {
+      this.fail(`site "${name.raw}" needs a supply line, as in 'supply 3x400V 250A'`, node.loc);
+    }
+    checkSiteBlock(node, this.file);
+    return node;
+  }
+
+  /** Site lines up to and including the closing `}`. `top`: the site block itself (supply, controller, ...). */
+  private parseSiteBody(what: string, opener: Token, top: boolean): [SiteItem[], string[]] {
+    const body: SiteItem[] = [];
+    for (;;) {
+      this.skipNewlines();
+      const t = this.peek();
+      if (this.atPunct('}')) {
+        const end = this.takeLeading(t.line);
+        this.advance();
+        return [body, end];
+      }
+      if (t.type === 'eof') this.fail(`expected '}' to close ${what} block opened at line ${opener.line}`);
+      if (!Parser.isWord(t)) this.fail(`expected a site line, got ${Parser.describe(t)}`);
+      const leading = this.takeLeading(t.line);
+      const item = this.parseSiteItem(t, top);
+      this.attach(item, leading);
+      this.endStmt(t.value);
+      body.push(item);
+    }
+  }
+
+  private parseSiteItem(t: Token, top: boolean): SiteItem {
+    const loc = Parser.loc(t);
+    const onlyTop = () => {
+      if (!top) this.fail(`'${t.value}' belongs in the site block itself, not inside a node`);
+    };
+    switch (t.value) {
+      case 'supply': {
+        onlyTop();
+        this.advance();
+        const args = this.parseSiteArgs(LINE_SPECS.supply, 'supply');
+        if (!args.some((a) => a.key === 'system'))
+          this.fail("expected the supply system, as in 'supply 3x400V 250A'", loc);
+        return { kind: 'supply', args, loc };
+      }
+      case 'tolerance': {
+        onlyTop();
+        this.advance();
+        this.expectWord('seed', "after 'tolerance'");
+        return { kind: 'tolerance', seed: this.expectNumber("after 'tolerance seed'"), loc };
+      }
+      case 'time': {
+        onlyTop();
+        this.advance();
+        const time = this.expectPlain("timestamp after 'time'");
+        const text = time.parts.join('');
+        if (!ISO_WITH_ZONE.test(text) || Number.isNaN(Date.parse(text))) {
+          this.fail(`invalid timestamp "${text}" after 'time', expected ISO 8601 with a zone`, time.loc);
+        }
+        return { kind: 'time', time, loc };
+      }
+      case 'controller':
+        onlyTop();
+        return this.parseController(loc);
+      case 'expect': {
+        onlyTop();
+        this.advance();
+        const check = this.parseSiteCheck();
+        if (!check) {
+          this.fail(
+            "a site block takes site assertions only: 'expect no trip', 'expect no violation', 'expect \"Q1\" current <= 63A', 'expect site imbalance <= 16A'",
+          );
+        }
+        return { kind: 'siteExpect', check, loc };
+      }
+      default:
+        if (SITE_NODE_TYPES.has(t.value)) return this.parseSiteNode(t.value as SiteNodeType);
+        return this.fail(
+          `unknown site line '${t.value}', expected ${top ? 'supply, tolerance, time, controller, expect or ' : ''}a node: ${[...SITE_NODE_TYPES].join(', ')}`,
+        );
+    }
+  }
+
+  private parseSiteNode(type: SiteNodeType): SiteNode {
+    const kw = this.advance();
+    let id: StringExpr | undefined;
+    if (this.peek().type === 'string') id = this.expectPlain(`${type} id`);
+    else if (type !== 'cable')
+      this.fail(`expected the ${type}'s id as a string, as in ${type} "X1", got ${Parser.describe(this.peek())}`);
+    const what = `${type}${id ? ` "${id.raw}"` : ''}`;
+    const args = this.parseSiteArgs(LINE_SPECS[type], what);
+    const node: SiteNode = { kind: 'node', type, args, loc: Parser.loc(kw) };
+    if (id) node.id = id;
+    if (this.atPunct('{')) {
+      if (SITE_LEAVES.has(type)) this.fail(`a ${type} is a leaf of the site: it has no block of its own`);
+      const open = this.advance();
+      const [children, end] = this.parseSiteBody(what, open, false);
+      node.children = children.filter((c): c is SiteNode => c.kind === 'node');
+      withEnd(node, end);
+    }
+    return node;
+  }
+
+  /** The settings of one site line, up to `{` or the end of the line. */
+  private parseSiteArgs(spec: LineSpec, what: string): SiteArg[] {
+    const args: SiteArg[] = [];
+    const line = this.peek().line;
+    for (;;) {
+      const t = this.peek();
+      if (t.type === 'newline' || t.type === 'eof' || t.line !== line) break;
+      if (this.atPunct('{') || this.atPunct('}') || this.atPunct(';')) break;
+      const loc = Parser.loc(t);
+      const keySpec = Parser.isWord(t) ? (spec.keys[t.value] ?? COMMON_KEYS[t.value]) : undefined;
+      let arg: SiteArg;
+      if (keySpec) {
+        this.advance();
+        const value =
+          keySpec.t === 'flag' ? ({ kind: 'flag' } as const) : this.parseSiteValue(keySpec, `'${t.value}' in ${what}`);
+        arg = { key: t.value, positional: false, value, loc };
+      } else {
+        const value = this.parseSitePositional(what);
+        const slot = spec.positional.find((p) => !args.some((a) => a.key === p.key) && siteAccepts(p.spec, value));
+        if (!slot) {
+          const taken = spec.positional.find((p) => siteAccepts(p.spec, value));
+          if (taken) this.fail(`${taken.key} given twice in ${what}`, loc);
+          const keys = Object.keys({ ...spec.keys, ...COMMON_KEYS });
+          this.fail(
+            `unexpected ${Parser.describe(t)} in ${what}${keys.length ? ` (settings: ${keys.join(', ')})` : ''}`,
+            loc,
+          );
+        }
+        arg = { key: slot.key, positional: true, value, loc };
+      }
+      const first = args.find((a) => a.key === arg.key);
+      if (first) this.fail(`${arg.key} given twice in ${what} (first at ${first.loc.line}:${first.loc.col})`, loc);
+      args.push(arg);
+    }
+    return args;
+  }
+
+  /** A setting written without its key: a number with its unit, a word, a string or a `3x400V` system. */
+  private parseSitePositional(what: string): SiteValue {
+    const t = this.peek();
+    if (t.type === 'string') return { kind: 'string', value: this.expectString(what) };
+    if (Parser.isWord(t)) return { kind: 'word', value: this.advance().value };
+    if (t.type === 'int' || t.type === 'number') {
+      const next = this.peek(1);
+      const sys = /^x(\d+(?:\.\d+)?)V$/.exec(next.value);
+      if (t.type === 'int' && Parser.isWord(next) && sys && next.col === t.col + t.value.length) {
+        const phases = Number(t.value);
+        if (phases !== 1 && phases !== 3) this.fail(`a supply has 1 or 3 phases, got ${phases}`, t);
+        this.advance();
+        this.advance();
+        return { kind: 'system', phases, voltageV: Number(sys[1]) };
+      }
+      return this.parseSiteNumber(what, false);
+    }
+    return this.fail(`expected a setting of ${what}, got ${Parser.describe(t)}`);
+  }
+
+  private parseSiteValue(spec: SiteSpec, what: string): SiteValue {
+    switch (spec.t) {
+      case 'string':
+        return { kind: 'string', value: this.expectString(what) };
+      case 'word': {
+        const t = this.peek();
+        if (!Parser.isWord(t) || !spec.words.includes(t.value)) {
+          this.fail(`expected ${spec.words.join(', ')} after ${what}, got ${Parser.describe(t)}`);
+        }
+        return { kind: 'word', value: this.advance().value };
+      }
+      case 'dur': {
+        const t = this.peek();
+        let sign = 1;
+        if (spec.signed && (this.atPunct('-') || this.atPunct('+'))) sign = this.advance().value === '-' ? -1 : 1;
+        const d = this.parseDurationLit(`after ${what}`, Parser.loc(t), sign);
+        return { kind: 'duration', ms: d.ms, unit: d.unit, ...(spec.signed ? { signed: true } : {}) };
+      }
+      case 'phases':
+        return { kind: 'phases', words: this.parsePhaseWords(`after ${what}`) };
+      case 'num': {
+        const v = this.parseSiteNumber(what, spec.signed ?? false);
+        if (!siteAccepts(spec, v)) {
+          const units = Object.keys(SITE_UNITS[spec.units]).filter(Boolean);
+          this.fail(`${what} takes ${units.length ? `a number in ${units.join(', ')}` : 'a plain number'}`);
+        }
+        return v;
+      }
+      default:
+        return this.fail(`unexpected ${Parser.describe(this.peek())} after ${what}`);
+    }
+  }
+
+  /** A number and its unit (attached, or apart on the same line when it is a known one). */
+  private parseSiteNumber(what: string, signed: boolean): SiteValue {
+    let sign = 1;
+    if (signed && (this.atPunct('-') || this.atPunct('+'))) sign = this.advance().value === '-' ? -1 : 1;
+    const t = this.peek();
+    if (t.type !== 'int' && t.type !== 'number') this.fail(`expected a number in ${what}, got ${Parser.describe(t)}`);
+    this.advance();
+    const value: SiteValue = { kind: 'number', value: sign * Number(t.value) };
+    const u = this.peek();
+    const attached = u.line === t.line && u.col === t.col + t.value.length;
+    if (u.type === 'punct' && u.value === '%' && attached) {
+      this.advance();
+      value.unit = '%';
+    } else if (Parser.isWord(u) && attached) {
+      this.advance();
+      value.unit = u.value;
+    }
+    return value;
+  }
+
+  private parsePhaseWords(what: string): string[] {
+    const out: string[] = [];
+    const line = this.peek().line;
+    while (Parser.isWord(this.peek()) && this.peek().line === line && PHASE_WORD.test(this.peek().value)) {
+      out.push(this.advance().value);
+    }
+    if (out.length === 0) this.fail(`expected phases such as L1, L2L3L1 ${what}, got ${Parser.describe(this.peek())}`);
+    return out;
+  }
+
+  private parsePhaseList(what: string): Array<'L1' | 'L2' | 'L3'> {
+    const out: Array<'L1' | 'L2' | 'L3'> = [];
+    for (const w of this.parsePhaseWords(what)) for (const p of w.match(/L[123]/g) ?? []) out.push(p as 'L1');
+    return out;
+  }
+
+  /** `controller reference [every 10s] [margin 5%] [min 6A]` or `controller none`. */
+  private parseController(loc: Loc): ControllerStmt {
+    this.advance();
+    const mode = this.peek();
+    if (!this.atWord('reference') && !this.atWord('none')) {
+      this.fail(`expected 'reference' or 'none' after 'controller', got ${Parser.describe(mode)}`);
+    }
+    const node: ControllerStmt = { kind: 'controller', mode: this.advance().value as 'reference' | 'none', loc };
+    if (node.mode === 'none') return node;
+    for (;;) {
+      if (this.atWord('every') && node.every === undefined) {
+        const t = this.advance();
+        node.every = this.parseDurationLit("after 'every'", Parser.loc(t));
+      } else if (this.atWord('margin') && node.marginPct === undefined) {
+        this.advance();
+        node.marginPct = this.expectNumber("after 'margin'");
+        this.expectPunct('%', 'after the margin');
+      } else if (this.atWord('min') && node.minA === undefined) {
+        this.advance();
+        node.minA = this.expectNumber("after 'min'");
+        this.expectWord('A', 'after the minimum current');
+      } else return node;
+    }
+  }
+
+  /**
+   * `site "Depot" at "SB1" [evse N] [phases L2L3L1|L2|rotate] [max 32A] [breaker C 40A] [cable 10mm2 Cu 25m C]`.
+   */
+  private parseAttach(loc: Loc): SiteAttachStmt {
+    this.advance();
+    const site = this.expectPlain("site name after 'site'");
+    this.expectWord('at', `after 'site "${site.raw}"'`);
+    const at = this.parseStr("node id after 'at'");
+    const node: SiteAttachStmt = { kind: 'site', site, at, loc };
+    const seen = new Set<string>();
+    for (;;) {
+      const t = this.peek();
+      if (!Parser.isWord(t) || t.line !== loc.line) return node;
+      if (seen.has(t.value)) this.fail(`'${t.value}' given twice`);
+      seen.add(t.value);
+      switch (t.value) {
+        case 'evse':
+          this.advance();
+          node.evse = this.expectNumber("after 'evse'");
+          if (!Number.isInteger(node.evse) || node.evse < 1) this.fail(`EVSE id must be an integer >= 1`, t);
+          break;
+        case 'phases': {
+          this.advance();
+          const w = this.peek();
+          if (this.atWord('rotate')) node.phases = this.advance().value;
+          else {
+            if (!Parser.isWord(w) || !PHASE_WORD.test(w.value) || (w.value.length !== 2 && w.value.length !== 6)) {
+              this.fail(`expected a phase mapping (L2L3L1, L2) or 'rotate' after 'phases', got ${Parser.describe(w)}`);
+            }
+            node.phases = this.advance().value;
+          }
+          break;
+        }
+        case 'max': {
+          this.advance();
+          node.maxA = this.expectNumber("after 'max'");
+          this.expectWord('A', 'after the EVSE rating');
+          break;
+        }
+        case 'breaker': {
+          this.advance();
+          const c = this.peek();
+          if (!Parser.isWord(c) || !SITE_CURVES.has(c.value))
+            this.fail(`expected curve B, C or D after 'breaker', got ${Parser.describe(c)}`);
+          this.advance();
+          const rating = this.expectNumber('for the breaker rating');
+          this.expectWord('A', 'after the breaker rating');
+          node.breaker = { curve: c.value as 'B' | 'C' | 'D', ratingA: rating };
+          break;
+        }
+        case 'cable': {
+          this.advance();
+          const args = this.parseCableArgs();
+          node.cable = args;
+          break;
+        }
+        default:
+          this.fail(`unexpected '${t.value}' in site attachment (evse, phases, max, breaker, cable)`);
+      }
+    }
+  }
+
+  /** `10mm2 [Cu|Al] 25m [method]` after `cable` in an attachment. */
+  private parseCableArgs(): NonNullable<SiteAttachStmt['cable']> {
+    const mm2 = this.parseSiteNumber("'cable'", false);
+    if (mm2.kind !== 'number' || mm2.unit !== 'mm2')
+      this.fail("expected the cross-section in mm2 after 'cable', as in 10mm2");
+    const out: NonNullable<SiteAttachStmt['cable']> = { mm2: mm2.value, lengthM: 0 };
+    if (this.atWord('Cu') || this.atWord('Al')) out.material = this.advance().value as 'Cu' | 'Al';
+    const len = this.parseSiteNumber("'cable'", false);
+    if (len.kind !== 'number' || (len.unit !== 'm' && len.unit !== 'km'))
+      this.fail('expected the cable length in m after the cross-section, as in 25m');
+    out.lengthM = len.value * (len.unit === 'km' ? 1000 : 1);
+    const method = this.peek();
+    if (Parser.isWord(method) && ['A1', 'B1', 'B2', 'C', 'E'].includes(method.value)) out.method = this.advance().value;
+    return out;
+  }
+
+  /** `load "X" set 20kW [pf 0.9]` / `load "X" profile "f.csv" [linear|step] [loop daily]` / `load "X" on|off`. */
+  private parseLoad(loc: Loc): Stmt {
+    this.advance();
+    const node = this.parseStr("load id after 'load'");
+    const op = this.peek();
+    if (this.atWord('set')) {
+      this.advance();
+      const v = this.parseSiteNumber("'load ... set'", true);
+      if (!siteAccepts(num('W', true), v) || v.kind !== 'number')
+        this.fail("'load ... set' takes a power in W, kW or MW");
+      const scale = (SITE_UNITS.W as Record<string, number>)[v.unit ?? ''] ?? 1;
+      const stmt: Stmt = { kind: 'load', node, op: 'set', watts: v.value * scale, unit: v.unit ?? 'W', loc };
+      if (this.atWord('pf')) {
+        this.advance();
+        stmt.pf = this.expectNumber("after 'pf'");
+      }
+      return stmt;
+    }
+    if (this.atWord('profile')) {
+      this.advance();
+      const file = this.expectPlain("profile file after 'load ... profile'");
+      const stmt: Stmt = { kind: 'load', node, op: 'profile', file, loc };
+      for (;;) {
+        if ((this.atWord('linear') || this.atWord('step')) && !stmt.interpolation) {
+          stmt.interpolation = this.advance().value as 'linear' | 'step';
+        } else if (this.atWord('loop') && !stmt.loop) {
+          this.advance();
+          const w = this.peek();
+          if (!this.atWord('none') && !this.atWord('daily') && !this.atWord('weekly')) {
+            this.fail(`expected none, daily or weekly after 'loop', got ${Parser.describe(w)}`);
+          }
+          stmt.loop = this.advance().value as 'none' | 'daily' | 'weekly';
+        } else return stmt;
+      }
+    }
+    if (this.atWord('on') || this.atWord('off'))
+      return { kind: 'load', node, op: this.advance().value as 'on' | 'off', loc };
+    return this.fail(
+      `expected 'set', 'profile', 'on' or 'off' after 'load ${Parser.describe(this.tokens[this.pos - 1] as Token)}', got ${Parser.describe(op)}`,
+    );
+  }
+
+  /**
+   * A site assertion after `expect`, or undefined when what follows is an OCPP expectation: `no trip ["Q1"]`,
+   * `no violation [kind] ["Q1"]`, `"Q1" current <= 63A [phase L2]`, `site imbalance <= 16A`.
+   */
+  private parseSiteCheck(): SiteCheck | undefined {
+    const t = this.peek();
+    const next = this.peek(1);
+    if (this.atWord('no') && Parser.isWord(next) && (next.value === 'trip' || next.value === 'violation')) {
+      this.advance();
+      this.advance();
+      const node = (): StringExpr | undefined =>
+        this.peek().type === 'string' && this.peek().line === t.line ? this.expectString('node id') : undefined;
+      if (next.value === 'trip') {
+        const id = node();
+        return id ? { kind: 'noTrip', node: id } : { kind: 'noTrip' };
+      }
+      const check: SiteCheck = { kind: 'noViolation' };
+      const k = this.peek();
+      if (Parser.isWord(k) && k.line === t.line) {
+        if (!Object.hasOwn(VIOLATION_WORDS, k.value)) {
+          this.fail(`unknown violation '${k.value}', expected ${Object.keys(VIOLATION_WORDS).join(', ')}`);
+        }
+        check.violation = this.advance().value;
+      }
+      const id = node();
+      if (id) check.node = id;
+      return check;
+    }
+    if (t.type === 'string') {
+      const id = this.expectString('node id');
+      this.expectWord('current', `after expect "${id.raw}"`);
+      const maxA = this.parseAtMost('A', 'current');
+      const check: SiteCheck = { kind: 'current', node: id, maxA };
+      if (this.atWord('phase')) {
+        this.advance();
+        const p = this.peek();
+        if (!Parser.isWord(p) || !SITE_CHECK_PHASES.has(p.value))
+          this.fail(`expected L1, L2 or L3 after 'phase', got ${Parser.describe(p)}`);
+        check.phase = this.advance().value as 'L1' | 'L2' | 'L3';
+      }
+      return check;
+    }
+    if (this.atWord('site') && Parser.isWord(next) && next.value === 'imbalance') {
+      this.advance();
+      this.advance();
+      return { kind: 'imbalance', maxA: this.parseAtMost('A', 'imbalance') };
+    }
+    return undefined;
+  }
+
+  /** `<= 63A`. */
+  private parseAtMost(unit: string, what: string): number {
+    this.expectPunct('<=', `after '${what}'`);
+    const n = this.expectNumber(`after '<='`);
+    this.expectWord(unit, `after the ${what} limit`);
+    return n;
+  }
+
+  /**
+   * Station attachments: only at the top level of a station block (they are wiring, resolved before the run), at
+   * most one per EVSE, to the scenario's site, at a node that can take children.
+   */
+  private checkAttachments(scenario: Scenario): void {
+    const nested = (body: Stmt[], where: string) => {
+      const walk = (stmts: Stmt[], top: boolean) => {
+        for (const st of stmts) {
+          if (st.kind === 'site' && !top) {
+            this.fail(
+              `'site ... at' wires the station to the site: it belongs at the top level of a station block, not in ${where}`,
+              st.loc,
+            );
+          }
+          if (st.kind === 'at' || st.kind === 'repeat') walk(st.body, false);
+          if (st.kind === 'choose') for (const b of st.branches) walk(b.body, false);
+        }
+      };
+      walk(body, where === 'a station block');
+    };
+    for (const p of scenario.procs) nested(p.body, `proc ${p.name}`);
+    for (const q of scenario.quirks) nested(q.body, `quirk "${q.name.raw}"`);
+    const points = scenario.site ? attachPoints(scenario.site) : undefined;
+    for (const st of scenario.stations) {
+      nested(st.body, 'a station block');
+      const evses = new Map<number, Loc>();
+      for (const s of st.body) {
+        if (s.kind !== 'site') continue;
+        const siteName = s.site.parts.join('');
+        if (!scenario.site) this.fail(`there is no site "${siteName}": add a site block`, s.site.loc);
+        if (siteName !== scenario.site.name.parts.join('')) {
+          this.fail(`unknown site "${siteName}" (the scenario's site is "${scenario.site.name.raw}")`, s.site.loc);
+        }
+        const id = s.evse ?? 1;
+        const first = evses.get(id);
+        if (first) this.fail(`EVSE ${id} is attached twice (first at line ${first.line})`, s.loc);
+        evses.set(id, s.loc);
+        if (
+          s.at.kind === 'string' &&
+          Parser.literal(s.at) !== undefined &&
+          points &&
+          !points.has(Parser.literal(s.at) as string)
+        ) {
+          this.fail(`site "${siteName}" has no node "${s.at.raw}" to attach to`, s.at.loc);
+        }
+      }
     }
   }
 
@@ -891,6 +1610,8 @@ class Parser {
 
   private parseExpect(loc: Loc): Stmt {
     this.advance();
+    const check = this.parseSiteCheck();
+    if (check) return { kind: 'siteExpect', check, loc };
     let frame: ExpectFrame | undefined;
     const f = this.peek();
     if (Parser.isWord(f) && EXPECT_FRAMES.has(f.value)) frame = this.advance().value as ExpectFrame;

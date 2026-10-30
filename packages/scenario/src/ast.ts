@@ -215,6 +215,131 @@ export type FailStmt = { kind: 'fail'; message: StrExpr; loc: Loc };
  */
 export type UseStmt = { kind: 'use'; target: 'quirk' | 'plugin'; name: StringExpr; loc: Loc };
 
+// ---- the electrical site ----------------------------------------------------------------------------------------
+
+/** A value in a site line: a number with its unit as written, a bare word, a string, a duration, or phase words. */
+export type SiteValue =
+  | { kind: 'number'; value: number; unit?: string }
+  | { kind: 'word'; value: string }
+  | { kind: 'string'; value: StringExpr }
+  | { kind: 'duration'; ms: number; unit: DurationUnit; signed?: boolean }
+  /** `3x400V`: a supply system. */
+  | { kind: 'system'; phases: 1 | 3; voltageV: number }
+  /** `phases L1 L2` / `phases L2L3L1`: the phase words as written. */
+  | { kind: 'phases'; words: string[] }
+  /** A key written alone (`on`). */
+  | { kind: 'flag' };
+
+/**
+ * One setting of a site line. `key` names what it sets; `positional` settings are written without their key
+ * (`250A` is the rating of a fuse, `gG` its class) and the formatter writes them back that way.
+ */
+export type SiteArg = { key: string; positional: boolean; value: SiteValue; loc: Loc };
+
+export type SiteNodeType =
+  | 'transformer'
+  | 'fuse'
+  | 'breaker'
+  | 'board'
+  | 'cable'
+  | 'meter'
+  | 'load'
+  | 'pv'
+  | 'battery'
+  | 'step';
+
+/** `breaker "Q1" C 63A 3p { ... }`: a node of the site tree. `id` may be left out on a cable only. */
+export type SiteNode = {
+  kind: 'node';
+  type: SiteNodeType;
+  id?: StringExpr;
+  args: SiteArg[];
+  children?: SiteNode[];
+  loc: Loc;
+  comments?: Comments;
+  endComments?: string[];
+};
+
+/** `supply 3x400V 250A`: the grid connection. */
+export type SiteSupply = { kind: 'supply'; args: SiteArg[]; loc: Loc; comments?: Comments };
+/** `tolerance seed 42`: seeded tolerance band positions of the protective devices. */
+export type SiteTolerance = { kind: 'tolerance'; seed: number; loc: Loc; comments?: Comments };
+/** `time "2026-06-21T07:00:00Z"`: the instant the load models read at the start of the run. */
+export type SiteTime = { kind: 'time'; time: StringExpr; loc: Loc; comments?: Comments };
+
+/** `controller reference [every 10s] [margin 5%] [min 6A]` or `controller none`. */
+export type ControllerStmt = {
+  kind: 'controller';
+  mode: 'reference' | 'none';
+  every?: DurationLit;
+  marginPct?: number;
+  minA?: number;
+  loc: Loc;
+};
+
+/** What a site assertion checks, over the run so far (at the end of the run in the site block). */
+export type SiteCheck =
+  /** `expect no trip ["Q1"]` */
+  | { kind: 'noTrip'; node?: StringExpr }
+  /** `expect no violation [kind] ["Q1"]`; `violation` is the DSL word (`overcurrent`, `cableAmpacity`, ...). */
+  | { kind: 'noViolation'; violation?: string; node?: StringExpr }
+  /** `expect "Q1" current <= 63A [phase L2]`: the highest current seen. */
+  | { kind: 'current'; node: StringExpr; maxA: number; phase?: 'L1' | 'L2' | 'L3' }
+  /** `expect site imbalance <= 16A`: the largest phase imbalance at the grid connection. */
+  | { kind: 'imbalance'; maxA: number };
+export type SiteExpectStmt = { kind: 'siteExpect'; check: SiteCheck; loc: Loc };
+
+export type SiteItem =
+  | SiteNode
+  | SiteSupply
+  | SiteTolerance
+  | SiteTime
+  | (ControllerStmt & { comments?: Comments })
+  | (SiteExpectStmt & { comments?: Comments });
+
+/** `site "Depot" { ... }`: the electrical site the stations hang from. */
+export type SiteBlock = {
+  kind: 'site';
+  name: StringExpr;
+  body: SiteItem[];
+  loc: Loc;
+  comments?: Comments;
+  endComments?: string[];
+};
+
+/**
+ * `site "Depot" at "SB1" [evse N] [phases L2L3L1|L2|rotate] [max 32A] [breaker C 40A] [cable 10mm2 Cu 25m C]`:
+ * the station's EVSE hangs from a node of the site (top level of a station block only).
+ */
+export type SiteAttachStmt = {
+  kind: 'site';
+  site: StringExpr;
+  at: StrExpr;
+  evse?: number;
+  /** A mapping (`L2L3L1`, `L2`) or `rotate` (the k-th charger at a node gets the k-th cyclic rotation). */
+  phases?: string;
+  maxA?: number;
+  breaker?: { curve: 'B' | 'C' | 'D'; ratingA: number };
+  cable?: { mm2: number; material?: 'Cu' | 'Al'; lengthM: number; method?: string };
+  loc: Loc;
+};
+/** `trip "Q1" [phases L1]` / `reclose "Q1"`: operate a protective device. */
+export type TripStmt = { kind: 'trip'; node: StrExpr; phases?: Array<'L1' | 'L2' | 'L3'>; loc: Loc };
+export type RecloseStmt = { kind: 'reclose'; node: StrExpr; loc: Loc };
+/** `load "HVAC" set 20kW [pf 0.9]` / `load "HVAC" profile "f.csv" [linear|step] [loop daily]` / `load "X" on|off`. */
+export type LoadStmt =
+  | { kind: 'load'; node: StrExpr; op: 'set'; watts: number; unit: string; pf?: number; loc: Loc }
+  | {
+      kind: 'load';
+      node: StrExpr;
+      op: 'profile';
+      file: StringExpr;
+      interpolation?: 'step' | 'linear';
+      loop?: 'none' | 'daily' | 'weekly';
+      loc: Loc;
+    }
+  | { kind: 'load'; node: StrExpr; op: 'on' | 'off'; loc: Loc };
+
 export type Stmt = (
   | VersionStmt
   | EvsesStmt
@@ -253,6 +378,12 @@ export type Stmt = (
   | LogStmt
   | FailStmt
   | UseStmt
+  | SiteAttachStmt
+  | TripStmt
+  | RecloseStmt
+  | LoadStmt
+  | ControllerStmt
+  | SiteExpectStmt
 ) & { comments?: Comments };
 
 export type StmtKind = Stmt['kind'];
@@ -304,6 +435,8 @@ export type Scenario = {
   quirks: QuirkDecl[];
   procs: ProcDecl[];
   stations: StationBlock[];
+  /** The electrical site, when the scenario has one. */
+  site?: SiteBlock;
   /** Comments on the header line and the `csms` line, and comments after the last declaration. */
   comments?: { header?: Comments; csms?: Comments; end?: string[] };
 };

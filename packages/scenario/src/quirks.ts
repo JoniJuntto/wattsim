@@ -16,7 +16,7 @@
 import { realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Clock, Station } from '@wattsim/core';
-import type { Loc, NumExpr, QuirkDecl, Scenario, Stmt, UseStmt } from './ast';
+import type { Loc, NumExpr, QuirkDecl, Scenario, SiteNode, Stmt, UseStmt } from './ast';
 import { ParseError } from './lexer';
 import { parse } from './parser';
 
@@ -35,6 +35,8 @@ export type Linked = {
   plugins: Map<string, PluginRef>;
   /** Directory the scenario's own relative paths resolve against. */
   dir: string;
+  /** Load profile files the site block and `load ... profile` statements name: absolute path -> text. */
+  profiles?: Map<string, string>;
 };
 
 export type LinkOptions = {
@@ -217,7 +219,11 @@ export async function link(scenario: Scenario, opts: LinkOptions = {}): Promise<
     }
     const lib = parse(src, shown);
     const other =
-      lib.stations[0] ?? lib.procs[0] ?? lib.lets[0] ?? (lib.csms ? { kind: 'csms', loc: lib.csms.loc } : undefined);
+      lib.stations[0] ??
+      lib.procs[0] ??
+      lib.lets[0] ??
+      lib.site ??
+      (lib.csms ? { kind: 'csms', loc: lib.csms.loc } : undefined);
     if (other) {
       throw located(
         `a quirk file holds only import and quirk declarations, but this is a '${other.kind}' declaration`,
@@ -274,7 +280,20 @@ export async function link(scenario: Scenario, opts: LinkOptions = {}): Promise<
     }
   }
   checkCycles(quirks);
-  return { quirks, applied, plugins, dir };
+  const profiles = new Map<string, string>();
+  for (const ref of profileRefs(scenario)) {
+    const abs = resolve(dir, ref.path);
+    if (profiles.has(abs)) continue;
+    if (root && !(await inRoot(root, abs)))
+      throw located('load profile outside the scenario folder', ref.loc, opts.file);
+    try {
+      profiles.set(abs, await read(abs));
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw located(`cannot read load profile ${display(abs)}: ${reason}`, ref.loc, opts.file);
+    }
+  }
+  return { quirks, applied, plugins, dir, profiles };
 }
 
 function known(quirks: Map<string, QuirkSource>): string {
@@ -301,6 +320,29 @@ function checkCycles(quirks: Map<string, QuirkSource>): void {
     done.add(name);
   };
   for (const name of quirks.keys()) visit(name, []);
+}
+
+/** Every load profile file the scenario names (site block and `load ... profile` statements), as written. */
+export function profileRefs(scenario: Scenario): Array<{ path: string; loc: Loc }> {
+  const out: Array<{ path: string; loc: Loc }> = [];
+  const nodes = (list: readonly SiteNode[]) => {
+    for (const n of list) {
+      for (const a of n.args)
+        if (a.key === 'profile' && a.value.kind === 'string')
+          out.push({ path: a.value.value.parts.join(''), loc: a.loc });
+      if (n.children) nodes(n.children);
+    }
+  };
+  if (scenario.site) nodes(scenario.site.body.filter((i): i is SiteNode => i.kind === 'node'));
+  const walk = (body: Stmt[]) => {
+    for (const st of body) {
+      if (st.kind === 'load' && st.op === 'profile') out.push({ path: st.file.parts.join(''), loc: st.file.loc });
+      if (st.kind === 'at' || st.kind === 'repeat') walk(st.body);
+      if (st.kind === 'choose') for (const b of st.branches) walk(b.body);
+    }
+  };
+  for (const b of [...scenario.stations, ...scenario.procs]) walk(b.body);
+  return out;
 }
 
 /** Import every plugin module. Throws `ParseError` at the first `use plugin` of a module that fails. */
