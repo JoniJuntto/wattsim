@@ -6,7 +6,7 @@ something other than its own fake CSMS. Nightly job: `.github/workflows/interop.
 | CSMS | OCPP | Station id | idTag / idToken | URL to pass to `wattsim run --csms` |
 |---|---|---|---|---|
 | SteVe 3.14.1 | 1.6J | `WS-16-1` | `TAG-16-1` | `ws://localhost:8180/steve/websocket/CentralSystemService` |
-| CitrineOS v2.1.0 | 2.0.1 | `WS-201-1` | `TAG-201-1` (type `ISO14443`) | `ws://localhost:8081` |
+| CitrineOS v2.1.0 | 2.0.1 | `WS-201-1` | `AA201001` (type `ISO14443`; CitrineOS requires an ISO14443 token to be 8 or 14 hex chars) | `ws://localhost:8081` |
 
 Both CSMSs take the station id from the last URL path segment, so the station appends `/<id>` to the base URL
 (`.../CentralSystemService/WS-16-1`, `ws://localhost:8081/WS-201-1`).
@@ -84,7 +84,7 @@ CitrineOS port 8081 has `allowUnknownChargingStations: true` (`apps/ocpp-server/
 in the image) and `ocpp.unknownChargerStatus` defaults to `Accepted`, so `WS-201-1` boots without any setup;
 the station row is created on first connect. `Authorize` for an unknown token returns `Unknown`, so
 `citrineos-init` runs `interop/init/citrineos.sql` after CitrineOS is healthy (migrations done, default tenant
-id 1 exists) and inserts `TAG-201-1` into `"Authorizations"` with `idTokenType=ISO14443`, `status=Accepted`.
+id 1 exists) and inserts `AA201001` into `"Authorizations"` with `idTokenType=ISO14443`, `status=Accepted`.
 The 2.0.1 Authorize handler looks the token up by `idToken` **and** `type`, so the station must send
 `idToken.type: "ISO14443"` for this row to match. Ports 8082/8443/8444 reject unknown stations; use 8081.
 
@@ -104,10 +104,14 @@ needed for a charger to boot, authorize and run a transaction over security prof
 
 ## Scenarios
 
-`interop/scenarios/steve-16.ws` and `interop/scenarios/citrineos-201.ws`: boot, plug, authorize, start, wait 2 min,
-stop, unplug, with `expect` on each response. They parse with the current `@wattsim/scenario` parser; the `expect`
-payload shapes assume the interpreter (plan Task 7) partial-matches the CALLRESULT payload for an outgoing action
-by action name, as the DSL grammar in `docs/superpowers/plans/2026-10-29-milestone-1.md` describes.
+`interop/scenarios/steve-16.ws` and `interop/scenarios/citrineos-201.ws`: boot, plug, authorize, `ev ready`, start, wait 2 min,
+stop, unplug, with `expect` on each response. `interop/scenarios/steve-16-netdrop.ws` is the SteVe scenario with
+`meterInterval 10s` and `at +30s { net drop 15s }`, to check that MeterValues sampled offline are queued and accepted
+after reconnect; it is not part of the nightly matrix. All three are canonical (`wattsim fmt` exits 0), which is why
+they carry a `log` line instead of comments: `fmt` drops comments in milestone 1.
+
+`ev ready evse 1` is explicit because a transaction on an EV that was plugged but not readied currently reports
+`SuspendedEV` and 0 Wh; once the station readies the EV itself the line becomes redundant but harmless.
 
 ## Caveats
 
@@ -123,25 +127,34 @@ by action name, as the DSL grammar in `docs/superpowers/plans/2026-10-29-milesto
 - **Apple Silicon.** `postgis/postgis` runs under amd64 emulation (OrbStack/Rosetta or Docker Desktop). Slower, works.
 - **Port clashes.** Fixed host ports by default (table above); override with the env vars if 8081/8082/8180 are taken.
 - **Persistent volumes.** Without `down -v`, DB state (including transactions from earlier runs) persists.
-- **CLI not there yet.** The workflow calls `bun packages/cli/src/index.ts run ... --csms ... --junit ...` (plan
-  Task 8). Until that lands the two scenario steps fail; the stack, probes, init and teardown already work.
+- **CitrineOS validates ISO14443 tokens.** `Authorize` with a non-hex `idToken` of type `ISO14443` gets
+  `CALLERROR PropertyConstraintViolation "ISO14443 tokens must be either 8 or 14 hexadecimal characters (0-9, A-F)"`,
+  hence `AA201001`. `TransactionEvent` with the same bad token is still answered `Accepted`.
+- **CitrineOS sends `CostUpdated`** after every `TransactionEvent`; wattsim answers `CALLERROR NotImplemented`,
+  which CitrineOS tolerates (the transaction completes and is stored).
+- **SteVe stores `transactionData` twice.** Every periodic sample reaches `connector_meter_value` once from the
+  `MeterValues` CALL and once more from the `transactionData` array in `StopTransaction` (identical timestamps and
+  values), so expect 2x the sample rows plus the `Transaction.Begin`/`Transaction.End` rows.
 - **CitrineOS security profile 0 only.** 8082 (basic auth) needs a station password set via
   `POST /commands/setStationPassword`; not wired up here.
 
 ## Verification status (2026-10-30, Apple Silicon Mac, OrbStack, Compose v5.5.0)
 
-Verified locally:
+Verified locally with the CLI, real time (no `--virtual`), warm volumes (`up -d --build --wait` exit 0 in ~60 s):
 
-- `down -v` then `up -d --build --wait`: exit 0 in 62 s cold (SteVe Maven build 30 s, app up 15 s later;
-  CitrineOS migrations + start ~45 s). Re-running `up -d --wait` on the running stack: exit 0.
-- `steve-init` inserted `WS-16-1` / `TAG-16-1` (`charge_box`, `ocpp_tag` only require the id columns);
-  `citrineos-init` inserted `TAG-201-1` and the `WS-201-1` station row (unique on `ocppConnectionName, tenantId`).
-- `ws-probe` to `ws://localhost:8180/steve/websocket/CentralSystemService/WS-16-1` with `ocpp1.6`: upgrade
-  accepted, negotiated `ocpp1.6`. An unregistered id gets HTTP 404 on the upgrade (SteVe default).
-- `ws-probe` to `ws://localhost:8081/WS-201-1` with `ocpp2.0.1`: accepted, negotiated `ocpp2.0.1`; CitrineOS
-  auto-created the station row on the first (pre-init) connect, confirming `allowUnknownChargingStations` on 8081.
-- Both scenario files parse and format idempotently with `@wattsim/scenario`.
+- `steve-16.ws`: `8/8 asserts passed; 0 violations; 120.2s`, exit 0. SteVe `transaction` row: `start_value 0`,
+  `stop_value 736`, `stop_reason Local`; `connector_meter_value` 30 rows (`Energy.Active.Import.Register` 0, 368, 736 Wh
+  at 60 s spacing, 22080 W, 230 V, 32 A, SoC 20.0 -> 21.2 %). 736 Wh over 120 s at 22.08 kW is right.
+- `citrineos-201.ws`: `7/7 asserts passed; 0 violations; 120.3s`, exit 0. `"Transactions"` row: `totalKwh 0.736`,
+  `timeSpentCharging 120`, `stoppedReason Local`, `authorizationId` -> `AA201001`; 4 `"MeterValues"` rows
+  (Transaction.Begin 0, Sample.Periodic 368 and 736, Transaction.End 736 Wh); `"TransactionEvents"` Started/Updated/
+  Updated/Ended with `seqNo` 0..3.
+- `steve-16-netdrop.ws`: `8/8`, exit 0. The one `MeterValues` sampled while offline (245 Wh at 00:26:45) was flushed
+  first thing after reconnect and SteVe stored it; `stop_value 736`. SteVe re-sends `GetConfiguration` on every
+  connect; wattsim does not re-send `BootNotification` after a drop. Known fidelity gap: the sampling cadence
+  re-anchors at the drop and again at the reconnect, so the samples due at +30 s and +50 s were skipped (gaps of
+  20 s and 15 s instead of 10 s); the energy register itself stays consistent.
+- Both scenario files and the netdrop copy parse and `fmt` to themselves.
 
-Not verified: an actual OCPP session (BootNotification through StopTransaction) against either CSMS, because the
-station runtime and CLI do not exist yet; the `expect` payload shapes and the `--csms`/`--junit` flags follow the
-milestone-1 plan. The GitHub Actions workflow has not been run.
+Not verified: the GitHub Actions workflow itself has not been run; with the token fix above both scenario steps pass
+locally with the exact commands it uses.

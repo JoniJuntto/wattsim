@@ -165,7 +165,7 @@ services:
       start_period: 60s
 
   citrineos-init:
-    # Pre-registers station WS-201-1 and idToken TAG-201-1 (ISO14443, Accepted) for tenant 1.
+    # Pre-registers station WS-201-1 and idToken AA201001 (ISO14443, Accepted) for tenant 1.
     # Port 8081 accepts unknown stations anyway; the row exists so the station also works on 8082
     # once a password is set, and so Authorize returns Accepted instead of Unknown.
     # Same sleep-after-insert pattern as steve-init (see there).
@@ -180,7 +180,7 @@ services:
       - ./init/citrineos.sql:/init/citrineos.sql:ro
     entrypoint: ['sh', '-c']
     command:
-      - "psql -v ON_ERROR_STOP=1 -h citrineos-db -U citrine -d citrine -f /init/citrineos.sql && echo 'citrineos-init done: WS-201-1 / TAG-201-1 registered' && touch /tmp/init-done && exec sleep infinity"
+      - "psql -v ON_ERROR_STOP=1 -h citrineos-db -U citrine -d citrine -f /init/citrineos.sql && echo 'citrineos-init done: WS-201-1 / AA201001 registered' && touch /tmp/init-done && exec sleep infinity"
     healthcheck:
       test: ['CMD', 'test', '-f', '/tmp/init-done']
       interval: 2s
