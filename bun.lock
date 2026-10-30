@@ -87,6 +87,14 @@
         "wattsim": "workspace:*",
       },
     },
+    "packages/grid": {
+      "name": "@wattsim/grid",
+      "version": "0.0.1",
+      "devDependencies": {
+        "@types/bun": "catalog:",
+        "typescript": "catalog:",
+      },
+    },
     "packages/lsp": {
       "name": "@wattsim/lsp",
       "version": "0.0.1",
@@ -953,6 +961,8 @@
     "@wattsim/csms": ["@wattsim/csms@workspace:packages/csms"],
 
     "@wattsim/docs": ["@wattsim/docs@workspace:packages/docs"],
+
+    "@wattsim/grid": ["@wattsim/grid@workspace:packages/grid"],
 
     "@wattsim/lsp": ["@wattsim/lsp@workspace:packages/lsp"],
 

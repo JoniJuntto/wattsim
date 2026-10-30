@@ -346,6 +346,64 @@ New EV properties (`EvConfig`; all optional):
 
 **Models.** `meterModel: 'constant'` draws one constant power per transaction (the EV's limit at its initial soc, capped by the offer) and leaves soc and temperature alone. Use it for load runs. `evFactory` and `meterFactory` in `StationConfig` build the `EvModel` / `MeterModel` for each EV and EVSE, so a subclass can replace either model.
 
+## Electrical site model
+
+`@wattsim/grid` models the site behind the chargers for testing dynamic load management (DLM). A site is a tree under a supply: transformer, fuse, breaker, board, cable and meter nodes, with EVSE, load, PV, battery and step-load leaves. The package is pure. It has no sockets and no timers, and time (epoch ms) comes in as a parameter, so the same site runs on the wall clock or a virtual one.
+
+```ts
+import { siteBuilder } from '@wattsim/grid';
+
+const site = siteBuilder({ phases: 3, voltageV: 400, ratingA: 250 })
+  .transformer('T1', { kva: 400, ukPercent: 4 }, (t) =>
+    t.fuse('F0', { ratingA: 250 }, (f) =>
+      f.board('MDB', { ratingA: 250 }, (b) =>
+        b
+          .breaker('Q1', { type: 'mcb', curve: 'C', ratingA: 40 }, (q) =>
+            q.cable('W1', { mm2: 10, lengthM: 40, method: 'C' }, (w) => w.evse('CP-1', { phases: 'L2L3L1' })),
+          )
+          .load('HVAC', { model: { type: 'shape', preset: 'office', peakW: 40_000 } }),
+      ),
+    ),
+  )
+  .build();
+
+const state = site.evaluate(t, { ...site.loadDraws(t), 'CP-1': { amps: [32, 32, 32] } });
+const next = site.nextEvent(); // { t, type: 'trip', nodeId: 'Q1', cause: 'thermal' } or null
+```
+
+`buildSite(json)` takes the same description as plain JSON, which is what the DSL and the UI import produce. It reports every problem with its path, for example an unknown phase, an EVSE wired to a phase its supply point lacks, or a cable whose Iz is below the In of the device protecting it.
+
+**Phases.** Currents are per-phase phasors at each load's power factor. They add up the tree, so PV export cancels import. The neutral current is the phasor sum of the phase currents: 0 for a balanced load, 16 A for a single-phase 16 A load. An EVSE is wired by a rotation (`L1L2L3`, `L2L3L1`, `L3L1L2`, or the anti-cyclic orders) or to one phase (`L2`). Its draw is given in its own phase order. A draw is `{ amps: [...] }` per leaf phase, or `{ watts, pf }` split over the leaf's phases at nominal voltage.
+
+**Evaluation.** `site.evaluate(t, draws)` returns each node's per-phase current, neutral current, active and apparent power, voltage, loading against its rating, and the thermal memory of each protective device. Voltage falls down the tree through the transformer impedance (uk, ur) and through the phase and neutral impedance of each cable (IEC 60228 resistance, 0.08 Ω/km reactance). Between two calls the leaves hold their last draws, and each protective device integrates its curve over that interval exactly. A trip inside the interval happens at its own instant and removes the subtree's current from the devices upstream from that instant on. `site.nextEvent(t, draws)` solves the same thing forward analytically and does not change the site, so a virtual clock can jump straight to a trip or an automatic reclose.
+
+**Protection.** Each curve is `tripTime(I / In)` in seconds from cold, at the median of the standard's tolerance band by default. A seeded spread (`tolerance: { seed }`) or a fixed `band` per device moves it within the band.
+
+| Device | Characteristic points |
+|---|---|
+| MCB / RCBO B, C, D | IEC 60898-1 Table 7: 1.13 In no trip for 1 h (2 h above 63 A), 1.45 In trips within it, 2.55 In between 1 and 60 s (120 s above 32 A), magnetic 3–5 / 5–10 / 10–20 In |
+| gG fuse | IEC 60269-1 Table 2 conventional non-fusing and fusing currents and times per rating band. Pre-arcing curve through the Table 3 gates: Imin(10 s), Imax(5 s), Imin(0.1 s), Imax(0.1 s) |
+| MCCB | IEC 60947-2: Ir with 1.05 / 1.30 Ir conventional currents, tr at 6 Ir (I²t), Isd with tsd, Ii, pickup tolerance ±20 % |
+
+Thermal memory is a normalised I²t accumulator: heat grows by dt / tripTime(m) and cools exponentially (`coolingS`) when the device is not heating. A single pulse at 2.55 In shorter than the curve does not trip, but repeated pulses can. Magnetic, short-time and instantaneous releases have no memory. A breaker opens all poles together. A fuse blows per link, so a leaf can lose one phase; `site.supplyOf(leafId)` gives its live phases and voltages, or `null` when it is dead. `site.trip(id)` and `site.reclose(id)` operate a device by hand (reclosing a fuse replaces it). `reclose: { afterS, attempts }` on a breaker recloses it automatically after a protection trip.
+
+**Violations and events.** Each node tracks these violations, each with start, end, peak and the integral over the limit (A·s, or V·s for voltage):
+- current over its rating;
+- a cable over its ampacity (IEC 60364-5-52 Annex B, PVC, methods A1/B1/B2/C/E, Cu 1.5–240 mm², Al 16–240 mm², 2 or 3 loaded conductors);
+- a transformer over its rated current;
+- voltage outside ±10 % (EN 50160);
+- neutral current over its rating;
+- phase imbalance over a threshold (16 A at the supply by default; set it per board or meter).
+
+`site.on(fn)` receives `trip`, `reclose`, `violation-start` and `violation-end` events. They also arrive in each returned state.
+
+**Static checks.** `site.check()` reports three kinds of issue:
+- selectivity: an upstream device that trips no later than a downstream one at the downstream device's magnetic threshold, upstream at its fast tolerance edge and downstream at its slow one;
+- cable coordination: Ib ≤ In and I2 ≤ 1.45 Iz (IEC 60364-4-43 §433.1), and cables with no protection;
+- ratings: a device rated above what feeds it, and connected ratings above a node's rating.
+
+**Loads and score.** Non-EV leaves have models: a constant load; a CSV profile (`timestamp,power[,pf]`, step or linear interpolation, looped daily or weekly); daily shapes; PV with a clear-sky bell and seeded cloud noise; a battery with soc, power limits and a setpoint; and an on/off step load. `site.loadDraws(t)` evaluates them all. `dlmScore(samples)` scores a run's sampled states: peak utilisation per node, seconds and A·s over the limit, trips, energy per EVSE, unmet energy against requests, the Jain fairness of the allocated power across active EVSEs, and the largest phase imbalance.
+
 ## Record, replay and proxy
 
 ```sh
