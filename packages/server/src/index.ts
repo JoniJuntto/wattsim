@@ -69,7 +69,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
   // signing works with zero setup. Created on first use.
   const startLoopback = async (): Promise<Csms> => {
     const ca = await createTestCa({ name: 'wattsim test CA' });
-    return startCsms({ port: 0, signer: ({ csr, identity }) => signCsr(ca, csr, { identity }) });
+    // Same interface as the UI server, so `wattsim ui --host 0.0.0.0` makes the test CSMS reachable remotely too.
+    return startCsms({ host, port: 0, signer: ({ csr, identity }) => signCsr(ca, csr, { identity }) });
   };
 
   const app = new Elysia()

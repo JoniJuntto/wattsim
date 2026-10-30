@@ -317,8 +317,9 @@ const lanAddress = Object.values(networkInterfaces())
 
 describe('--attach to a server on another host', () => {
   test.skipIf(lanAddress === undefined)(
-    'run_scenario without csmsUrl reports the unreachable test CSMS instead of dialing 127.0.0.1 here',
+    'run_scenario without csmsUrl reaches the test CSMS of a UI server bound to all interfaces',
     async () => {
+      // The test CSMS listens on the UI server's host, so it is reachable at the attached host, not at 127.0.0.1 here.
       const ui = await startServer({ port: 0, host: '0.0.0.0' });
       const port = new URL(ui.url).port;
       const mcp = await createMcp({ attach: `http://${lanAddress}:${port}` });
@@ -326,13 +327,42 @@ describe('--attach to a server on another host', () => {
       try {
         const text = await Bun.file(BASIC).text();
         const r = await call(client, 'run_scenario', { text });
-        expect(r.isError).toBe(true);
-        expect(r.text).toContain(`ws://${lanAddress}:`);
-        expect(r.text).toContain('csmsUrl');
+        expect(r.isError).toBeFalsy();
+        expect(r.data.ok).toBe(true);
       } finally {
         await client.close();
         await mcp.close();
         await ui.stop();
+      }
+    },
+  );
+
+  test.skipIf(lanAddress === undefined)(
+    'run_scenario without csmsUrl reports an unreachable test CSMS instead of dialing 127.0.0.1 here',
+    async () => {
+      // A server whose test CSMS listens on loopback only: from another host it cannot be reached.
+      const stub = Bun.serve({
+        hostname: '0.0.0.0',
+        port: 0,
+        fetch: (req) => {
+          const path = new URL(req.url).pathname;
+          if (path === '/api/health') return Response.json({ ok: true, version: 'stub' });
+          if (path === '/api/loopback') return Response.json({ url: 'ws://127.0.0.1:1' });
+          return Response.json({ error: 'not found' }, { status: 404 });
+        },
+      });
+      const mcp = await createMcp({ attach: `http://${lanAddress}:${stub.port}` });
+      const client = await connect(mcp);
+      try {
+        const text = await Bun.file(BASIC).text();
+        const r = await call(client, 'run_scenario', { text });
+        expect(r.isError).toBe(true);
+        expect(r.text).toContain(`ws://${lanAddress}:1`);
+        expect(r.text).toContain('csmsUrl');
+      } finally {
+        await client.close();
+        await mcp.close();
+        await stub.stop(true);
       }
     },
   );
