@@ -33,6 +33,44 @@ function make(opts: Partial<ConstructorParameters<typeof Connection>[0]> = {}): 
   return conn;
 }
 
+/**
+ * Connect a fresh Connection, retrying when the host refuses the local socket (ephemeral-port exhaustion). The
+ * reconnect backoff runs on the virtual clock, which no test advances during open, so a refused first open would
+ * otherwise hang until the 5 s test timeout.
+ */
+async function connected(opts: Partial<ConstructorParameters<typeof Connection>[0]> = {}): Promise<Connection> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const conn = make(opts);
+    const opened = await Promise.race([
+      conn.connect().then(
+        () => true,
+        () => false,
+      ),
+      Bun.sleep(1500).then(() => false),
+    ]);
+    if (opened) return conn;
+    await conn.disconnect();
+    open.pop();
+  }
+  throw new Error('could not connect to FakeCsms');
+}
+
+/** `conn.connect()` with the same refused-socket retry as `connected()`, for tests that attach listeners first. */
+async function openConn(conn: Connection): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const opened = await Promise.race([
+      conn.connect().then(
+        () => true,
+        () => false,
+      ),
+      Bun.sleep(1500).then(() => false),
+    ]);
+    if (opened) return;
+    await conn.disconnect();
+  }
+  throw new Error('could not connect to FakeCsms');
+}
+
 beforeEach(async () => {
   csms = await FakeCsms.start({ version: 'ocpp1.6' });
   clock = new VirtualClock(T0);
@@ -49,7 +87,7 @@ describe('Connection: connect and disconnect', () => {
     const states: ConnectionState[] = [];
     conn.on('state', (s) => states.push(s));
     expect(conn.state).toBe('Disconnected');
-    await conn.connect();
+    await openConn(conn);
     expect(conn.state).toBe('Connected');
     expect(states).toEqual(['Connecting', 'Connected']);
     await until(() => csms.isConnected('CP1'));
@@ -58,15 +96,13 @@ describe('Connection: connect and disconnect', () => {
   });
 
   test('sends HTTP basic auth on the upgrade', async () => {
-    const conn = make({ basicAuth: { user: 'CP1', password: 's3cret' } });
-    await conn.connect();
+    await connected({ basicAuth: { user: 'CP1', password: 's3cret' } });
     await until(() => csms.isConnected('CP1'));
     expect(csms.authorizationOf('CP1')).toBe(`Basic ${btoa('CP1:s3cret')}`);
   });
 
   test('disconnect closes the socket and schedules no reconnect', async () => {
-    const conn = make();
-    await conn.connect();
+    const conn = await connected();
     await until(() => csms.isConnected('CP1'));
     await conn.disconnect();
     expect(conn.state).toBe('Disconnected');
@@ -76,9 +112,8 @@ describe('Connection: connect and disconnect', () => {
   });
 
   test('connect twice is a no-op while connected', async () => {
-    const conn = make();
-    await conn.connect();
-    await conn.connect();
+    const conn = await connected();
+    await openConn(conn);
     expect(conn.state).toBe('Connected');
   });
 
@@ -94,8 +129,7 @@ describe('Connection: connect and disconnect', () => {
 
 describe('Connection: request/response', () => {
   test('request resolves with the CSMS reply', async () => {
-    const conn = make();
-    await conn.connect();
+    const conn = await connected();
     const result = (await conn.request('BootNotification', BOOT)) as { status: string; interval: number };
     expect(result.status).toBe('Accepted');
     expect(result.interval).toBe(300);
@@ -109,7 +143,7 @@ describe('Connection: request/response', () => {
     const conn = make();
     const seen: Array<['in' | 'out', number, string]> = [];
     conn.on('frame', (dir, frame, raw) => seen.push([dir, frame.type, raw]));
-    await conn.connect();
+    await openConn(conn);
     await conn.request('Heartbeat', {});
     expect(seen.map(([d, t]) => [d, t])).toEqual([
       ['out', 2],
@@ -119,8 +153,7 @@ describe('Connection: request/response', () => {
   });
 
   test('times out on the virtual clock when the CSMS never answers, then sends the next request', async () => {
-    const conn = make();
-    await conn.connect();
+    const conn = await connected();
     csms.respondWith('BootNotification', () => undefined);
     const first = outcome(conn.request('BootNotification', BOOT));
     const second = conn.request('Heartbeat', {});
@@ -137,8 +170,7 @@ describe('Connection: request/response', () => {
   });
 
   test('custom requestTimeoutMs', async () => {
-    const conn = make({ requestTimeoutMs: 5000 });
-    await conn.connect();
+    const conn = await connected({ requestTimeoutMs: 5000 });
     csms.respondWith('Heartbeat', () => undefined);
     const p = outcome(conn.request('Heartbeat', {}));
     await until(() => csms.receivedFrom('CP1').length === 1);
@@ -147,8 +179,7 @@ describe('Connection: request/response', () => {
   });
 
   test('CALLERROR from the CSMS rejects with CallError', async () => {
-    const conn = make();
-    await conn.connect();
+    const conn = await connected();
     csms.respondWith('Heartbeat', () => new CsmsCallError('InternalError', 'boom'));
     const err = await conn.request('Heartbeat', {}).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CallError);
@@ -161,7 +192,7 @@ describe('Connection: request/response', () => {
     const conn = make();
     const errors: Error[] = [];
     conn.on('error', (e) => errors.push(e));
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     csms.send('CP1', { type: 3, id: 'nope', payload: {} });
     await until(() => errors.length === 1);
@@ -173,7 +204,7 @@ describe('Connection: request/response', () => {
     const conn = make();
     const errors: Error[] = [];
     conn.on('error', (e) => errors.push(e));
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     csms.sendRaw('CP1', 'not json');
     await until(() => errors.length === 1);
@@ -184,8 +215,7 @@ describe('Connection: request/response', () => {
 
 describe('Connection: offline queue and reconnect', () => {
   test('requests queue while disconnected and flush in order after reconnect', async () => {
-    const conn = make();
-    await conn.connect();
+    const conn = await connected();
     await until(() => csms.isConnected('CP1'));
     csms.dropClient('CP1');
     await until(() => conn.state === 'Disconnected');
@@ -205,8 +235,7 @@ describe('Connection: offline queue and reconnect', () => {
   });
 
   test('an in-flight CALL interrupted by a drop is re-sent once after reconnect', async () => {
-    const conn = make();
-    await conn.connect();
+    const conn = await connected();
     csms.respondWith('StartTransaction', () => undefined);
     const p = conn.request('StartTransaction', { connectorId: 1, idTag: 'ABC', meterStart: 0, timestamp: 'x' });
     await until(() => csms.receivedFrom('CP1').length === 1);
@@ -223,7 +252,7 @@ describe('Connection: offline queue and reconnect', () => {
     const conn = make();
     const p = conn.request('Heartbeat', {});
     expect(conn.queuedCount()).toBe(1);
-    await conn.connect();
+    await openConn(conn);
     await expect(p).resolves.toHaveProperty('currentTime');
   });
 
@@ -231,7 +260,7 @@ describe('Connection: offline queue and reconnect', () => {
     const conn = make({ reconnect: { initialMs: 1000, maxMs: 3000, factor: 2 } });
     const states: ConnectionState[] = [];
     conn.on('state', (s) => states.push(s));
-    await conn.connect();
+    await openConn(conn);
     const port = csms.port;
     await csms.stop();
     await until(() => conn.state === 'Disconnected');
@@ -256,8 +285,7 @@ describe('Connection: offline queue and reconnect', () => {
   });
 
   test('reconnect: false stays disconnected after a drop', async () => {
-    const conn = make({ reconnect: false });
-    await conn.connect();
+    const conn = await connected({ reconnect: false });
     await until(() => csms.isConnected('CP1'));
     csms.dropClient('CP1');
     await until(() => conn.state === 'Disconnected');
@@ -272,7 +300,7 @@ describe('Connection: strict mode', () => {
     const conn = make();
     const violations: Violation[] = [];
     conn.on('violation', (v) => violations.push(v));
-    await conn.connect();
+    await openConn(conn);
     csms.respondWith('BootNotification', () => ({ status: 'Bogus', currentTime: 'now', interval: 300 }));
     const err = await conn.request('BootNotification', BOOT).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ViolationError);
@@ -286,7 +314,7 @@ describe('Connection: strict mode', () => {
     const conn = make();
     const violations: Violation[] = [];
     conn.on('violation', (v) => violations.push(v));
-    await conn.connect();
+    await openConn(conn);
     await expect(conn.request('BootNotification', { chargePointVendor: 'x' })).resolves.toHaveProperty('status');
     expect(violations.length).toBe(1);
     expect(violations[0]).toMatchObject({ action: 'BootNotification', direction: 'request', path: 'chargePointModel' });
@@ -302,7 +330,7 @@ describe('Connection: strict mode', () => {
       dispatched++;
       reply({ status: 'Accepted' });
     });
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     const err = await csms.call('CP1', 'RemoteStartTransaction', { idTag: 42 }).catch((e: unknown) => e);
     expect((err as Error).message).toMatch(/FormationViolation/);
@@ -314,7 +342,7 @@ describe('Connection: strict mode', () => {
     const conn = make({ strict: false });
     const violations: Violation[] = [];
     conn.on('violation', (v) => violations.push(v));
-    await conn.connect();
+    await openConn(conn);
     csms.respondWith('BootNotification', () => ({ status: 'Bogus' }));
     await expect(conn.request('BootNotification', {})).resolves.toEqual({ status: 'Bogus' });
     expect(violations).toEqual([]);
@@ -327,7 +355,7 @@ describe('Connection: inbound CALLs', () => {
     conn.on('call', (call, reply) => {
       if (call.action === 'RemoteStartTransaction') reply({ status: 'Accepted' });
     });
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     await expect(csms.call('CP1', 'RemoteStartTransaction', { idTag: 'ABC' })).resolves.toEqual({ status: 'Accepted' });
   });
@@ -335,14 +363,13 @@ describe('Connection: inbound CALLs', () => {
   test('a call listener can reply with a CALLERROR', async () => {
     const conn = make();
     conn.on('call', (_call, _reply, error) => error('NotSupported', 'nope'));
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     await expect(csms.call('CP1', 'UnlockConnector', { connectorId: 1 })).rejects.toThrow(/NotSupported: nope/);
   });
 
   test('without a listener the station replies NotImplemented', async () => {
-    const conn = make();
-    await conn.connect();
+    await connected();
     await until(() => csms.isConnected('CP1'));
     await expect(csms.call('CP1', 'UnlockConnector', { connectorId: 1 })).rejects.toThrow(/NotImplemented/);
   });
@@ -354,7 +381,7 @@ describe('Connection: inbound CALLs', () => {
       error('InternalError', 'late');
       reply({ status: 'Rejected' });
     });
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     await expect(csms.call('CP1', 'RemoteStartTransaction', { idTag: 'ABC' })).resolves.toEqual({ status: 'Accepted' });
     await Bun.sleep(20);
@@ -368,7 +395,7 @@ describe('Connection: inbound CALLs', () => {
     conn.on('call', () => {
       throw new Error('handler bug');
     });
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     await expect(csms.call('CP1', 'UnlockConnector', { connectorId: 1 })).rejects.toThrow(/InternalError/);
     expect(errors.length).toBe(1);
@@ -379,7 +406,7 @@ describe('Connection: inbound CALLs', () => {
   test('inbound CALLs do not block the outbound request pipeline', async () => {
     const conn = make();
     conn.on('call', (_call, reply) => reply({ status: 'Accepted' }));
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     csms.respondWith('Heartbeat', () => undefined);
     const pending = outcome(conn.request('Heartbeat', {}));
@@ -397,7 +424,7 @@ describe('Connection: chaos', () => {
     const conn = make({ chaos });
     const applied: Array<[string | undefined, Frame]> = [];
     conn.on('chaos', (rule, frame) => applied.push([rule.id, frame]));
-    await conn.connect();
+    await openConn(conn);
     const p = outcome(conn.request('Heartbeat', {}));
     await Bun.sleep(30);
     expect(csms.receivedFrom('CP1').length).toBe(0);
@@ -412,7 +439,7 @@ describe('Connection: chaos', () => {
     chaos.add({ match: { direction: 'out', action: 'Heartbeat' }, effect: { kind: 'duplicate' } });
     const conn = make({ chaos });
     conn.on('error', () => {}); // the second CALLRESULT has no matching CALL
-    await conn.connect();
+    await openConn(conn);
     await expect(conn.request('Heartbeat', {})).resolves.toHaveProperty('currentTime');
     await until(() => csms.receivedFrom('CP1').length === 2);
     const [a, b] = csms.callsFrom('CP1');
@@ -422,8 +449,7 @@ describe('Connection: chaos', () => {
   test('delay 500 on out: received only after advance(500)', async () => {
     const chaos = new ChaosEngine();
     chaos.add({ match: { direction: 'out', action: 'Heartbeat' }, effect: { kind: 'delay', ms: 500 } });
-    const conn = make({ chaos });
-    await conn.connect();
+    const conn = await connected({ chaos });
     const p = conn.request('Heartbeat', {});
     await Bun.sleep(30);
     expect(csms.receivedFrom('CP1').length).toBe(0);
@@ -437,8 +463,7 @@ describe('Connection: chaos', () => {
   test('corrupt on out: CSMS receives invalid JSON', async () => {
     const chaos = new ChaosEngine();
     chaos.add({ match: { direction: 'out' }, effect: { kind: 'corrupt' }, once: true });
-    const conn = make({ chaos });
-    await conn.connect();
+    const conn = await connected({ chaos });
     void conn.request('Heartbeat', {}).catch(() => {});
     await until(() => csms.invalid.length === 1);
     expect(() => JSON.parse(csms.invalid[0] as string)).toThrow();
@@ -451,7 +476,7 @@ describe('Connection: chaos', () => {
     const conn = make({ chaos });
     const errors: Error[] = [];
     conn.on('error', (e) => errors.push(e));
-    await conn.connect();
+    await openConn(conn);
     const p = outcome(conn.request('Heartbeat', {}));
     await until(() => errors.length === 1);
     expect(errors[0]?.message).toMatch(/unexpected message id/);
@@ -465,8 +490,7 @@ describe('Connection: chaos', () => {
       match: { direction: 'in', action: 'Heartbeat' },
       effect: { kind: 'callError', code: 'InternalError' },
     });
-    const conn = make({ chaos });
-    await conn.connect();
+    const conn = await connected({ chaos });
     const err = await conn.request('Heartbeat', {}).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CallError);
     expect((err as CallError).code).toBe('InternalError');
@@ -481,7 +505,7 @@ describe('Connection: chaos', () => {
       dispatched++;
       reply({ status: 'Unlocked' });
     });
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     await expect(csms.call('CP1', 'UnlockConnector', { connectorId: 1 })).rejects.toThrow(/InternalError/);
     expect(dispatched).toBe(0);
@@ -496,7 +520,7 @@ describe('Connection: chaos', () => {
       dispatched++;
       reply({ status: 'Unlocked' });
     });
-    await conn.connect();
+    await openConn(conn);
     await until(() => csms.isConnected('CP1'));
     let settled = false;
     const p = csms.call('CP1', 'UnlockConnector', { connectorId: 1 }).finally(() => {
@@ -518,7 +542,7 @@ describe('Connection: chaos', () => {
     const conn = make({ chaos });
     const violations: Violation[] = [];
     conn.on('violation', (v) => violations.push(v));
-    await conn.connect();
+    await openConn(conn);
     await conn.request('BootNotification', BOOT);
     const [call] = csms.callsFrom('CP1', 'BootNotification');
     expect(call?.payload).toEqual({ ...BOOT, chargePointModel: 'MUTATED' });
@@ -528,8 +552,7 @@ describe('Connection: chaos', () => {
   test('nth: 2 drop on in results: only the second reply is lost', async () => {
     const chaos = new ChaosEngine();
     chaos.add({ match: { direction: 'in', action: 'Heartbeat', nth: 2 }, effect: { kind: 'drop' } });
-    const conn = make({ chaos });
-    await conn.connect();
+    const conn = await connected({ chaos });
     await expect(conn.request('Heartbeat', {})).resolves.toHaveProperty('currentTime');
     const second = outcome(conn.request('Heartbeat', {}));
     await until(() => csms.callsFrom('CP1').length === 2);
@@ -602,7 +625,7 @@ describe('Connection: offline queue cap', () => {
     expect(errors.length).toBe(5);
     expect(conn.queuedCount()).toBe(3);
 
-    await conn.connect();
+    await openConn(conn);
     await Promise.all([start2, start3, stop]);
     expect(csms.callsFrom('CP1').map((c) => c.action)).toEqual([
       'StartTransaction',
