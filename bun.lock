@@ -122,6 +122,14 @@
         "typescript": "catalog:",
       },
     },
+    "packages/modbus": {
+      "name": "@wattsim/modbus",
+      "version": "0.0.1",
+      "devDependencies": {
+        "@types/bun": "catalog:",
+        "typescript": "catalog:",
+      },
+    },
     "packages/pki": {
       "name": "@wattsim/pki",
       "version": "0.0.1",
@@ -949,6 +957,8 @@
     "@wattsim/lsp": ["@wattsim/lsp@workspace:packages/lsp"],
 
     "@wattsim/mcp": ["@wattsim/mcp@workspace:packages/mcp"],
+
+    "@wattsim/modbus": ["@wattsim/modbus@workspace:packages/modbus"],
 
     "@wattsim/pki": ["@wattsim/pki@workspace:packages/pki"],
 

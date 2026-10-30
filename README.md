@@ -415,6 +415,59 @@ It gives you:
 
 The extension runs the server under Bun when `bun` is on PATH or in `~/.bun/bin`, and otherwise under the Node runtime built into VS Code; both run the same bundle (`bun build --target node`). The `wattsim.server.runtime` setting (`auto`, `bun`, `node`) overrides the choice. Other editors can run the server directly: `bun packages/lsp/src/bin.ts --stdio`.
 
+## Emulated Modbus meters
+
+Local DLM controllers read the site and sub-board meters over Modbus TCP. `@wattsim/modbus` serves emulated meters whose registers carry live values from wattsim's electrical model, so a controller can be pointed at wattsim instead of a real switchboard. The server is written from the Modbus Application Protocol v1.1b3 and Messaging on TCP/IP v1.0b specifications on `Bun.listen`, with no Modbus dependency. It supports function codes 03, 04, 06 and 16 where the meter's map allows them, exceptions 01 to 04, many concurrent clients, pipelined requests and requests split across TCP segments.
+
+```sh
+# a demo meter with fixed values (everything not given is derived: 230 V, 50 Hz, P = V·I·pf, ...)
+bun packages/modbus/src/cli.ts serve --map sdm630 --unit 1 --port 1502 --const currentL1=12.5,currentL2=8,importKwh=1234.5
+# read it back, decoded with the same map, or as raw registers
+bun packages/modbus/src/cli.ts read --port 1502 --unit 1 --map sdm630
+bun packages/modbus/src/cli.ts read --port 1502 --unit 1 --fc 4 --address 6 --count 2
+# print a register map as a table
+bun packages/modbus/src/cli.ts map em24
+```
+
+`--unit 1,2,3` serves several unit ids on one port, and `--per-port` starts one server per unit id on consecutive ports, since controllers differ. From TypeScript:
+
+```ts
+import { liveDevice, type MeterReading, sdm630, startModbus } from '@wattsim/modbus';
+
+let main: Partial<MeterReading> = { currentL1: 16 }; // updated by the electrical model
+const server = startModbus({ port: 502, devices: { 1: liveDevice(sdm630, () => main) } });
+// server.port, server.stop()
+```
+
+A device is a register map plus `read(quantity)`, called while a request is answered. The quantities (`voltageL1`, `currentL2`, `powerTotal`, `importKwh`, `breakerClosed`, ...) are the `MeterReading` type, the contract with the electrical model. Power is positive for import. A throwing `read` answers exception 04. With a single device, unit ids 0 and 255 reach it too. An unknown unit id answers exception 0Bh, or nothing with `unknownUnit: 'ignore'`.
+
+| Map | Meter | Encoding | Functions | Source |
+|---|---|---|---|---|
+| `sdm630` | Eastron SDM630-Modbus V2 | float32, most significant register first; a request may not split a float (02) and reads at most 80 registers | 03, 04, 16 | [Eastron SDM630Modbus Protocol Implementation V1.8](https://communityarchive.victronenergy.com/storage/attachments/sdm630-modbus-protocol.pdf) |
+| `em24` | Carlo Gavazzi EM24-DIN E1 (Ethernet), EM24DINAV23XE1X | INT32 least significant word first, scaled (V×10, A×1000, W×10, kWh×10); PF and Hz INT16/UINT16 | 03 = 04, 06 | [EM24_E1 Communication Protocol v0 rev 1.2](https://www.enika.cz/data/files/produkty/energy%20m/CP/em24%20ethernet%20cp.pdf) |
+| `generic` | wattsim generic meter | float32, most significant register first | 03 = 04, 06, 16 | below |
+
+The vendor maps cover the documented live values, energy registers and holding registers (SDM630 demand period, system type, network node, ...; EM24 password, measuring system, interval, tariff, reset commands, serial number and identification code), with the documents' ranges and defaults. Demand, THD, hour counters and tariff meters read 0, since wattsim does not model them.
+
+The generic map has every `MeterReading` quantity as a float32 at two registers each, in this order from address 0, read by FC 03 and FC 04 alike, so one 80-register read gets everything:
+
+| Address | Quantities |
+|---|---|
+| 0x00-0x0A | `voltageL1`, `voltageL2`, `voltageL3`, `voltageL1L2`, `voltageL2L3`, `voltageL3L1` (V) |
+| 0x0C-0x12 | `currentL1`, `currentL2`, `currentL3`, `currentN` (A) |
+| 0x14-0x1A | `powerL1`, `powerL2`, `powerL3`, `powerTotal` (W, import positive) |
+| 0x1C-0x22 | `apparentPowerL1` ... `apparentPowerTotal` (VA) |
+| 0x24-0x2A | `reactivePowerL1` ... `reactivePowerTotal` (var, inductive positive) |
+| 0x2C-0x32 | `powerFactorL1` ... `powerFactorTotal` |
+| 0x34 | `frequency` (Hz) |
+| 0x36-0x44 | `importKwh`, `exportKwh`, `importKwhL1`-`L3`, `exportKwhL1`-`L3` (kWh) |
+| 0x46-0x48 | `importKvarh`, `exportKvarh` |
+| 0x4A-0x4E | `breakerClosed` (1 closed, 0 open), `breakerRatingA` (A), `breakerThermal` (fraction of the trip threshold) |
+| 0xFE | map version (uint16, 1) |
+| 0x100, 0x102 | scratch registers for write tests: uint16 (FC 06/16) and float32 (FC 16) |
+
+`bun test packages/modbus` includes an interop test that reads and writes every map with [pymodbus](https://github.com/pymodbus-dev/pymodbus). It runs when `$WATTSIM_PYTHON` (default `python3`) can import pymodbus, and is skipped otherwise.
+
 ## Development
 
 ```sh
@@ -436,9 +489,10 @@ Packages, all Bun workspaces under `packages/`:
 - `vscode`: the VS Code extension (TextMate grammar generated from the parser, plus the language server)
 - `docs`: the documentation site (Fumadocs, static export; references generated from the code)
 - `trace`: Open OCPP Trace reading and writing, the recording proxy, replay, and trace-to-scenario conversion
+- `modbus`: emulated Modbus TCP energy meters (SDM630, EM24, generic map) for DLM controllers
 - `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`, `mcp`, `proxy`, `replay`, `quirk`)
 
-Style is Biome with two-space indent and single quotes; lefthook runs lint and typecheck on commit. Tests are `bun test` and never touch the network except through the in-repo fake CSMS.
+Style is Biome with two-space indent and single quotes; lefthook runs lint and typecheck on commit. Tests are `bun test` and only use local sockets on 127.0.0.1 (the in-repo CSMS, emulated meters, TLS endpoints); nothing reaches beyond the machine.
 
 ## License
 
