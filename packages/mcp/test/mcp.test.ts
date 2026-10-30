@@ -145,6 +145,22 @@ describe('embedded server', () => {
     });
     expect(rule).toMatchObject({ fault: 'drop', action: 'MeterValues', trigger: 'nth 3' });
     await ok(client, 'remove_chaos_rule', { stationId: 'CP-C', ruleId: rule.id as string });
+
+    // Milestone-4 faults and behavioural actions reach the server through the same tools.
+    const jitter = await ok(client, 'add_chaos_rule', { stationId: 'CP-C', fault: 'jitter', minMs: 10, maxMs: 20 });
+    expect(jitter).toMatchObject({ fault: 'jitter' });
+    const oversized = await ok(client, 'add_chaos_rule', {
+      stationId: 'CP-C',
+      fault: 'oversized',
+      direction: 'out',
+      kb: 2,
+    });
+    expect(oversized).toMatchObject({ fault: 'oversized' });
+    await ok(client, 'remove_chaos_rule', { stationId: 'CP-C', ruleId: oversized.id as string });
+    const misuse = await call(client, 'add_chaos_rule', { stationId: 'CP-C', fault: 'slowRead', direction: 'out' });
+    expect(misuse.isError).toBe(true);
+    await ok(client, 'station_action', { stationId: 'CP-C', type: 'fault', evse: 2 });
+    await ok(client, 'station_action', { stationId: 'CP-C', type: 'meter', op: 'reset', evse: 1 });
     await ok(client, 'delete_station', { stationId: 'CP-C' });
 
     const good = await ok(client, 'validate_payload', {

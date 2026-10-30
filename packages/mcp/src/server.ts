@@ -45,6 +45,10 @@ const ACTION_TYPES = [
   'stop',
   'status',
   'send',
+  'bootLoop',
+  'fault',
+  'meter',
+  'reset',
 ] as const;
 const CONNECTOR_STATUSES = [
   'Available',
@@ -57,7 +61,24 @@ const CONNECTOR_STATUSES = [
   'Unavailable',
   'Faulted',
 ] as const;
-const CHAOS_FAULTS = ['drop', 'delay', 'duplicate', 'corrupt', 'wrongId', 'callError', 'noResponse'] as const;
+const CHAOS_FAULTS = [
+  'drop',
+  'delay',
+  'duplicate',
+  'corrupt',
+  'wrongId',
+  'callError',
+  'noResponse',
+  'jitter',
+  'reorder',
+  'halfOpen',
+  'slowRead',
+  'reconnectStorm',
+  'invalidEnum',
+  'missingField',
+  'timestamp',
+  'oversized',
+] as const;
 
 const INSTRUCTIONS = `wattsim simulates OCPP charge points (stations) that connect to a CSMS (the backend that manages \
 them) over WebSocket. A station has one or more EVSEs (charging outlets, numbered from 1). To charge: create_station \
@@ -279,6 +300,11 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
         status: z.enum(CONNECTOR_STATUSES).optional().describe('status: the connector status to report'),
         action: z.string().min(1).optional().describe('send: OCPP action, e.g. DataTransfer'),
         payload: z.record(z.string(), z.unknown()).optional().describe('send: the CALL payload'),
+        count: z.number().int().min(0).max(20).optional().describe('bootLoop: how many reboots'),
+        code: z.string().min(1).max(50).optional().describe('fault: 1.6 ChargePointErrorCode or 2.x tech code'),
+        op: z.enum(['backwards', 'reset']).optional().describe('meter: run the register backwards, or reset it'),
+        wh: z.number().min(0).optional().describe('meter backwards: how many Wh'),
+        mode: z.enum(['hard', 'soft']).optional().describe('reset: hard (power loss) or soft (reboot)'),
       },
     },
     ({ stationId, ...body }) =>
@@ -298,9 +324,13 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
     {
       title: 'Add chaos rule',
       description:
-        "Inject a fault into a station's OCPP traffic: drop, delay (needs delayMs), duplicate, corrupt, wrongId " +
-        '(reply with a wrong message id), callError, noResponse. Narrow it with direction (out = station to CSMS) ' +
-        'and action; trigger on the nth match, every n-th, or with a probability. Returns the rule with its id.',
+        "Inject a fault into a station's OCPP traffic. Transport: drop, delay (delayMs), duplicate, corrupt, " +
+        'wrongId (reply with a wrong message id), callError, noResponse, jitter (minMs..maxMs), reorder (after N), ' +
+        'halfOpen (go silent, optional forMs then reconnect), slowRead (in only, stepMs grows per frame), ' +
+        'reconnectStorm (count drops within withinMs). Protocol, out only (deliberately invalid payloads): ' +
+        'invalidEnum / missingField (optional path), timestamp (shiftMs, signed), oversized (kb). Narrow it with ' +
+        'direction (out = station to CSMS) and action; trigger on the nth match, every n-th, or with a probability. ' +
+        'Returns the rule with its id.',
       inputSchema: {
         stationId,
         fault: z.enum(CHAOS_FAULTS),
@@ -311,6 +341,16 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
         probability: z.number().min(0).max(1).optional(),
         once: z.boolean().optional().describe('Remove the rule after it fires'),
         delayMs: z.number().int().min(0).optional().describe("Required for fault 'delay', not allowed otherwise"),
+        minMs: z.number().int().min(0).optional().describe('jitter: shortest delay'),
+        maxMs: z.number().int().min(0).optional().describe('jitter: longest delay'),
+        after: z.number().int().min(1).optional().describe('reorder: release after this many later frames'),
+        forMs: z.number().int().min(1).optional().describe('halfOpen: drop and reconnect after this long'),
+        stepMs: z.number().int().min(1).optional().describe('slowRead: extra wait per received frame'),
+        count: z.number().int().min(1).optional().describe('reconnectStorm: number of drops'),
+        withinMs: z.number().int().min(1).optional().describe('reconnectStorm: over this long'),
+        path: z.string().min(1).optional().describe('invalidEnum / missingField: payload path, e.g. idTagInfo.status'),
+        shiftMs: z.number().int().optional().describe('timestamp: shift every date-time field by this (signed)'),
+        kb: z.number().positive().optional().describe('oversized: pad the payload to this many kB'),
       },
     },
     ({ stationId, ...rule }) => guard(async () => api.post<Json>(`/api/stations/${enc(stationId)}/chaos`, rule)),
