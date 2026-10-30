@@ -1,0 +1,102 @@
+{
+  "name": "wattsim-vscode",
+  "displayName": "wattsim scenarios",
+  "description": "Language support for wattsim scenario files (.ws): highlighting, diagnostics, formatting, hover, completion and go to definition.",
+  "version": "0.0.1",
+  "publisher": "wattsim",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JoniJuntto/wattsim"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Snippets"
+  ],
+  "main": "./dist/extension.cjs",
+  "contributes": {
+    "languages": [
+      {
+        "id": "wattsim",
+        "aliases": [
+          "wattsim",
+          "wattsim scenario"
+        ],
+        "extensions": [
+          ".ws"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "wattsim",
+        "scopeName": "source.wattsim",
+        "path": "./dist/wattsim.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "wattsim",
+        "path": "./snippets/wattsim.json"
+      }
+    ],
+    "configuration": {
+      "title": "wattsim",
+      "properties": {
+        "wattsim.server.runtime": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "bun",
+            "node"
+          ],
+          "default": "auto",
+          "markdownDescription": "How to run the language server. `auto` uses `bun` when it is on PATH, otherwise the Node runtime built into VS Code."
+        },
+        "wattsim.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the communication between VS Code and the wattsim language server."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "wattsim.restartServer",
+        "title": "Restart language server",
+        "category": "wattsim"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "bun run scripts/grammar.ts && bun build src/extension.ts --target node --format cjs --external vscode --outfile dist/extension.cjs && bun build ../lsp/src/main.ts --target node --format cjs --outfile dist/server.cjs",
+    "package": "bun run build && vsce package --no-dependencies --skip-license --out wattsim.vsix",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "@types/vscode": "1.91.0",
+    "@vscode/vsce": "4.1.0",
+    "@wattsim/lsp": "workspace:*",
+    "@wattsim/protocol": "workspace:*",
+    "@wattsim/scenario": "workspace:*",
+    "typescript": "catalog:",
+    "vscode-jsonrpc": "10.0.0",
+    "vscode-languageclient": "11.0.0",
+    "vscode-languageserver": "11.0.0",
+    "vscode-oniguruma": "2.0.1",
+    "vscode-textmate": "9.3.2"
+  }
+}

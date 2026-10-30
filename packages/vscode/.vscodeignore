@@ -1,0 +1,8 @@
+**
+!dist/extension.cjs
+!dist/server.cjs
+!dist/wattsim.tmLanguage.json
+!snippets/wattsim.json
+!language-configuration.json
+!package.json
+!README.md

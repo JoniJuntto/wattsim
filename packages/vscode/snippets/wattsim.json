@@ -1,0 +1,94 @@
+{
+  "scenario": {
+    "prefix": "scenario",
+    "description": "A scenario file: header, CSMS URL and one station",
+    "body": [
+      "wattsim 1",
+      "",
+      "csms \"${1:ws://localhost:9000/ocpp}\"",
+      "",
+      "station \"${2:CP-1}\" {",
+      "  version ${3|1.6,2.0.1,2.1|}",
+      "  boot",
+      "  $0",
+      "}"
+    ]
+  },
+  "station": {
+    "prefix": "station",
+    "description": "A station block",
+    "body": ["station \"${1:CP-1}\" {", "  version ${2|1.6,2.0.1,2.1|}", "  boot", "  $0", "}"]
+  },
+  "station range": {
+    "prefix": "stationfor",
+    "description": "A fleet: one station per number in a range",
+    "body": [
+      "station \"${1:CP}-{${2:i}}\" for ${2:i} in ${3:1}..${4:10} {",
+      "  version ${5|1.6,2.0.1,2.1|}",
+      "  boot",
+      "  $0",
+      "}"
+    ]
+  },
+  "proc": {
+    "prefix": "proc",
+    "description": "A procedure, run with `call`",
+    "body": ["proc ${1:charge} {", "  $0", "}"]
+  },
+  "quirk": {
+    "prefix": "quirk",
+    "description": "A quirk profile, applied with `use quirk`",
+    "body": ["quirk \"${1:name}\" {", "  $0", "}"]
+  },
+  "charging session": {
+    "prefix": "session",
+    "description": "Plug in, authorize, charge, stop and unplug",
+    "body": [
+      "ev plug evse ${1:1} { battery ${2:60}kWh soc ${3:20}% target ${4:80}% }",
+      "authorize \"${5:TAG-1}\"",
+      "start evse ${1:1} tag \"${5:TAG-1}\"",
+      "wait ${6:30min}",
+      "stop evse ${1:1}",
+      "ev unplug evse ${1:1}"
+    ]
+  },
+  "at": {
+    "prefix": "at",
+    "description": "Run a block concurrently, after an offset",
+    "body": ["at +${1:30s} {", "  $0", "}"]
+  },
+  "repeat": {
+    "prefix": "repeat",
+    "description": "Run a block N times",
+    "body": ["repeat ${1:3} {", "  $0", "}"]
+  },
+  "choose": {
+    "prefix": "choose",
+    "description": "Pick one branch by weight",
+    "body": [
+      "choose {",
+      "  ${1:70}%: {",
+      "    ${2:wait 45min}",
+      "  }",
+      "  ${3:30}%: {",
+      "    ${4:call charge}",
+      "  }",
+      "}"
+    ]
+  },
+  "on": {
+    "prefix": "on",
+    "description": "Answer a CSMS call with a scripted reply",
+    "body": ["on ${1:Reset} ${2:always }{", "  reply {${3:status: \"Accepted\"}}", "}"]
+  },
+  "expect": {
+    "prefix": "expect",
+    "description": "Assert on the next matching message",
+    "body": ["expect ${1:StatusNotification} {${2:status: \"Available\"}} within ${3:5s}"]
+  },
+  "chaos": {
+    "prefix": "chaos",
+    "description": "A fault-injection rule",
+    "body": ["chaos ${1|drop,duplicate,corrupt,wrongId,callError,noResponse|} ${2|out,in|} ${3:MeterValues} nth ${4:3}"]
+  }
+}

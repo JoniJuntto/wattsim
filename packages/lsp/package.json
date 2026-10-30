@@ -1,0 +1,29 @@
+{
+  "name": "@wattsim/lsp",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "Apache-2.0",
+  "bin": {
+    "wattsim-lsp": "./src/bin.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "bun build src/main.ts --target node --format cjs --outfile dist/server.cjs",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@wattsim/csms": "workspace:*",
+    "@wattsim/protocol": "workspace:*",
+    "@wattsim/scenario": "workspace:*",
+    "vscode-languageserver": "11.0.0",
+    "vscode-languageserver-textdocument": "1.0.16"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "typescript": "catalog:",
+    "vscode-jsonrpc": "10.0.0"
+  }
+}
