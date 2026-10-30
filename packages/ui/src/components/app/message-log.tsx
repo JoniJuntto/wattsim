@@ -1,13 +1,5 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
-import {
-  ArrowDownToLineIcon,
-  ArrowLeftIcon,
-  ArrowRightIcon,
-  PauseIcon,
-  PlayIcon,
-  SearchIcon,
-  TriangleAlertIcon,
-} from 'lucide-react';
+import { ArrowDownToLineIcon, PauseIcon, PlayIcon, SearchIcon, TriangleAlertIcon } from 'lucide-react';
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { FrameEvent, Violation } from '@/api/types';
 import { Button } from '@/components/ui/button';
@@ -19,8 +11,10 @@ import { useDebounced } from '@/hooks/use-debounced';
 import { clockTime, duration, prettyJson } from '@/lib/format';
 import {
   actionsIn,
+  type Exchange,
   FRAME_TYPE_LABEL,
-  filterFrames,
+  groupExchanges,
+  type Initiator,
   isError,
   isResponse,
   type Pairing,
@@ -36,11 +30,21 @@ const NO_FRAMES: FrameEvent[] = [];
 const NO_VIOLATIONS: ViolationEntry[] = [];
 const ALL = '__all__';
 
-const TYPE_SHORT: Record<FrameEvent['type'], string> = { 2: 'CALL', 3: 'RESULT', 4: 'ERROR', 5: 'ERROR', 6: 'SEND' };
+/*
+ * The log is drawn as a sequence diagram. Every row has a gutter with two lanes, the charge point on the left and the
+ * CSMS on the right, and the rows stack so the lanes run unbroken down the whole log. Each exchange draws its request
+ * between the lanes and its reply back underneath. Lane x positions are shared by the header, the rows and the
+ * expanded detail through these constants: row padding + time column + gap, then the lane offsets inside the gutter.
+ */
+const GUTTER_START = 'calc(0.5rem + 5.6rem + 0.5rem)';
+const GUTTER_W = 68;
+const LANE_CP = 12;
+const LANE_CSMS = 56;
+const laneLeft = (x: number) => `calc(${GUTTER_START} + ${x}px)`;
 
-type RowProblem = 'error' | 'violation' | 'malformed' | 'unpaired' | null;
+type FrameProblem = 'error' | 'violation' | 'malformed' | 'unpaired' | null;
 
-function problemOf(f: FrameEvent, pairing: Pairing, violations: Violation[] | undefined): RowProblem {
+function problemOf(f: FrameEvent, pairing: Pairing, violations: Violation[] | undefined): FrameProblem {
   if (isError(f)) return 'error';
   if (violations?.length) return 'violation';
   if (!parseFrame(f).ok) return 'malformed';
@@ -48,130 +52,242 @@ function problemOf(f: FrameEvent, pairing: Pairing, violations: Violation[] | un
   return null;
 }
 
-const Row = memo(function Row({
+function exchangeProblems(ex: Exchange, pairing: Pairing, violationsBySeq: Map<number, Violation[]>): FrameProblem[] {
+  const out: FrameProblem[] = [];
+  for (const f of ex.frames) {
+    const p = problemOf(f, pairing, violationsBySeq.get(f.seq));
+    if (p) out.push(p);
+  }
+  return out;
+}
+
+const sideOf = (f: FrameEvent): Initiator => (f.dir === 'out' ? 'station' : 'csms');
+
+/** The request and return arrows between the two lanes for one exchange. */
+function WireGlyph({ ex, bad }: { ex: Exchange; bad: boolean }) {
+  const first = ex.call ?? ex.lone;
+  if (!first) return null;
+  const from = (side: Initiator) => (side === 'station' ? LANE_CP : LANE_CSMS);
+  const color = (f: FrameEvent) =>
+    isError(f) || (f === ex.lone && isResponse(f)) || !parseFrame(f).ok
+      ? 'var(--violation)'
+      : f.dir === 'out'
+        ? 'var(--out)'
+        : 'var(--in)';
+  const arrow = (f: FrameEvent, y: number, dashed: boolean) => {
+    const x1 = from(sideOf(f));
+    const x2 = x1 === LANE_CP ? LANE_CSMS : LANE_CP;
+    const dir = x2 > x1 ? 1 : -1;
+    const c = color(f);
+    return (
+      <g key={f.seq} stroke={c} fill={c}>
+        <line x1={x1} y1={y} x2={x2 - dir * 6} y2={y} strokeWidth={1.75} strokeDasharray={dashed ? '3.5 2.5' : undefined} />
+        <path d={`M${x2},${y} l${-dir * 6},-4 v8 z`} stroke="none" />
+        <circle cx={x1} cy={y} r={2.5} stroke="none" />
+      </g>
+    );
+  };
+  const waiting = ex.call && !ex.reply;
+  return (
+    <svg
+      width={GUTTER_W}
+      height={26}
+      viewBox={`0 0 ${GUTTER_W} 26`}
+      className="block overflow-visible"
+      role="img"
+      aria-label={describeExchange(ex)}
+    >
+      {arrow(first, 8, isResponse(first))}
+      {ex.reply && arrow(ex.reply, 19, true)}
+      {waiting && (
+        <circle
+          cx={from(sideOf(first)) === LANE_CP ? LANE_CSMS : LANE_CP}
+          cy={19}
+          r={2.5}
+          fill="none"
+          stroke={bad ? 'var(--violation)' : 'var(--muted-foreground)'}
+          strokeWidth={1.25}
+        />
+      )}
+    </svg>
+  );
+}
+
+function describeExchange(ex: Exchange): string {
+  const who = (f: FrameEvent) => (f.dir === 'out' ? 'station to CSMS' : 'CSMS to station');
+  if (ex.lone) return `${FRAME_TYPE_LABEL[ex.lone.type]} ${who(ex.lone)}`;
+  if (!ex.call) return '';
+  const reply = ex.reply ? `, ${FRAME_TYPE_LABEL[ex.reply.type]} back` : ', no reply yet';
+  return `CALL ${who(ex.call)}${reply}`;
+}
+
+function Lanes() {
+  return (
+    <>
+      <span
+        aria-hidden="true"
+        className="absolute top-0 -bottom-px w-px bg-border"
+        style={{ left: laneLeft(LANE_CP) }}
+      />
+      <span
+        aria-hidden="true"
+        className="absolute top-0 -bottom-px w-px bg-border"
+        style={{ left: laneLeft(LANE_CSMS) }}
+      />
+    </>
+  );
+}
+
+function FramePane({
   frame,
-  pairing,
-  partner,
+  title,
   violations,
-  expanded,
-  highlighted,
-  onToggle,
-  onJump,
 }: {
   frame: FrameEvent;
-  pairing: Pairing;
-  partner: FrameEvent | undefined;
+  title: string;
   violations: Violation[] | undefined;
-  expanded: boolean;
-  highlighted: boolean;
-  onToggle: (seq: number) => void;
-  onJump: (seq: number) => void;
 }) {
-  const problem = problemOf(frame, pairing, violations);
-  const latency = pairing.latencyMs.get(frame.seq);
-  const out = frame.dir === 'out';
-  const parsed = expanded ? parseFrame(frame) : null;
-  const bad = problem === 'error' || problem === 'violation' || problem === 'malformed';
+  const parsed = parseFrame(frame);
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <div className="flex flex-wrap items-baseline gap-x-2 text-[11px] text-muted-foreground">
+        <span className="font-medium text-foreground">{title}</span>
+        <span className="font-mono">{clockTime(frame.at)}</span>
+        <span className="font-mono">id {frame.id}</span>
+      </div>
+      {violations && violations.length > 0 && (
+        <ul className="flex flex-col gap-1 rounded-sm border border-violation/40 bg-violation-bg p-2 text-xs">
+          {violations.map((v) => (
+            <li key={`${v.path}:${v.message}`} className="flex gap-2">
+              <span className="shrink-0 font-mono text-violation">{v.path || '(payload)'}</span>
+              <span>{v.message}</span>
+              <span className="ml-auto shrink-0 text-muted-foreground">{v.code}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {isError(frame) && parsed.ok ? (
+        <div className="flex flex-col gap-1 text-xs">
+          <span>
+            <span className="font-mono font-semibold text-violation">{parsed.errorCode}</span> {parsed.errorDescription}
+          </span>
+          <pre className="overflow-x-auto rounded-sm bg-muted p-2 font-mono text-[12px] leading-relaxed">
+            {prettyJson(parsed.errorDetails)}
+          </pre>
+        </div>
+      ) : (
+        <pre className="max-h-96 overflow-auto rounded-sm bg-muted p-2 font-mono text-[12px] leading-relaxed">
+          {parsed.ok ? prettyJson(parsed.payload) : frame.raw}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+const sender = (f: FrameEvent) => (f.dir === 'out' ? 'station' : 'CSMS');
+
+const Row = memo(function Row({
+  ex,
+  pairing,
+  violationsBySeq,
+  expanded,
+  onToggle,
+}: {
+  ex: Exchange;
+  pairing: Pairing;
+  violationsBySeq: Map<number, Violation[]>;
+  expanded: boolean;
+  onToggle: (key: number) => void;
+}) {
+  const problems = exchangeProblems(ex, pairing, violationsBySeq);
+  const bad = problems.length > 0;
+  const violationCount = ex.frames.reduce((n, f) => n + (violationsBySeq.get(f.seq)?.length ?? 0), 0);
+  const first = (ex.call ?? ex.lone) as FrameEvent;
+  const latency = ex.reply ? pairing.latencyMs.get(ex.reply.seq) : undefined;
+  const fromCsms = ex.initiator === 'csms';
+  const replyPreview = ex.reply ? previewOf(ex.reply, 80) : '';
   return (
     <div
       className={cn(
-        'border-b border-l-[3px] border-l-transparent',
-        bad && 'border-l-violation bg-violation-bg',
-        highlighted && !bad && 'border-l-ring bg-accent/60',
-        expanded && !bad && !highlighted && 'bg-accent/40',
+        'relative border-b',
+        fromCsms && !bad && 'bg-[color-mix(in_oklab,var(--in)_7%,transparent)]',
+        bad && 'bg-violation-bg',
+        expanded && !bad && 'bg-accent/40',
       )}
     >
+      <Lanes />
+      {bad && <span aria-hidden="true" className="absolute inset-y-0 left-0 w-[3px] bg-violation" />}
       <button
         type="button"
-        onClick={() => onToggle(frame.seq)}
+        onClick={() => onToggle(ex.key)}
         aria-expanded={expanded}
-        className="grid w-full grid-cols-[5.6rem_1.1rem_3.4rem_minmax(0,1fr)_auto] items-center gap-x-2 px-2 py-1.5 text-left outline-none hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+        className="relative grid w-full grid-cols-[5.6rem_68px_minmax(0,1fr)_auto] items-start gap-x-2 px-2 py-1 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
       >
-        <span className="font-mono text-[11px] text-muted-foreground">{clockTime(frame.at)}</span>
-        <span className={out ? 'text-out' : 'text-in'}>
-          {out ? (
-            <ArrowRightIcon className="size-3.5" aria-label="Station to CSMS" />
-          ) : (
-            <ArrowLeftIcon className="size-3.5" aria-label="CSMS to station" />
-          )}
+        <span className="pt-0.5 font-mono text-[11px] text-muted-foreground">{clockTime(first.at)}</span>
+        <WireGlyph ex={ex} bad={bad} />
+        <span className="flex min-w-0 flex-col">
+          <span className="flex min-w-0 items-baseline gap-2">
+            <span className="truncate font-medium text-[13px]">{ex.action ?? '(unknown action)'}</span>
+            {ex.lone && (
+              <span className="shrink-0 rounded-[3px] border px-1 font-mono text-[10px] text-muted-foreground leading-4">
+                {FRAME_TYPE_LABEL[ex.lone.type]}
+              </span>
+            )}
+            {ex.reply && isError(ex.reply) && (
+              <span className="shrink-0 font-medium font-mono text-[11px] text-violation">
+                {parseFrame(ex.reply).errorCode ?? FRAME_TYPE_LABEL[ex.reply.type]}
+              </span>
+            )}
+            {violationCount > 0 && (
+              <span className="flex shrink-0 items-center gap-1 font-medium text-[11px] text-violation">
+                <TriangleAlertIcon className="size-3" aria-hidden="true" />
+                {violationCount} {violationCount === 1 ? 'violation' : 'violations'}
+              </span>
+            )}
+            {problems.includes('malformed') && (
+              <span className="shrink-0 font-medium text-[11px] text-violation">malformed</span>
+            )}
+            {problems.includes('unpaired') && (
+              <span className="shrink-0 text-[11px] text-violation" title="No CALL with this message id">
+                answers no call
+              </span>
+            )}
+          </span>
+          <span className="flex min-w-0 gap-3 font-mono text-[11px]">
+            <span className="min-w-0 flex-1 truncate text-muted-foreground">{previewOf(first)}</span>
+            {replyPreview && replyPreview !== '{}' && !isError(ex.reply as FrameEvent) && (
+              <span
+                className={cn('max-w-[45%] shrink-0 truncate', ex.reply?.dir === 'out' ? 'text-out' : 'text-in')}
+                title="Reply"
+              >
+                {replyPreview}
+              </span>
+            )}
+          </span>
         </span>
-        <span
-          className={cn(
-            'w-fit rounded-[3px] px-1 font-mono font-medium text-[10px] leading-4',
-            isError(frame)
-              ? 'bg-violation text-background'
-              : frame.type === 2
-                ? 'border'
-                : 'bg-muted text-muted-foreground',
-          )}
-          title={FRAME_TYPE_LABEL[frame.type]}
-        >
-          {TYPE_SHORT[frame.type]}
-        </span>
-        <span className="flex min-w-0 items-baseline gap-2">
-          <span className="truncate font-medium text-[13px]">{frame.action ?? '(unknown action)'}</span>
-          {problem === 'violation' && (
-            <span className="flex shrink-0 items-center gap-1 font-medium text-[11px] text-violation">
-              <TriangleAlertIcon className="size-3" aria-hidden="true" />
-              {violations?.length} {violations?.length === 1 ? 'violation' : 'violations'}
-            </span>
-          )}
-          {problem === 'malformed' && (
-            <span className="shrink-0 font-medium text-[11px] text-violation">malformed</span>
-          )}
-          {problem === 'unpaired' && (
-            <span className="shrink-0 text-[11px] text-muted-foreground" title="No CALL with this message id">
-              no matching call
-            </span>
-          )}
-        </span>
-        <span className="font-mono text-[11px] text-muted-foreground">
-          {latency !== undefined ? `+${duration(latency)}` : frame.type === 2 && !partner ? 'waiting' : ''}
-        </span>
-        <span className="col-span-3 col-start-3 truncate font-mono text-[11px] text-muted-foreground">
-          {previewOf(frame)}
+        <span className="pt-0.5 text-right font-mono text-[11px] text-muted-foreground">
+          {latency !== undefined ? duration(latency) : ex.call && !ex.reply ? 'waiting' : ''}
         </span>
       </button>
-      {expanded && parsed && (
-        <div className="flex flex-col gap-2 px-3 pt-1 pb-3">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-            <span>
-              {FRAME_TYPE_LABEL[frame.type]} {out ? 'from station' : 'from CSMS'}
-            </span>
-            <span className="font-mono">id {frame.id}</span>
-            <span className="font-mono">#{frame.seq}</span>
-            {partner && (
-              <Button variant="link" size="xs" className="h-auto px-0 text-[11px]" onClick={() => onJump(partner.seq)}>
-                {partner.type === 2 ? 'Go to the CALL' : `Go to the ${FRAME_TYPE_LABEL[partner.type]}`}
-              </Button>
-            )}
-          </div>
-          {violations && violations.length > 0 && (
-            <ul className="flex flex-col gap-1 rounded-sm border border-violation/40 bg-card p-2 text-xs">
-              {violations.map((v) => (
-                <li key={`${v.path}:${v.message}`} className="flex gap-2">
-                  <span className="shrink-0 font-mono text-violation">{v.path || '(payload)'}</span>
-                  <span>{v.message}</span>
-                  <span className="ml-auto shrink-0 text-muted-foreground">{v.code}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-          {isError(frame) && parsed.ok ? (
-            <div className="flex flex-col gap-1 text-xs">
-              <span>
-                <span className="font-mono font-semibold text-violation">{parsed.errorCode}</span>{' '}
-                {parsed.errorDescription}
-              </span>
-              <pre className="overflow-x-auto rounded-sm bg-muted p-2 font-mono text-[12px] leading-relaxed">
-                {prettyJson(parsed.errorDetails)}
-              </pre>
-            </div>
-          ) : (
-            <pre className="max-h-96 overflow-auto rounded-sm bg-muted p-2 font-mono text-[12px] leading-relaxed">
-              {parsed.ok ? prettyJson(parsed.payload) : frame.raw}
-            </pre>
-          )}
+      {expanded && (
+        <div
+          className="relative grid gap-3 pt-1 pr-3 pb-3 @3xl:grid-cols-2"
+          style={{ paddingLeft: `calc(${GUTTER_START} + ${GUTTER_W}px + 0.5rem)` }}
+        >
+          {ex.frames.map((f) => (
+            <FramePane
+              key={f.seq}
+              frame={f}
+              violations={violationsBySeq.get(f.seq)}
+              title={
+                f === ex.reply
+                  ? `${isError(f) ? 'Error' : 'Reply'} from ${sender(f)}${latency !== undefined ? ` after ${duration(latency)}` : ''}`
+                  : f.type === 2
+                    ? `Request from ${sender(f)}`
+                    : `${FRAME_TYPE_LABEL[f.type]} from ${sender(f)}`
+              }
+            />
+          ))}
         </div>
       )}
     </div>
@@ -182,16 +298,15 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
   const frames = useLive((s) => s.frames[stationId]) ?? NO_FRAMES;
   const violationEntries = useLive((s) => s.violations[stationId]) ?? NO_VIOLATIONS;
   const [text, setText] = useState('');
-  const [dir, setDir] = useState<'' | 'in' | 'out'>('');
+  const [side, setSide] = useState<'' | Initiator>('');
   const [action, setAction] = useState(ALL);
   const [problemsOnly, setProblemsOnly] = useState(false);
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
-  const [focusSeq, setFocusSeq] = useState<number | null>(null);
   const debouncedText = useDebounced(text, 150);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const pairing = useMemo(() => pairFrames(frames), [frames]);
-  const bySeq = useMemo(() => new Map(frames.map((f) => [f.seq, f])), [frames]);
+  const exchanges = useMemo(() => groupExchanges(frames, pairing), [frames, pairing]);
   const violationsBySeq = useMemo(() => {
     const m = new Map<number, Violation[]>();
     for (const v of violationEntries) {
@@ -204,48 +319,46 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
   }, [violationEntries]);
   const unattached = violationEntries.filter((v) => v.seq === undefined);
   const actions = useMemo(() => actionsIn(frames), [frames]);
+  const problemKeys = useMemo(() => {
+    const keys = new Set<number>();
+    for (const ex of exchanges) if (exchangeProblems(ex, pairing, violationsBySeq).length > 0) keys.add(ex.key);
+    return keys;
+  }, [exchanges, pairing, violationsBySeq]);
 
-  const indices = useMemo(() => {
-    const base = filterFrames(frames, {
-      text: debouncedText,
-      dir: dir || undefined,
-      action: action === ALL ? undefined : action,
+  const visible = useMemo(() => {
+    const needle = debouncedText.trim().toLowerCase();
+    return exchanges.filter((ex) => {
+      if (side && ex.initiator !== side) return false;
+      if (action !== ALL && ex.action !== action) return false;
+      if (problemsOnly && !problemKeys.has(ex.key)) return false;
+      if (!needle) return true;
+      if ((ex.action ?? '').toLowerCase().includes(needle)) return true;
+      return ex.frames.some((f) => f.raw.toLowerCase().includes(needle));
     });
-    if (!problemsOnly) return base;
-    return base.filter((i) => {
-      const f = frames[i] as FrameEvent;
-      const p = problemOf(f, pairing, violationsBySeq.get(f.seq));
-      return p !== null;
-    });
-  }, [frames, debouncedText, dir, action, problemsOnly, pairing, violationsBySeq]);
-
-  const problemCount = useMemo(
-    () => frames.reduce((n, f) => n + (problemOf(f, pairing, violationsBySeq.get(f.seq)) ? 1 : 0), 0),
-    [frames, pairing, violationsBySeq],
-  );
+  }, [exchanges, side, action, problemsOnly, problemKeys, debouncedText]);
 
   const virtualizer = useVirtualizer({
-    count: indices.length,
+    count: visible.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => 44,
+    estimateSize: () => 40,
     overscan: 12,
-    getItemKey: (i) => (frames[indices[i] as number] as FrameEvent).seq,
+    getItemKey: (i) => (visible[i] as Exchange).key,
   });
 
-  // Follow the tail while autoscroll is on. `pausedAt` is the newest seq when autoscroll was paused.
+  // Follow the tail while autoscroll is on. `pausedAt` is the newest exchange key when autoscroll was paused.
   const [pausedAt, setPausedAt] = useState<number | null>(null);
   const follow = pausedAt === null;
   useEffect(() => {
-    if (follow && indices.length > 0) virtualizer.scrollToIndex(indices.length - 1, { align: 'end' });
-  }, [indices, follow, virtualizer]);
+    if (follow && visible.length > 0) virtualizer.scrollToIndex(visible.length - 1, { align: 'end' });
+  }, [visible, follow, virtualizer]);
   const unseen = useMemo(() => {
     if (pausedAt === null) return 0;
     let n = 0;
-    for (let i = indices.length - 1; i >= 0 && (frames[indices[i] as number] as FrameEvent).seq > pausedAt; i--) n++;
+    for (let i = visible.length - 1; i >= 0 && (visible[i] as Exchange).key > pausedAt; i--) n++;
     return n;
-  }, [pausedAt, indices, frames]);
+  }, [pausedAt, visible]);
 
-  const pause = () => setPausedAt((p) => p ?? frames[frames.length - 1]?.seq ?? 0);
+  const pause = () => setPausedAt((p) => p ?? exchanges[exchanges.length - 1]?.key ?? 0);
   const resume = () => setPausedAt(null);
 
   // Scrolling up by hand (wheel, touch, keys) pauses autoscroll so the tail stops pulling the view down.
@@ -271,44 +384,27 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
     };
   }, []);
 
-  const toggle = (seq: number) => {
-    // Reading a frame should not be interrupted by the tail moving.
-    if (!expanded.has(seq)) pause();
+  const toggle = (key: number) => {
+    // Reading an exchange should not be interrupted by the tail moving.
+    if (!expanded.has(key)) pause();
     setExpanded((prev) => {
       const next = new Set(prev);
-      if (next.has(seq)) next.delete(seq);
-      else next.add(seq);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
-    setFocusSeq(seq);
   };
 
-  const jump = (seq: number) => {
-    let idx = indices.findIndex((i) => (frames[i] as FrameEvent).seq === seq);
-    if (idx < 0) {
-      // The partner is filtered out: drop the filters so it can be shown.
-      setText('');
-      setDir('');
-      setAction(ALL);
-      setProblemsOnly(false);
-      idx = frames.findIndex((f) => f.seq === seq);
-    }
-    pause();
-    setFocusSeq(seq);
-    setExpanded((prev) => new Set(prev).add(seq));
-    requestAnimationFrame(() => virtualizer.scrollToIndex(Math.max(0, idx), { align: 'center' }));
-  };
-
-  const focusPartner = focusSeq !== null ? pairing.partner.get(focusSeq) : undefined;
-  const filtered = indices.length !== frames.length;
+  const filtered = visible.length !== exchanges.length;
 
   return (
-    <section aria-label="Message log" className={cn('flex min-h-0 flex-col rounded-md border bg-card', className)}>
+    <section aria-label="Message log" className={cn('@container flex min-h-0 flex-col rounded-md border bg-card', className)}>
       <div className="flex flex-col gap-2 border-b p-2">
         <div className="flex items-center gap-2">
           <h2 className="font-semibold text-sm">Message log</h2>
           <span className="text-muted-foreground text-xs">
-            {filtered ? `${indices.length} of ${frames.length}` : frames.length} frames
+            {filtered ? `${visible.length} of ${exchanges.length}` : exchanges.length}{' '}
+            {exchanges.length === 1 ? 'exchange' : 'exchanges'}, {frames.length} frames
           </span>
           {unattached.length > 0 && (
             <span
@@ -340,7 +436,7 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
               placeholder="Search action, id, payload"
               value={text}
               onChange={(e) => setText(e.target.value)}
-              aria-label="Search frames"
+              aria-label="Search the log"
               className="text-sm"
             />
             <InputGroupAddon>
@@ -366,18 +462,16 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
             type="single"
             variant="outline"
             size="sm"
-            value={dir || 'all'}
-            onValueChange={(v) => setDir(v === 'in' || v === 'out' ? v : '')}
-            aria-label="Filter by direction"
+            value={side || 'all'}
+            onValueChange={(v) => setSide(v === 'station' || v === 'csms' ? v : '')}
+            aria-label="Filter by who started the exchange"
           >
             <ToggleGroupItem value="all">Both</ToggleGroupItem>
-            <ToggleGroupItem value="out" title="Station to CSMS">
-              <ArrowRightIcon className="text-out" />
-              Sent
+            <ToggleGroupItem value="station" title="Exchanges the station started">
+              From station
             </ToggleGroupItem>
-            <ToggleGroupItem value="in" title="CSMS to station">
-              <ArrowLeftIcon className="text-in" />
-              Received
+            <ToggleGroupItem value="csms" title="Exchanges the CSMS started">
+              From CSMS
             </ToggleGroupItem>
           </ToggleGroup>
           <Toggle
@@ -385,12 +479,34 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
             size="sm"
             pressed={problemsOnly}
             onPressedChange={setProblemsOnly}
-            title="Show only CALLERRORs, violations, malformed frames and responses without a CALL"
+            title="Show only exchanges with a CALLERROR, a violation, a malformed frame or a reply to no call"
           >
-            <TriangleAlertIcon className={problemCount > 0 ? 'text-violation' : undefined} />
-            Problems {problemCount}
+            <TriangleAlertIcon className={problemKeys.size > 0 ? 'text-violation' : undefined} />
+            Problems {problemKeys.size}
           </Toggle>
         </div>
+      </div>
+
+      <div className="relative h-6 shrink-0 border-b bg-panel text-[10px] text-muted-foreground">
+        <span className="absolute top-1 font-medium" style={{ left: laneLeft(LANE_CP), transform: 'translateX(-50%)' }}>
+          CP
+        </span>
+        <span
+          className="absolute top-1 font-medium"
+          style={{ left: laneLeft(LANE_CSMS), transform: 'translateX(-50%)' }}
+        >
+          CSMS
+        </span>
+        <span
+          aria-hidden="true"
+          className="absolute bottom-0 h-1.5 w-px bg-border"
+          style={{ left: laneLeft(LANE_CP) }}
+        />
+        <span
+          aria-hidden="true"
+          className="absolute bottom-0 h-1.5 w-px bg-border"
+          style={{ left: laneLeft(LANE_CSMS) }}
+        />
       </div>
 
       <div className="relative min-h-0 flex-1">
@@ -399,22 +515,21 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
           className="absolute inset-0 overflow-y-auto"
           style={{ contain: 'strict', overflowAnchor: 'none' }}
           role="log"
-          aria-label="Frames"
+          aria-label="Exchanges"
           // biome-ignore lint/a11y/noNoninteractiveTabindex: a scrollable region must be reachable by keyboard
           tabIndex={0}
         >
           {frames.length === 0 ? (
             <p className="p-4 text-muted-foreground text-sm">
-              No frames yet. Connect the station, or send a message, and every OCPP frame in both directions shows up
-              here.
+              No messages yet. Connect the station or send a message, and every OCPP exchange in both directions shows
+              up here.
             </p>
-          ) : indices.length === 0 ? (
-            <p className="p-4 text-muted-foreground text-sm">No frames match these filters.</p>
+          ) : visible.length === 0 ? (
+            <p className="p-4 text-muted-foreground text-sm">No exchanges match these filters.</p>
           ) : (
             <div style={{ height: virtualizer.getTotalSize(), position: 'relative', width: '100%' }}>
               {virtualizer.getVirtualItems().map((item) => {
-                const frame = frames[indices[item.index] as number] as FrameEvent;
-                const partnerSeq = pairing.partner.get(frame.seq);
+                const ex = visible[item.index] as Exchange;
                 return (
                   <div
                     key={item.key}
@@ -429,14 +544,11 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
                     }}
                   >
                     <Row
-                      frame={frame}
+                      ex={ex}
                       pairing={pairing}
-                      partner={partnerSeq !== undefined ? bySeq.get(partnerSeq) : undefined}
-                      violations={violationsBySeq.get(frame.seq)}
-                      expanded={expanded.has(frame.seq)}
-                      highlighted={frame.seq === focusPartner}
+                      violationsBySeq={violationsBySeq}
+                      expanded={expanded.has(ex.key)}
                       onToggle={toggle}
-                      onJump={jump}
                     />
                   </div>
                 );
@@ -447,7 +559,7 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
         {!follow && unseen > 0 && (
           <Button size="sm" className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-md" onClick={resume}>
             <ArrowDownToLineIcon data-icon="inline-start" />
-            {unseen} new {unseen === 1 ? 'frame' : 'frames'}
+            {unseen} new {unseen === 1 ? 'exchange' : 'exchanges'}
           </Button>
         )}
       </div>

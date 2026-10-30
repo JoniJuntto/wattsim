@@ -43,7 +43,7 @@
 }
 
 /*
- * Base palette: switchgear-enclosure grey (light) and a blue slate (dark). Color carries state only: primary
+ * Base palette: switchgear-enclosure grey (light) and charger-housing anthracite (dark). Color carries state only: primary
  * actions are graphite ink, and the hues below are reserved for connector status, frame direction and violations.
  */
 :root {
@@ -97,30 +97,31 @@
 }
 
 .dark {
-  --background: #141a1f;
-  --panel: #182026;
-  --foreground: #e2e8e4;
-  --card: #1c252c;
-  --card-foreground: #e2e8e4;
-  --popover: #212b33;
-  --popover-foreground: #e2e8e4;
-  --primary: #e2e8e4;
-  --primary-foreground: #141a1f;
-  --secondary: #28333b;
-  --secondary-foreground: #e2e8e4;
-  --muted: #232d35;
-  --muted-foreground: #9aa6ae;
-  --accent: #2a363f;
-  --accent-foreground: #e2e8e4;
+  /* Anthracite (RAL 7016), the housing color most charge points ship in: a warm neutral grey, not a blue slate. */
+  --background: #1d2124;
+  --panel: #22272a;
+  --foreground: #e6e8e6;
+  --card: #272c2f;
+  --card-foreground: #e6e8e6;
+  --popover: #2c3236;
+  --popover-foreground: #e6e8e6;
+  --primary: #e6e8e6;
+  --primary-foreground: #1d2124;
+  --secondary: #31373b;
+  --secondary-foreground: #e6e8e6;
+  --muted: #2f3539;
+  --muted-foreground: #a3aaad;
+  --accent: #343b3f;
+  --accent-foreground: #e6e8e6;
   --destructive: #f06a5f;
-  --border: #2f3b44;
-  --input: #3a4751;
+  --border: #3a4246;
+  --input: #465054;
   --ring: #6fa0f0;
 
-  --out: #7aa8f2;
+--out: #7aa8f2;
   --in: #5fcf8d;
   --violation: #f2857b;
-  --violation-bg: #3a1d1d;
+  --violation-bg: #3b2321;
 
   --st-available: #3dbe73;
   --st-available-on: #06200e;

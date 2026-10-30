@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { actionsIn, filterFrames, pairFrames, parseFrame, previewOf } from '../src/lib/frames';
+import { actionsIn, filterFrames, groupExchanges, pairFrames, parseFrame, previewOf } from '../src/lib/frames';
 import { frame } from './fixtures';
 
 describe('pairFrames', () => {
@@ -102,5 +102,43 @@ describe('filterFrames', () => {
   });
   test('actionsIn lists distinct actions sorted', () => {
     expect(actionsIn(frames)).toEqual(['Authorize', 'Reset']);
+  });
+});
+
+describe('groupExchanges', () => {
+  test('a CALL and its reply form one exchange, ordered by the CALL', () => {
+    const frames = [
+      frame({ seq: 1, type: 2, id: 'a', dir: 'out', action: 'Heartbeat' }),
+      frame({ seq: 2, type: 2, id: 'b', dir: 'in', action: 'RemoteStartTransaction' }),
+      frame({ seq: 3, type: 3, id: 'b', dir: 'out', action: 'RemoteStartTransaction' }),
+      frame({ seq: 4, type: 3, id: 'a', dir: 'in', action: 'Heartbeat' }),
+    ];
+    const ex = groupExchanges(frames, pairFrames(frames));
+    expect(ex.map((e) => [e.call?.seq, e.reply?.seq, e.initiator])).toEqual([
+      [1, 4, 'station'],
+      [2, 3, 'csms'],
+    ]);
+    expect(ex.map((e) => e.action)).toEqual(['Heartbeat', 'RemoteStartTransaction']);
+  });
+
+  test('a CALL still waiting has no reply; an orphan response and a SEND stand alone', () => {
+    const frames = [
+      frame({ seq: 1, type: 2, id: 'a', dir: 'out', action: 'MeterValues' }),
+      frame({ seq: 2, type: 3, id: 'zzz', dir: 'in' }),
+      frame({ seq: 3, type: 6, id: 's', dir: 'in', action: 'NotifyPeriodicEventStream' }),
+    ];
+    const ex = groupExchanges(frames, pairFrames(frames));
+    expect(ex).toHaveLength(3);
+    expect(ex[0]).toMatchObject({ key: 1, initiator: 'station' });
+    expect(ex[0]?.reply).toBeUndefined();
+    expect(ex[1]).toMatchObject({ key: 2, lone: frames[1], initiator: 'csms' });
+    expect(ex[1]?.call).toBeUndefined();
+    expect(ex[2]).toMatchObject({ key: 3, lone: frames[2], initiator: 'csms' });
+  });
+
+  test('frames lists every frame of the exchange in wire order', () => {
+    const frames = [frame({ seq: 7, type: 2, id: 'a', dir: 'out' }), frame({ seq: 9, type: 4, id: 'a', dir: 'in' })];
+    const [ex] = groupExchanges(frames, pairFrames(frames));
+    expect(ex?.frames.map((f) => f.seq)).toEqual([7, 9]);
   });
 });

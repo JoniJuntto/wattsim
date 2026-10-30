@@ -122,3 +122,46 @@ export function previewOf(frame: FrameEvent, max = 140): string {
     : JSON.stringify(p.payload ?? null);
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
+
+/** Who opened an exchange: the side that sent its CALL (or SEND, or the stray frame). */
+export type Initiator = 'station' | 'csms';
+
+/**
+ * One request and what answered it: the unit the message log shows. `lone` is a frame that belongs to no CALL: a SEND
+ * (never answered), a response whose id matched nothing, or a malformed frame.
+ */
+export type Exchange = {
+  /** seq of the first frame; stable across appends. */
+  key: number;
+  initiator: Initiator;
+  action?: string;
+  call?: FrameEvent;
+  reply?: FrameEvent;
+  lone?: FrameEvent;
+  /** Every frame of the exchange in wire order. */
+  frames: FrameEvent[];
+};
+
+/** Groups frames into exchanges, ordered by their first frame. */
+export function groupExchanges(frames: readonly FrameEvent[], pairing: Pairing): Exchange[] {
+  const bySeq = new Map(frames.map((f) => [f.seq, f]));
+  const out: Exchange[] = [];
+  for (const f of frames) {
+    const partnerSeq = pairing.partner.get(f.seq);
+    if (f.type === 2 && parseFrame(f).ok) {
+      const reply = partnerSeq !== undefined ? bySeq.get(partnerSeq) : undefined;
+      out.push({
+        key: f.seq,
+        initiator: f.dir === 'out' ? 'station' : 'csms',
+        action: f.action,
+        call: f,
+        reply,
+        frames: reply ? [f, reply] : [f],
+      });
+    } else if (partnerSeq === undefined || f.type === 2) {
+      // Paired responses are shown with their CALL; anything else stands alone.
+      out.push({ key: f.seq, initiator: f.dir === 'out' ? 'station' : 'csms', action: f.action, lone: f, frames: [f] });
+    }
+  }
+  return out;
+}
