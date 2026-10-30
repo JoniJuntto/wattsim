@@ -95,6 +95,8 @@ export function startModbus(options: ModbusServerOptions): ModbusServer {
     const fail = (code: number) => ({ pdu: exceptionPdu(fc, code), exception: code });
     const image = images.get(unitId);
     if (!image) return unknownUnit === 'ignore' ? undefined : fail(EXCEPTION.GATEWAY_TARGET_FAILED_TO_RESPOND);
+    // A dark device sends nothing: the client times out, as with a meter that lost its supply.
+    if (image.device.online && !image.device.online()) return undefined;
     if (!image.map.functions.includes(fc)) return fail(EXCEPTION.ILLEGAL_FUNCTION);
     const parsed = parseRequest(pdu);
     if (!parsed.ok) return fail(parsed.exception);

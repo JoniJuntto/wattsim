@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Station, VirtualClock } from '@wattsim/core';
-import { type Csms, startCsms } from '@wattsim/csms';
+import { type Csms, connectInMemory, startCsms } from '@wattsim/csms';
 import { dlmScore, type SiteDescription } from '@wattsim/grid';
 import { decodeValue, ModbusClient } from '@wattsim/modbus';
 import { type SiteRuntime, startSite } from '../src/index';
@@ -114,9 +114,16 @@ describe('stations on the site', () => {
 
   test("a station's draw trips its breaker at the predicted instant; the reclose boots it again", async () => {
     const clock = new VirtualClock(T0);
-    csms = startCsms({ clock });
+    csms = startCsms({ listen: false, clock });
     rt = startSite({ site, clock });
-    const st = new Station({ id: 'CP-1', version: 'ocpp1.6', csmsUrl: csms.url, clock, ...rt.hooks('CP-1') });
+    const st = new Station({
+      id: 'CP-1',
+      version: 'ocpp1.6',
+      csmsUrl: csms.url,
+      socket: connectInMemory,
+      clock,
+      ...rt.hooks('CP-1'),
+    });
     stations.push(st);
     rt.register('CP-1', st);
     st.on('error', () => {});
@@ -220,9 +227,11 @@ describe('Modbus meters', () => {
       expect(await g(0x38)).toBeGreaterThan(0.1); // dawn of a 24-hour sun
       expect(await g(0x4a)).toBe(1);
       expect(await g(0x4c)).toBe(63);
+      // Both meters are behind F1: a de-energised self-powered meter goes silent (deadMeter 'zero' would answer 0 instead).
       rt.trip('F1');
-      expect(await g(0x4a)).toBe(0);
-      expect(await f32(0x0006)).toBe(0);
+      const [generic, sdm] = await Promise.allSettled([g(0x4a), f32(0x0006)]);
+      expect(generic.status).toBe('rejected');
+      expect(sdm.status).toBe('rejected');
     } finally {
       c1.close();
       c2.close();

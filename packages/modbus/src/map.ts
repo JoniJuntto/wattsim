@@ -65,6 +65,8 @@ export interface Device {
   read(quantity: Quantity): number;
   /** Called for every accepted write, with the register's `key` and decoded value. A throw is Server Device Failure. */
   onWrite?(key: string, value: number): void;
+  /** False while the device is dark (a de-energised self-powered meter): requests get no answer at all. */
+  online?(): boolean;
 }
 
 export type TableName = 'input' | 'holding';

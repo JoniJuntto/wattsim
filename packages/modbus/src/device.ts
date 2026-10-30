@@ -15,12 +15,13 @@ export function getMap(id: string): RegisterMap {
 
 /**
  * A device whose values come live from `source`, called once per register value. Missing quantities are
- * filled by `deriveReading` unless `derive` is false, in which case they read 0.
+ * filled by `deriveReading` unless `derive` is false, in which case they read 0. While `online` returns false the
+ * device answers nothing.
  */
 export function liveDevice(
   map: RegisterMap,
   source: () => Partial<MeterReading>,
-  options: { derive?: boolean; onWrite?: Device['onWrite'] } = {},
+  options: { derive?: boolean; onWrite?: Device['onWrite']; online?: Device['online'] } = {},
 ): Device {
   const derive = options.derive ?? true;
   return {
@@ -30,6 +31,7 @@ export function liveDevice(
       return (derive ? deriveReading(given)[q] : given[q]) ?? 0;
     },
     onWrite: options.onWrite,
+    ...(options.online ? { online: options.online } : {}),
   };
 }
 

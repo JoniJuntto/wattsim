@@ -5,7 +5,7 @@
  */
 import { afterEach, expect, test } from 'bun:test';
 import { Station, VirtualClock } from '@wattsim/core';
-import { type Csms, startCsms } from '@wattsim/csms';
+import { type Csms, connectInMemory, startCsms } from '@wattsim/csms';
 import { SUPPLY_ID } from '@wattsim/grid';
 import { type SiteRuntime, startSite } from '../src/index';
 import { depot } from './depot';
@@ -30,7 +30,7 @@ afterEach(async () => {
 
 async function day(controller: 'reference' | null) {
   const clock = new VirtualClock(T0);
-  const server = startCsms({ clock, callTimeoutMs: 10_000 });
+  const server = startCsms({ listen: false, clock, callTimeoutMs: 10_000 });
   csms = server;
   const runtime = startSite({ site: depot(), clock, csms: server, controller, loadStepMs: 10_000, seriesMs: 60_000 });
   rt = runtime;
@@ -40,6 +40,7 @@ async function day(controller: 'reference' | null) {
       id,
       version: n % 2 === 0 ? 'ocpp2.0.1' : 'ocpp1.6',
       csmsUrl: server.url,
+      socket: connectInMemory,
       clock,
       meterIntervalMs: 5 * MIN,
       heartbeatMs: HOUR,
@@ -92,7 +93,7 @@ test('the reference controller keeps every node under its rating for 24 h with z
   expect(score.nodes[SUPPLY_ID]).toBeDefined();
   expect(score.energyWh).toBeGreaterThan(500_000);
   expect(score.fairness.mean).toBeGreaterThan(0.8);
-  const allocations = runtime.report().allocations;
+  const allocations = runtime.allocationList();
   const bindings = new Set(allocations.map((a) => a.binding?.nodeId));
   // Sub-boards bind while the main connection has room; the main connection binds when the offices are busy.
   expect(['Q1', 'SB1', 'Q2', 'SB2'].some((id) => bindings.has(id))).toBe(true);

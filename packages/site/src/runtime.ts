@@ -41,6 +41,7 @@ import {
   type Violation,
   type ViolationKind,
 } from '@wattsim/grid';
+import { AllocationLog, type AllocationStep } from './alloc-log';
 import { type Allocation, type AllocationReason, ReferenceController, type ReferenceOptions } from './controller';
 import { type ModbusOptions, type ServedMeter, SiteMeters } from './meters';
 import { ScoreAccumulator } from './score';
@@ -65,8 +66,12 @@ export type SiteRuntimeOptions = {
   seriesMs?: number;
   /** Most time series points (the resolution doubles when full). Default 10000. */
   maxPoints?: number;
-  /** Most allocations kept (every other one is dropped when full). Default 10000. */
+  /** Most bytes of JSON the time series takes in the report (the resolution doubles when full). Default 6 MB. */
+  maxSeriesBytes?: number;
+  /** Most allocations kept (thinned to half when full, keeping events and extremes). Default 10000. */
   maxAllocations?: number;
+  /** Most bytes of JSON the allocations take in the report (thinned the same way). Default 6 MB. */
+  maxAllocationBytes?: number;
   /** Load models read `t + timeOffsetMs` (a site `time`); the site and the stations keep the run clock. */
   timeOffsetMs?: number;
   /** Keep every score sample (`samples()`), e.g. to check the score against `dlmScore`. Default false. */
@@ -123,10 +128,14 @@ export type SiteSnapshot = {
   modbus: ServedMeter[];
 };
 
-/** The `--site-report` file: everything the Site page and its replay load. */
+/**
+ * The `--site-report` file: everything the Site page and its replay load. Version 2 stores the controller's steps as
+ * `allocationSteps` against the keyframes in `allocations`; version 1 (older files) has every step in `allocations`.
+ * `decodeAllocations`, `allocationAt` and `allocationCount` read both.
+ */
 export type SiteReport = {
   format: 'wattsim-site-report';
-  version: 1;
+  version: 1 | 2;
   name?: string;
   description: SiteDescription;
   /** Tree order, with parents, children, phases and ratings. */
@@ -137,7 +146,13 @@ export type SiteReport = {
   series: SiteSeries;
   events: Array<TripEvent | RecloseEvent>;
   violations: Violation[];
+  /**
+   * The controller's steps. With `allocationSteps` (wattsim writes it), these are the keyframes the steps are encoded
+   * against, a coarser trail on their own: read the steps with `allocationAt` / `decodeAllocations`.
+   */
   allocations: Allocation[];
+  /** Every step kept: the index of its keyframe in `allocations`, or what changed since the step before. */
+  allocationSteps?: AllocationStep[];
   modbus: ServedMeter[];
   /** The state at the end of the run. */
   final?: SiteState;
@@ -171,8 +186,7 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
   private readonly series: SeriesRecorder;
   private readonly kept: ScoreSample[] | undefined;
   private readonly history: Array<TripEvent | RecloseEvent> = [];
-  private readonly allocations: Allocation[] = [];
-  private readonly maxAllocations: number;
+  private readonly allocations: AllocationLog;
   private readonly peaks = new Map<string, Triple>();
   private readonly meters: SiteMeters;
   private readonly csms: Csms | undefined;
@@ -197,8 +211,11 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
     this.site = buildSite(opts.site, { startTime: this.startedAt });
     this.loadStepMs = opts.loadStepMs ?? 10_000;
     if (!(this.loadStepMs > 0)) throw new RangeError(`loadStepMs must be > 0, got ${this.loadStepMs}`);
-    this.series = new SeriesRecorder(opts.seriesMs ?? 10_000, opts.maxPoints ?? 10_000);
-    this.maxAllocations = opts.maxAllocations ?? 10_000;
+    this.series = new SeriesRecorder(opts.seriesMs ?? 10_000, opts.maxPoints ?? 10_000, opts.maxSeriesBytes);
+    this.allocations = new AllocationLog({
+      maxSteps: opts.maxAllocations ?? 10_000,
+      ...(opts.maxAllocationBytes !== undefined ? { maxBytes: opts.maxAllocationBytes } : {}),
+    });
     this.kept = opts.keepSamples ? [] : undefined;
     for (const [id, m] of this.site.models) this.models.set(id, m);
     this.leafList = evseLeaves(opts.site.nodes);
@@ -479,13 +496,38 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
     return this.meters.reading(meterId);
   }
 
+  /** Controller steps kept so far. */
+  allocationCount(): number {
+    return this.allocations.length;
+  }
+
+  /** Controller step `i` kept so far (0 = oldest; numbers to 0.01). */
+  allocationAt(i: number): Allocation | undefined {
+    return this.allocations.at(i);
+  }
+
+  /** Controller steps at or after `t` (the newest `limit`), numbers to 0.01: a live view's increment, no full copy. */
+  allocationsSince(t: number, limit?: number): Allocation[] {
+    return this.allocations.since(t, limit);
+  }
+
+  /** Time series points at or after `t` (the newest `limit`): a live view's increment, no full copy. */
+  seriesSince(t: number, limit?: number): SiteSeries {
+    return this.series.since(t, limit);
+  }
+
+  /** Every controller step kept so far, oldest first (numbers to 0.01). */
+  allocationList(): Allocation[] {
+    return this.allocations.all();
+  }
+
   /** Everything recorded, for `--site-report` and the Site page. */
   report(): SiteReport {
     const end = this.endedAt ?? this.siteTime();
     const state = this.site.state();
     return {
       format: 'wattsim-site-report',
-      version: 1,
+      version: 2,
       ...(this.site.description.name !== undefined ? { name: this.site.description.name } : {}),
       description: this.site.description,
       nodes: this.site.nodes,
@@ -501,7 +543,7 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
       series: this.series.toJSON(),
       events: [...this.history],
       violations: this.site.violations(),
-      allocations: [...this.allocations],
+      ...this.allocations.toJSON(),
       modbus: [...this.meters.served],
       ...(state ? { final: state } : {}),
     };
@@ -631,15 +673,6 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
   private onAllocation(a: Allocation): void {
     this.lastAllocation = a;
     this.allocations.push(a);
-    if (this.allocations.length > this.maxAllocations) {
-      // Keep the ones that sent something and every other one of the rest.
-      let odd = false;
-      const kept = this.allocations.filter((x) => {
-        odd = !odd;
-        return x.sent.length > 0 || odd;
-      });
-      this.allocations.splice(0, this.allocations.length, ...kept);
-    }
     this.emit('allocation', a);
   }
 
