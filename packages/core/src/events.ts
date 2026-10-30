@@ -1,6 +1,10 @@
 /**
  * Minimal typed event emitter. No dependency, no Node `events` import.
  *
+ * Listener arrays are copy-on-write: `on`, `once` and `off` replace the array, never mutate it, so `emit` can walk
+ * the array it read without copying it and still ignore listeners added or removed while it runs. Every frame a
+ * station handles goes through two emits, so an emit with no `once` listener allocates nothing.
+ *
  * `Events` maps event name -> listener argument tuple, e.g.
  *   type E = { state: [ConnectionState]; error: [Error] };
  */
@@ -38,21 +42,23 @@ export class TypedEmitter<Events extends Record<string, unknown[]>> {
   emit<K extends keyof Events>(event: K, ...args: Events[K]): boolean {
     const entries = this.listeners.get(event);
     if (!entries || entries.length === 0) return false;
-    // Snapshot so listeners may add/remove during emit without affecting this dispatch.
-    const snapshot = entries.slice();
-    const remaining = entries.filter((e) => !e.once);
-    if (remaining.length === 0) this.listeners.delete(event);
-    else this.listeners.set(event, remaining);
+    // `entries` is never mutated, so it is this dispatch's snapshot. Drop `once` listeners before calling anyone.
+    if (entries.some((e) => e.once)) {
+      const remaining = entries.filter((e) => !e.once);
+      if (remaining.length === 0) this.listeners.delete(event);
+      else this.listeners.set(event, remaining);
+    }
     // One throwing listener must not starve the rest; errors are rethrown once every listener has run.
-    const errors: unknown[] = [];
-    for (const e of snapshot) {
+    let errors: unknown[] | undefined;
+    for (const e of entries) {
       try {
         (e.fn as unknown as Listener<Events[K]>)(...args);
       } catch (err) {
-        errors.push(err);
+        if (errors) errors.push(err);
+        else errors = [err];
       }
     }
-    throwCollected(errors, `listeners threw during emit('${String(event)}')`);
+    if (errors) throwCollected(errors, `listeners threw during emit('${String(event)}')`);
     return true;
   }
 
@@ -67,7 +73,6 @@ export class TypedEmitter<Events extends Record<string, unknown[]>> {
 
   private add(event: keyof Events, fn: AnyListener, once: boolean): void {
     const entries = this.listeners.get(event);
-    if (entries) entries.push({ fn, once });
-    else this.listeners.set(event, [{ fn, once }]);
+    this.listeners.set(event, entries ? [...entries, { fn, once }] : [{ fn, once }]);
   }
 }

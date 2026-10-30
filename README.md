@@ -29,6 +29,10 @@ bun packages/cli/src/index.ts run examples/basic.ws --csms ws://localhost:9000/o
 | `--seed <n>` | Seed for `choose` and probabilistic chaos, so fleet runs are reproducible |
 | `--quiet` | Summary only, no per-frame lines |
 | `--quirk <file.ws\|name>` | Apply quirk profiles to every station before its own statements; repeatable |
+| `--shard <i/n>` | Run shard i of n (0-based): the stations whose position in the expanded fleet mod n is i. See [Scale](#scale) |
+| `--ids <a..b>` | Run the template stations whose loop variable is in a..b; a station block without `for` is skipped |
+| `--metrics-port-base <port>` | Serve Prometheus metrics on this port plus the shard index, one port per `--shard` process |
+| `--connect-rate <n>` | Open at most n station connections per second (on the run's clock); default unpaced |
 
 `wattsim fmt <file>` prints the canonical formatting and exits 1 when the file is not already canonical. `wattsim fmt --write <files...>` rewrites files in place; `wattsim fmt --check <files...>` lists the files that are not canonical and exits 1 if there are any, which makes it the CI check.
 
@@ -134,6 +138,51 @@ The complete reference is in [docs/dsl.md](docs/dsl.md). More examples:
 - Three-layer deterministic chaos. Transport, protocol and behavioural faults compose per station, per message type and per direction, with deterministic triggers ("the 3rd MeterValues") by default and seeded probabilities for fleets.
 - Real EV physics. Battery capacity, SoC-dependent charging curve, phase count, current limits and the smart-charging limit in force all feed meter values that are self-consistent in voltage, current, power and energy.
 - Scales to 10k. The target is around ten thousand idle stations per process with small, serializable per-station state, a Prometheus endpoint from day one, and no coordinator: horizontal scale is running N instances with id ranges.
+
+## Scale
+
+One process holds 10k idle stations: 168 MB RSS, event-loop lag p99 3.3 ms, heartbeat jitter under 10 ms. Fleets larger than one process run as N processes over the same scenario file, with no coordinator:
+
+```sh
+# four processes, each runs a quarter of the fleet and serves its own /metrics on 9100..9103
+for i in 0 1 2 3; do
+  wattsim run fleet.ws --quiet --connect-rate 500 --shard $i/4 --metrics-port-base 9100 &
+done
+wait
+
+# or split by the fleet's loop variable: station "CP-{i}" for i in 1..20000
+wattsim run fleet.ws --ids 1..10000 &
+wattsim run fleet.ws --ids 10001..20000 &
+```
+
+Every process expands the whole fleet and checks it for duplicate names before it keeps its part, so each one reports the same scenario errors. `--shard i/n` keeps the stations whose position in the expanded fleet, counted from 0 in file order, is i modulo n. `--ids a..b` keeps the template stations whose loop variable is in a..b and skips station blocks without `for`. Random draws are keyed by station name and `--seed`, so a station picks the same `choose` branch whichever process runs it. A `barrier` counts the stations of its own process only. `--connect-rate n` spreads the connects at n per second; unpaced, 10k sockets open in under a second but stall the event loop for about 250 ms.
+
+### Measured
+
+`bun scripts/perf.ts matrix --md` produces this table. Each row is a fresh process running real `Station`s with real WebSockets against `@wattsim/csms` in a second process, so the numbers are the simulator's alone. The 1.6 stations use a 60 s heartbeat and a 60 s meter interval and connect at 1000 per second. Wall rows wait 60 s after boot and then measure for 120 s. Lag is the overshoot of a 10 ms interval timer. Jitter is |actual − nominal| between a station's consecutive Heartbeats. Per-station figures are (after − before) / stations, where before is the process with the CSMS up and no station. The `scenario` row is the same fleet driven through the interpreter, as `wattsim run` does it.
+
+| stations | driver | clock | charging | RSS | RSS/station | heap/station | connect + boot | lag p50 / p99 | heartbeat jitter p50 / p99 / max | msgs/s |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1000 | Station | wall | 0 | 69 MB | 9.7 KB | 3.9 KB | 1.0 s | 2.0 / 2.4 ms | 0.1 / 1.8 / 1.8 ms | 33 |
+| 3000 | Station | wall | 0 | 90 MB | 10.3 KB | 4.3 KB | 3.0 s | 2.0 / 2.4 ms | 0.1 / 1.3 / 3.0 ms | 100 |
+| 5000 | Station | wall | 0 | 109 MB | 10.2 KB | 4.4 KB | 5.0 s | 2.0 / 2.5 ms | 0.1 / 2.4 / 7.8 ms | 167 |
+| 10000 | Station | wall | 0 | 168 MB | 11.1 KB | 4.5 KB | 10.0 s | 1.9 / 3.3 ms | 0.1 / 3.9 / 7.2 ms | 333 |
+| 10000 | Station | wall | 1000 | 174 MB | 11.9 KB | 4.6 KB | 10.0 s | 1.8 / 2.9 ms | 0.1 / 3.9 / 12 ms | 367 |
+| 10000 | scenario | wall | 1000 | 295 MB | 24.1 KB | 13.2 KB | 10.0 s | 1.7 / 3.6 ms | 0.1 / 4.0 / 21 ms | 367 |
+| 10000 | Station | virtual 1 h in 11.2 s | 0 | 198 MB | 14.2 KB | 5.0 KB | 10.0 s | 0.0 / 1.2 ms | n/a | 107018 |
+| 10000 | Station | virtual 1 h in 11.8 s | 1000 | 213 MB | 15.7 KB | 6.2 KB | 10.0 s | 0.0 / 1.4 ms | n/a | 111686 |
+
+Apple M4 Pro (14 cores, 24 GB), macOS 27.0.1, Bun 1.4.4.
+
+`bun scripts/perf.ts run --stations 10000 [--charging 0.1] [--mode virtual] [--via scenario] [--connect-rate 0]` runs one row; the comment at the top of `scripts/perf.ts` lists every flag. `WATTSIM_PERF=1 bun test packages/core/test/perf.test.ts` asserts the 10k budget: under 1 GB RSS, lag p99 under 50 ms, jitter under 1 s, every station booted. It takes about ten minutes, so CI skips it.
+
+The interpreter keeps a window of up to 2048 recent frames per station, but only for stations whose script can reach an `expect`: those frames exist to be matched. A fleet without assertions keeps none, so 2000 scenario-driven stations after 6 virtual hours hold 17 KB of heap each (205 KB each when every station kept its window). A fleet that asserts on every station still grows towards that window; split it with `--shard`.
+
+What a big fleet needs from the machine:
+
+- File descriptors: one per station, in the simulator and again in a local CSMS. Bun raises the soft limit to the hard limit at start. `scripts/perf.ts` checks the limit and prints the `ulimit -n` to run when it is too low. macOS caps a process at `kern.maxfilesperproc` (92160 here).
+- Ephemeral ports: one per station towards one CSMS address. macOS has 16384 (49152–65535; `sudo sysctl net.inet.ip.portrange.first=10000` widens it). Closed sockets wait 2 × MSL (30 s on macOS) before their port is reused, so `matrix` pauses between rows.
+- Listen backlog: `kern.ipc.somaxconn` is 128 on macOS. Bun's own CSMS kept up with 10k unpaced connects, but another CSMS may refuse some; `--connect-rate` avoids the burst.
 
 ## Fault injection layers
 

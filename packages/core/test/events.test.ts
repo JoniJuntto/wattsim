@@ -59,4 +59,24 @@ describe('TypedEmitter', () => {
     expect(() => em.emit('ping', 1)).toThrow('boom');
     expect(em.listenerCount('ping')).toBe(0);
   });
+  test('listeners added or removed during an emit take effect from the next emit', () => {
+    const em = new TypedEmitter<E>();
+    const seen: string[] = [];
+    let offB: () => void = () => {};
+    em.on('ping', (n) => {
+      seen.push(`a${n}`);
+      if (n === 1) {
+        em.on('ping', (m) => seen.push(`late${m}`));
+        em.once('ping', (m) => seen.push(`lateOnce${m}`));
+        offB();
+      }
+    });
+    offB = em.on('ping', (n) => seen.push(`b${n}`));
+    em.once('ping', (n) => seen.push(`once${n}`));
+    em.emit('ping', 1);
+    em.emit('ping', 2);
+    em.emit('ping', 3);
+    expect(seen).toEqual(['a1', 'b1', 'once1', 'a2', 'late2', 'lateOnce2', 'a3', 'late3']);
+    expect(em.listenerCount('ping')).toBe(2);
+  });
 });

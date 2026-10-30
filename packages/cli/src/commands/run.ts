@@ -1,12 +1,12 @@
 import { basename } from 'node:path';
 import type { Clock, StationConfig } from '@wattsim/core';
-import { attachMetrics, Station, serveMetrics, VirtualClock, WallClock } from '@wattsim/core';
+import { attachMetrics, ConnectPacer, pace, Station, serveMetrics, VirtualClock, WallClock } from '@wattsim/core';
 import type { Frame } from '@wattsim/protocol';
 import { MessageType } from '@wattsim/protocol';
-import type { RunEvent, RunOptions, RunResult } from '@wattsim/scenario';
+import type { FleetSelection, RunEvent, RunOptions, RunResult } from '@wattsim/scenario';
 import { driveVirtual, isIdle, ParseError, QuirkError, run as runScenario, toJUnit } from '@wattsim/scenario';
 import { defineCommand } from 'citty';
-import { err, loadScenario, out } from '../load';
+import { err, loadScenario, out, parseIds, parseShard } from '../load';
 import { quirkFlags } from './quirk';
 
 const MAX_VIRTUAL_MS = 24 * 3_600_000;
@@ -140,6 +140,22 @@ export const run = defineCommand({
     virtual: { type: 'boolean', description: 'Use a virtual clock and fast-forward until all stations finish' },
     speed: { type: 'string', description: 'Clock speed multiplier' },
     metrics: { type: 'string', description: 'Port for the Prometheus /metrics endpoint' },
+    'metrics-port-base': {
+      type: 'string',
+      description: 'Serve /metrics on this port plus the shard index (one port per --shard process)',
+    },
+    shard: {
+      type: 'string',
+      description: 'Run shard i of n (i/n, 0-based): the stations whose position in the expanded fleet mod n is i',
+    },
+    ids: {
+      type: 'string',
+      description: 'Run the fleet stations whose loop variable is in a..b; stations outside a template are skipped',
+    },
+    'connect-rate': {
+      type: 'string',
+      description: 'Open at most this many station connections per second (default: no limit)',
+    },
     junit: { type: 'string', description: 'Write a JUnit XML report to this path' },
     seed: { type: 'string', description: 'Seed for deterministic chaos and choose blocks' },
     quiet: { type: 'boolean', description: 'Suppress per-event output' },
@@ -155,17 +171,39 @@ export const run = defineCommand({
     if (!args.csms && !scenario.csms) await badFlag('no CSMS URL: pass --csms or add a csms line');
     const speed = await parseNumber('speed', args.speed, (n) => n > 0);
     const seed = await parseNumber('seed', args.seed, Number.isInteger);
-    const metricsPort = await parseNumber('metrics', args.metrics, (n) => Number.isInteger(n) && n >= 0 && n <= 65535);
+    const isPort = (n: number) => Number.isInteger(n) && n >= 0 && n <= 65535;
+    const shard =
+      args.shard === undefined
+        ? undefined
+        : (parseShard(args.shard) ?? (await badFlag(`invalid --shard: ${args.shard} (expected i/n with 0 <= i < n)`)));
+    const ids =
+      args.ids === undefined
+        ? undefined
+        : (parseIds(args.ids) ?? (await badFlag(`invalid --ids: ${args.ids} (expected a..b with a <= b)`)));
+    const select: FleetSelection | undefined = shard || ids ? { shard, ids } : undefined;
+    const connectRate = await parseNumber('connect-rate', args['connect-rate'], (n) => n > 0);
+    if (args.metrics !== undefined && args['metrics-port-base'] !== undefined) {
+      await badFlag('--metrics and --metrics-port-base exclude each other');
+    }
+    const portBase = await parseNumber('metrics-port-base', args['metrics-port-base'], isPort);
+    const metricsPort =
+      portBase !== undefined ? portBase + (shard?.index ?? 0) : await parseNumber('metrics', args.metrics, isPort);
+    if (metricsPort !== undefined && !isPort(metricsPort)) {
+      await badFlag(`--metrics-port-base ${portBase} + shard ${shard?.index} is past port 65535`);
+    }
 
     const printer = new Printer();
     const formatter = new EventFormatter();
     const metricsServer = metricsPort === undefined ? undefined : serveMetrics(metricsPort);
     if (metricsServer) printer.write(`metrics: ${metricsServer.url}\n`);
 
+    const clock: Clock = args.virtual ? new VirtualClock(Date.now()) : new WallClock();
+    // Paced on the run's clock, so a virtual run stays deterministic: station k connects k / rate seconds in.
+    const pacer = connectRate === undefined ? undefined : new ConnectPacer(clock, connectRate);
     const stations: Station[] = [];
     const detachers: (() => void)[] = [];
     const stationFactory = (cfg: StationConfig) => {
-      const station = new Station(cfg);
+      const station = pacer ? pace(new Station(cfg), pacer) : new Station(cfg);
       stations.push(station);
       if (metricsServer) detachers.push(attachMetrics(station));
       return station;
@@ -181,7 +219,6 @@ export const run = defineCommand({
     };
     process.on('SIGINT', onSigint);
 
-    const clock: Clock = args.virtual ? new VirtualClock(Date.now()) : new WallClock();
     const opts: RunOptions = {
       clock,
       csmsUrl: args.csms || undefined,
@@ -192,6 +229,7 @@ export const run = defineCommand({
       file: args.file,
       quirkFiles: quirks.files,
       quirks: quirks.names,
+      select,
       onEvent: args.quiet ? undefined : (e) => printer.write(formatter.format(e)),
     };
 

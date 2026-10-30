@@ -29,3 +29,21 @@ export async function loadScenario(file: string, exitCode = 1): Promise<Loaded> 
     throw e;
   }
 }
+
+/** `--shard i/n`: the i-th of n shards, 0-based. Undefined when the text is not of that form or out of range. */
+export function parseShard(text: string): { index: number; count: number } | undefined {
+  const m = /^(\d+)\/(\d+)$/.exec(text.trim());
+  if (!m) return undefined;
+  const index = Number(m[1]);
+  const count = Number(m[2]);
+  return count >= 1 && index < count ? { index, count } : undefined;
+}
+
+/** `--ids a..b`: an inclusive range of fleet loop-variable values. Undefined when malformed or reversed. */
+export function parseIds(text: string): { from: number; to: number } | undefined {
+  const m = /^(-?\d+)\.\.(-?\d+)$/.exec(text.trim());
+  if (!m) return undefined;
+  const from = Number(m[1]);
+  const to = Number(m[2]);
+  return to >= from ? { from, to } : undefined;
+}

@@ -15,6 +15,7 @@ export * from './faults';
 export * from './meter';
 export * from './metrics';
 export * from './ocmf';
+export * from './pacer';
 export * from './phases';
 export * from './security';
 export * from './station';

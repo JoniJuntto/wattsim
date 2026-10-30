@@ -165,7 +165,41 @@ export type RunOptions = {
   quirkFiles?: string[];
   /** Quirks applied to every station before its own statements, in this order. */
   quirks?: string[];
+  /**
+   * Run only part of the expanded fleet (DESIGN §3: N processes, no coordinator). Applied after the whole fleet is
+   * expanded and checked for duplicate names and before any station is created, so every process sees the same
+   * fleet and keeps a disjoint part of it. Barriers count the kept stations only.
+   */
+  select?: FleetSelection;
 };
+
+/**
+ * `shard`: keep the stations whose position in the expanded fleet (0-based, in file order) modulo `count` is `index`.
+ * `ids`: keep the template stations whose loop variable is in `from..to`, inclusive; a station block without
+ * `for i in a..b` has no id and is dropped. Both together keep the stations both select.
+ */
+export type FleetSelection = {
+  shard?: { index: number; count: number };
+  ids?: { from: number; to: number };
+};
+
+/** Why a `FleetSelection` is invalid, or undefined when it is fine. */
+export function selectionProblem(select: FleetSelection): string | undefined {
+  const { shard, ids } = select;
+  if (shard) {
+    if (!Number.isInteger(shard.count) || shard.count < 1)
+      return `shard count must be an integer >= 1, got ${shard.count}`;
+    if (!Number.isInteger(shard.index) || shard.index < 0 || shard.index >= shard.count) {
+      return `shard index must be an integer in 0..${shard.count - 1}, got ${shard.index}`;
+    }
+  }
+  if (ids) {
+    if (!Number.isInteger(ids.from) || !Number.isInteger(ids.to))
+      return `ids must be integers, got ${ids.from}..${ids.to}`;
+    if (ids.to < ids.from) return `invalid ids ${ids.from}..${ids.to}: end must not be before start`;
+  }
+  return undefined;
+}
 
 export type RunEvent =
   | { type: 'log'; station?: string; message: string; at: number }
@@ -331,12 +365,22 @@ class FrameLog {
   private base = 0;
   private readonly listeners = new Set<FrameListener>();
 
+  /**
+   * `retain: false` keeps sequence numbers (cursors stay meaningful) but no frames: only `expect` reads them, so a
+   * station that can never run `expect` holds nothing (a 10k-station fleet would otherwise keep ~2048 frames each).
+   */
+  constructor(private readonly retain = true) {}
+
   get nextSeq(): number {
     return this.base + this.entries.length;
   }
 
   push(entry: FrameEntry): void {
     const seq = this.nextSeq;
+    if (!this.retain) {
+      this.base++;
+      return;
+    }
     this.entries.push(entry);
     if (this.entries.length > 2 * LOG_KEEP) {
       this.entries = this.entries.slice(LOG_KEEP);
@@ -480,7 +524,22 @@ class StationClock implements Clock {
   }
 }
 
-type Instance = { index: number; name: string; block: StationBlock; vars: Vars };
+/** `index`: position in the expanded fleet. `id`: the loop variable's value for a template station. */
+type Instance = { index: number; name: string; block: StationBlock; vars: Vars; id?: number };
+
+function selected(inst: Instance, select: FleetSelection): boolean {
+  const { shard, ids } = select;
+  if (shard && inst.index % shard.count !== shard.index) return false;
+  if (ids && (inst.id === undefined || inst.id < ids.from || inst.id > ids.to)) return false;
+  return true;
+}
+
+function describeSelection(select: FleetSelection): string {
+  const parts: string[] = [];
+  if (select.shard) parts.push(`shard ${select.shard.index}/${select.shard.count}`);
+  if (select.ids) parts.push(`ids ${select.ids.from}..${select.ids.to}`);
+  return parts.join(', ');
+}
 
 /**
  * Where random draws come from. `path` names a sequential thread of statements: the station body, an `at` branch
@@ -538,9 +597,20 @@ class Run {
   async execute(): Promise<RunResult> {
     const csmsUrl = this.opts.csmsUrl ?? this.scenarioCsms();
     if (!csmsUrl) throw new Error('scenario has no csms URL: add `csms "ws://..."` or pass RunOptions.csmsUrl');
+    const select = this.opts.select;
+    const problem = select && selectionProblem(select);
+    if (problem) throw new RangeError(problem);
     await this.ready;
     const start = this.clock.now();
-    const instances = this.expand();
+    const fleet = this.expand();
+    const instances = select ? fleet.filter((inst) => selected(inst, select)) : fleet;
+    if (select) {
+      this.emit({
+        type: 'log',
+        message: `fleet: running ${instances.length} of ${fleet.length} stations (${describeSelection(select)})`,
+        at: start,
+      });
+    }
     for (const inst of instances) {
       for (const name of mentionedBarriers(inst.block.body, this.procs)) this.barriers.declare(name, inst.index);
     }
@@ -592,6 +662,11 @@ class Run {
 
   proc(name: string): Stmt[] | undefined {
     return this.procs.get(name);
+  }
+
+  /** Whether this instance's station body can ever run `expect` (it decides whether frames are kept). */
+  mayExpect(inst: Instance): boolean {
+    return mayExpect(inst.block.body, this.procs);
   }
 
   get dir(): string {
@@ -706,7 +781,7 @@ class Run {
   private expand(): Instance[] {
     const out: Instance[] = [];
     const named = new Map<string, StationBlock>();
-    const add = (block: StationBlock, vars: Vars) => {
+    const add = (block: StationBlock, vars: Vars, id?: number) => {
       const name = this.interpolate(block.name, vars);
       const first = named.get(name);
       if (first) {
@@ -718,7 +793,7 @@ class Run {
         );
       }
       named.set(name, block);
-      out.push({ index: out.length, name, block, vars });
+      out.push({ index: out.length, name, block, vars, ...(id === undefined ? {} : { id }) });
     };
     for (const block of this.scenario.stations) {
       if (!block.range) {
@@ -734,7 +809,7 @@ class Run {
           block.loc.col,
         );
       }
-      for (let i = from; i <= to; i++) add(block, new Map([[block.range.var, i]]));
+      for (let i = from; i <= to; i++) add(block, new Map([[block.range.var, i]]), i);
     }
     return out;
   }
@@ -746,15 +821,13 @@ function stringify(v: Value): string {
   return 'ms' in v ? formatDuration(v) : formatDurExpr(v);
 }
 
-/** Every barrier name a body can reach, through procs and every nested block. */
-function mentionedBarriers(body: Stmt[], procs: Map<string, Stmt[]>, seen = new Set<string>()): Set<string> {
-  const out = new Set<string>();
+/** Calls `visit` on every statement a body can reach, through procs and every nested block, each proc once. */
+function walkReachable(body: Stmt[], procs: Map<string, Stmt[]>, visit: (s: Stmt) => void): void {
+  const seen = new Set<string>();
   const walk = (stmts: Stmt[]) => {
     for (const s of stmts) {
+      visit(s);
       switch (s.kind) {
-        case 'barrier':
-          out.add(s.name);
-          break;
         case 'at':
         case 'repeat':
           walk(s.body);
@@ -776,7 +849,27 @@ function mentionedBarriers(body: Stmt[], procs: Map<string, Stmt[]>, seen = new 
     }
   };
   walk(body);
+}
+
+/** Every barrier name a body can reach, through procs and every nested block. */
+function mentionedBarriers(body: Stmt[], procs: Map<string, Stmt[]>): Set<string> {
+  const out = new Set<string>();
+  walkReachable(body, procs, (s) => {
+    if (s.kind === 'barrier') out.add(s.name);
+  });
   return out;
+}
+
+/**
+ * Whether a station body can ever run `expect`, directly, in a nested block or through a proc. Quirks cannot hold
+ * `expect` (the parser refuses it), so the body and its procs are the whole search.
+ */
+export function mayExpect(body: Stmt[], procs: Map<string, Stmt[]>): boolean {
+  let found = false;
+  walkReachable(body, procs, (s) => {
+    if (s.kind === 'expect') found = true;
+  });
+  return found;
 }
 
 // ---- one station instance --------------------------------------------------------------------------------------
@@ -802,7 +895,7 @@ class InstanceRunner {
   private readonly csmsUrl: string;
   private readonly clock: Clock;
   private readonly chaos: ChaosEngine;
-  private readonly log = new FrameLog();
+  private readonly log: FrameLog;
   private readonly pendingIds = new Map<string, string>();
   private readonly asserts: AssertResult[] = [];
   private readonly branches: Promise<void>[] = [];
@@ -824,6 +917,7 @@ class InstanceRunner {
     this.inst = inst;
     this.name = inst.name;
     this.csmsUrl = csmsUrl;
+    this.log = new FrameLog(run.mayExpect(inst));
     this.clock = run.runClock;
     this.stationClock = new StationClock(this.clock);
     const seed = (fnv1a(inst.name) ^ run.seed) >>> 0;

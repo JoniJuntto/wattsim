@@ -74,11 +74,17 @@ function yieldToEventLoop(): Promise<void> {
  * are drained between firings so promise chains started by one callback settle before the next.
  * Intervals reschedule from their due time, so a 300 ms interval fires at 300, 600, 900 regardless of
  * how `advance` is chunked.
+ *
+ * Timers live in a binary min-heap on (due, seq). `cancel` only marks the timer; cancelled entries are dropped when
+ * they reach the top, or all at once when they outnumber the live ones. A fleet on one clock schedules and cancels a
+ * request timeout per CALL, so every operation stays O(log n) in the number of timers.
  */
 export class VirtualClock implements Clock {
   private current: number;
   private seq = 0;
-  private timers: VirtualTimer[] = [];
+  private heap: VirtualTimer[] = [];
+  /** Cancelled timers still in `heap`. */
+  private dead = 0;
   private advancing = false;
 
   constructor(startMs = 0) {
@@ -110,7 +116,7 @@ export class VirtualClock implements Clock {
   }
 
   pendingTimers(): number {
-    return this.timers.length;
+    return this.heap.length - this.dead;
   }
 
   /** Advance by `ms`, firing every timer due in (now, now + ms] in order. */
@@ -122,7 +128,7 @@ export class VirtualClock implements Clock {
     this.advancing = true;
     try {
       for (;;) {
-        const next = this.timers[0];
+        const next = this.peek();
         if (!next || next.due > target) break;
         // A throwing callback must not stall the clock: keep firing, report afterwards.
         try {
@@ -151,7 +157,7 @@ export class VirtualClock implements Clock {
   async runUntilIdle(maxMs: number): Promise<void> {
     const deadline = this.current + maxMs;
     for (;;) {
-      const next = this.timers[0];
+      const next = this.peek();
       if (!next) return;
       if (next.due > deadline) break;
       await this.advance(next.due - this.current);
@@ -162,41 +168,93 @@ export class VirtualClock implements Clock {
   private schedule(fn: () => void, ms: number, interval: number | undefined): Timer {
     if (!Number.isFinite(ms) || ms < 0) throw new RangeError(`timer: ms must be a finite number >= 0, got ${ms}`);
     const timer: VirtualTimer = { seq: this.seq++, due: this.current + ms, fn, interval, cancelled: false };
-    this.insert(timer);
+    this.push(timer);
     return {
       cancel: () => {
         if (timer.cancelled) return;
         timer.cancelled = true;
-        const i = this.timers.indexOf(timer);
-        if (i >= 0) this.timers.splice(i, 1);
+        this.dead++;
+        if (this.dead > 64 && this.dead * 2 > this.heap.length) this.compact();
       },
     };
   }
 
-  /** Keep `timers` sorted by (due, seq) so index 0 is always the next to fire. */
-  private insert(timer: VirtualTimer): void {
-    let lo = 0;
-    let hi = this.timers.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      const t = this.timers[mid] as VirtualTimer;
-      if (t.due < timer.due || (t.due === timer.due && t.seq < timer.seq)) lo = mid + 1;
-      else hi = mid;
+  /** The next live timer, dropping cancelled ones off the top. */
+  private peek(): VirtualTimer | undefined {
+    for (;;) {
+      const top = this.heap[0];
+      if (!top || !top.cancelled) return top;
+      this.pop();
+      this.dead--;
     }
-    this.timers.splice(lo, 0, timer);
   }
 
   private fire(timer: VirtualTimer): void {
-    this.timers.shift();
+    this.pop();
     this.current = timer.due;
     if (timer.interval !== undefined) {
       // Reschedule before calling so the callback may cancel it.
       timer.due += timer.interval;
       timer.seq = this.seq++;
-      this.insert(timer);
+      this.push(timer);
+    } else {
+      // Fired: a later cancel() is a no-op and must not count it as a dead heap entry.
+      timer.cancelled = true;
     }
     timer.fn();
   }
+
+  /** Drop every cancelled entry and rebuild the heap. */
+  private compact(): void {
+    this.heap = this.heap.filter((t) => !t.cancelled);
+    this.dead = 0;
+    for (let i = (this.heap.length >>> 1) - 1; i >= 0; i--) this.down(i);
+  }
+
+  private push(timer: VirtualTimer): void {
+    const heap = this.heap;
+    heap.push(timer);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >>> 1;
+      const p = heap[parent] as VirtualTimer;
+      if (!earlier(timer, p)) break;
+      heap[i] = p;
+      i = parent;
+    }
+    heap[i] = timer;
+  }
+
+  private pop(): void {
+    const heap = this.heap;
+    const last = heap.pop() as VirtualTimer;
+    if (heap.length === 0) return;
+    heap[0] = last;
+    this.down(0);
+  }
+
+  private down(start: number): void {
+    const heap = this.heap;
+    const n = heap.length;
+    const timer = heap[start] as VirtualTimer;
+    let i = start;
+    for (;;) {
+      const left = 2 * i + 1;
+      if (left >= n) break;
+      const right = left + 1;
+      const child = right < n && earlier(heap[right] as VirtualTimer, heap[left] as VirtualTimer) ? right : left;
+      const c = heap[child] as VirtualTimer;
+      if (!earlier(c, timer)) break;
+      heap[i] = c;
+      i = child;
+    }
+    heap[i] = timer;
+  }
+}
+
+/** Heap order: due time, then scheduling order. */
+function earlier(a: VirtualTimer, b: VirtualTimer): boolean {
+  return a.due < b.due || (a.due === b.due && a.seq < b.seq);
 }
 
 export type SkewOptions = { offsetMs?: number; driftPpm?: number };

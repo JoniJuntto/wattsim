@@ -150,6 +150,77 @@ describe('VirtualClock', () => {
   });
 });
 
+describe('VirtualClock at fleet scale', () => {
+  test('thousands of timers with interleaved cancels fire in (due, scheduling) order', async () => {
+    const c = new VirtualClock(0);
+    // A seeded shuffle of due times with many ties, a third of them cancelled, some from inside callbacks.
+    let x = 12345;
+    const rand = () => {
+      x = (x * 1103515245 + 12345) & 0x7fffffff;
+      return x;
+    };
+    const fired: Array<[number, number]> = [];
+    const timers: Array<{ due: number; seq: number; cancel(): void }> = [];
+    for (let seq = 0; seq < 3000; seq++) {
+      const due = (rand() % 500) * 10;
+      const t = c.setTimeout(() => {
+        fired.push([due, seq]);
+        // Cancelling a later timer from inside a callback must stop it firing.
+        const victim = timers[seq + 7];
+        if (seq % 11 === 0 && victim) victim.cancel();
+      }, due);
+      timers.push({ due, seq, cancel: () => t.cancel() });
+    }
+    const cancelled = new Set<number>();
+    for (const t of timers) {
+      if (rand() % 3 === 0) {
+        t.cancel();
+        cancelled.add(t.seq);
+      }
+    }
+    expect(c.pendingTimers()).toBe(3000 - cancelled.size);
+    await c.advance(5000);
+    for (let i = 1; i < fired.length; i++) {
+      const [d0, s0] = fired[i - 1] as [number, number];
+      const [d1, s1] = fired[i] as [number, number];
+      expect(d0 < d1 || (d0 === d1 && s0 < s1)).toBe(true);
+    }
+    for (const [, seq] of fired) expect(cancelled.has(seq)).toBe(false);
+    // Every timer that was neither cancelled up front nor by an earlier callback fired exactly once.
+    expect(new Set(fired.map(([, s]) => s)).size).toBe(fired.length);
+    expect(c.pendingTimers()).toBe(0);
+  });
+
+  test('pendingTimers counts live timers only; cancelling a fired timeout is a no-op', async () => {
+    const c = new VirtualClock(0);
+    const once = c.setTimeout(() => {}, 10);
+    const every = c.setInterval(() => {}, 10);
+    const later = c.setTimeout(() => {}, 1000);
+    expect(c.pendingTimers()).toBe(3);
+    await c.advance(10);
+    expect(c.pendingTimers()).toBe(2);
+    once.cancel();
+    expect(c.pendingTimers()).toBe(2);
+    later.cancel();
+    later.cancel();
+    expect(c.pendingTimers()).toBe(1);
+    every.cancel();
+    expect(c.pendingTimers()).toBe(0);
+    await c.advance(5000);
+    expect(c.now()).toBe(5010);
+  });
+
+  test('mass cancellation compacts and keeps the remaining order', async () => {
+    const c = new VirtualClock(0);
+    const order: number[] = [];
+    const handles = Array.from({ length: 1000 }, (_, i) => c.setTimeout(() => order.push(i), 1000 - i));
+    for (let i = 0; i < 1000; i++) if (i % 10 !== 0) handles[i]?.cancel();
+    expect(c.pendingTimers()).toBe(100);
+    await c.runUntilIdle(10_000);
+    expect(order).toEqual(Array.from({ length: 100 }, (_, k) => 990 - k * 10));
+  });
+});
+
 describe('SkewedClock', () => {
   test('applies offset and drift on top of the base clock', async () => {
     const base = new VirtualClock(1_700_000_000_000);
