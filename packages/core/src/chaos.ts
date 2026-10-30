@@ -85,7 +85,7 @@ export class ChaosEngine {
    * The first matching rule wins; a `once` rule is removed after it matches.
    */
   decide(direction: ChaosDirection, frame: Frame, action?: string): ChaosDecision {
-    const frameAction = frame.type === 2 ? frame.action : action;
+    const frameAction = frame.type === 2 || frame.type === 6 ? frame.action : action;
     const total = this.bump(direction);
     const perAction = frameAction === undefined ? 0 : this.bump(`${direction}:${frameAction}`);
 

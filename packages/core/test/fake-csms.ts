@@ -183,7 +183,7 @@ export class FakeCsms {
   private onMessage(ws: Socket, raw: string): void {
     let frame: Frame;
     try {
-      frame = decodeFrame(raw);
+      frame = decodeFrame(raw, { version: ws.data.protocol });
     } catch {
       this.invalid.push(raw);
       return;
@@ -198,7 +198,8 @@ export class FakeCsms {
     if (!pending) return;
     this.pendingCalls.delete(frame.id);
     if (frame.type === MessageType.CallResult) pending.resolve(frame.payload);
-    else pending.reject(new Error(`CALLERROR ${frame.code}: ${frame.description}`));
+    else if (frame.type === MessageType.CallError)
+      pending.reject(new Error(`CALLERROR ${frame.code}: ${frame.description}`));
   }
 
   private async handleCall(ws: Socket, call: CallFrame): Promise<void> {
@@ -234,9 +235,9 @@ export class FakeCsms {
         return () => ({ currentTime: isoTimestamp(this.clock) });
       case 'Authorize':
         return (_payload, identity) =>
-          this.protocolOf(identity) === 'ocpp2.0.1'
-            ? { idTokenInfo: { status: 'Accepted' } }
-            : { idTagInfo: { status: 'Accepted' } };
+          this.protocolOf(identity) === 'ocpp1.6'
+            ? { idTagInfo: { status: 'Accepted' } }
+            : { idTokenInfo: { status: 'Accepted' } };
       case 'StatusNotification':
       case 'StopTransaction':
       case 'MeterValues':

@@ -3,6 +3,10 @@
  *
  *   schemas/v16/<Action>.json, <Action>Response.json          -> generated/v16/index.ts
  *   schemas/v201/<Action>Request.json, <Action>Response.json  -> generated/v201/index.ts
+ *   schemas/v21/<Action>Request.json, <Action>Response.json   -> generated/v21/index.ts
+ *   schemas/v21/<Action>.json (no suffix)                     -> a SEND payload: the request schema, a response
+ *                                                                schema that rejects everything, and an entry in
+ *                                                                the module's `sendActions` export
  *
  * Schemas that cannot be converted fall back to z.unknown() and are listed in the
  * generated module's `fallbacks` export; the build never fails because of one schema.
@@ -13,10 +17,26 @@ import { jsonSchemaToZod } from 'json-schema-to-zod';
 import { z } from 'zod';
 
 type Direction = 'request' | 'response';
+/** `send`: the payload of a 2.1 SEND message, which has no response. */
+type FileKind = Direction | 'send';
 type Json = Record<string, unknown>;
 
+/** Response schema of a SEND-only action: a SEND is never answered, so no payload is a valid response. */
+const NO_RESPONSE = 'z.never()';
+
 const root = join(import.meta.dir, '..');
-const versions: Array<{ dir: string; parse: (file: string) => { action: string; direction: Direction } | null }> = [
+
+/** 2.x naming: `<Action>Request.json` / `<Action>Response.json`; with `sendWithoutSuffix`, a bare name is a SEND. */
+function parse2x(sendWithoutSuffix: boolean) {
+  return (file: string): { action: string; direction: FileKind } | null => {
+    const base = file.replace(/\.json$/, '');
+    if (base.endsWith('Request')) return { action: base.slice(0, -'Request'.length), direction: 'request' };
+    if (base.endsWith('Response')) return { action: base.slice(0, -'Response'.length), direction: 'response' };
+    return sendWithoutSuffix ? { action: base, direction: 'send' } : null;
+  };
+}
+
+const versions: Array<{ dir: string; parse: (file: string) => { action: string; direction: FileKind } | null }> = [
   {
     dir: 'v16',
     parse: (file) => {
@@ -26,15 +46,8 @@ const versions: Array<{ dir: string; parse: (file: string) => { action: string; 
         : { action: base, direction: 'request' };
     },
   },
-  {
-    dir: 'v201',
-    parse: (file) => {
-      const base = file.replace(/\.json$/, '');
-      if (base.endsWith('Request')) return { action: base.slice(0, -'Request'.length), direction: 'request' };
-      if (base.endsWith('Response')) return { action: base.slice(0, -'Response'.length), direction: 'response' };
-      return null;
-    },
-  },
+  { dir: 'v201', parse: parse2x(false) },
+  { dir: 'v21', parse: parse2x(true) },
 ];
 
 /** Keywords whose value is a map of property-name -> schema; keys under them are names, not keywords. */
@@ -98,6 +111,7 @@ for (const { dir, parse } of versions) {
   const schemaDir = join(root, 'schemas', dir);
   const byAction = new Map<string, Partial<Record<Direction, string>>>();
   const fallbacks: string[] = [];
+  const sendActions: string[] = [];
 
   for (const file of readdirSync(schemaDir)
     .filter((f) => f.endsWith('.json'))
@@ -107,7 +121,8 @@ for (const { dir, parse } of versions) {
       console.warn(`[generate] ${dir}/${file}: cannot derive action name, skipped`);
       continue;
     }
-    const { action, direction } = parsed;
+    const { action } = parsed;
+    const direction: Direction = parsed.direction === 'send' ? 'request' : parsed.direction;
     const schema = (await Bun.file(join(schemaDir, file)).json()) as Json;
     let code: string;
     try {
@@ -119,6 +134,11 @@ for (const { dir, parse } of versions) {
     }
     const entry = byAction.get(action) ?? {};
     entry[direction] = code;
+    if (parsed.direction === 'send') {
+      if (entry.response !== undefined) throw new Error(`${dir}/${file}: SEND action ${action} also has a response`);
+      entry.response = NO_RESPONSE;
+      sendActions.push(action);
+    }
     byAction.set(action, entry);
   }
 
@@ -149,6 +169,8 @@ for (const { dir, parse } of versions) {
   }
   lines.push('};', '');
   lines.push(`export const actions: readonly string[] = ${JSON.stringify(actions)};`, '');
+  lines.push('/** Actions whose payload travels in a SEND (2.1); their response schema rejects everything. */');
+  lines.push(`export const sendActions: readonly string[] = ${JSON.stringify(sendActions.sort())};`, '');
   lines.push(`/** "<Action>.<direction>" entries where conversion failed and z.unknown() is used. */`);
   lines.push(`export const fallbacks: readonly string[] = ${JSON.stringify(fallbacks.sort())};`, '');
 

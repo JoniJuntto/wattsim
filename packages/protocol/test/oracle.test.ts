@@ -11,6 +11,7 @@ import draft06 from 'ajv/dist/refs/json-schema-draft-06.json';
 import Ajv04 from 'ajv-draft-04';
 import addFormats from 'ajv-formats';
 import { fallbacks as v16Fallbacks, schemas as v16Schemas } from '../generated/v16';
+import { fallbacks as v21Fallbacks, schemas as v21Schemas, sendActions as v21SendActions } from '../generated/v21';
 import { fallbacks as v201Fallbacks, schemas as v201Schemas } from '../generated/v201';
 import type { Direction } from '../src/validate';
 import type { OcppVersion } from '../src/version';
@@ -76,8 +77,16 @@ function dummy(schema: Json): unknown {
   }
 }
 
-function fileFor(version: OcppVersion, action: string, direction: Direction): string {
+/** `undefined` for the response of a SEND-only action: it has no schema file. */
+function fileFor(
+  version: OcppVersion,
+  action: string,
+  direction: Direction,
+  sendActions: readonly string[],
+): string | undefined {
   const dir = schemaDir(version);
+  if (sendActions.includes(action))
+    return direction === 'request' ? join(schemasRoot, dir, `${action}.json`) : undefined;
   const suffix = direction === 'response' ? 'Response' : dir === 'v16' ? '' : 'Request';
   return join(schemasRoot, dir, `${action}${suffix}.json`);
 }
@@ -86,12 +95,14 @@ const cases: Array<{
   version: OcppVersion;
   schemas: Record<string, { request: unknown; response: unknown }>;
   fallbacks: readonly string[];
+  sendActions: readonly string[];
 }> = [
-  { version: 'ocpp1.6', schemas: v16Schemas, fallbacks: v16Fallbacks },
-  { version: 'ocpp2.0.1', schemas: v201Schemas, fallbacks: v201Fallbacks },
+  { version: 'ocpp1.6', schemas: v16Schemas, fallbacks: v16Fallbacks, sendActions: [] },
+  { version: 'ocpp2.0.1', schemas: v201Schemas, fallbacks: v201Fallbacks, sendActions: [] },
+  { version: 'ocpp2.1', schemas: v21Schemas, fallbacks: v21Fallbacks, sendActions: v21SendActions },
 ];
 
-for (const { version, schemas, fallbacks } of cases) {
+for (const { version, schemas, fallbacks, sendActions } of cases) {
   describe(`oracle ${version}`, () => {
     test(`generator fell back to z.unknown() for at most ${MAX_FALLBACKS_PER_VERSION} schemas`, () => {
       if (fallbacks.length > 0)
@@ -101,9 +112,19 @@ for (const { version, schemas, fallbacks } of cases) {
 
     test('every schema file has a generated counterpart', () => {
       const files = readdirSync(join(schemasRoot, schemaDir(version))).filter((f) => f.endsWith('.json'));
-      const expected = files.length;
+      // A SEND-only action has one file (its payload) but a request/response pair in the registry.
+      const expected = files.length + sendActions.length;
       const generated = Object.keys(schemas).length * 2;
       expect(generated).toBe(expected);
+    });
+
+    test('a SEND-only action rejects every response', () => {
+      for (const action of sendActions) {
+        const pair = schemas[action] as { response: { safeParse: (x: unknown) => { success: boolean } } };
+        for (const payload of [{}, null, 'x', { status: 'Accepted' }]) {
+          expect(pair.response.safeParse(payload).success).toBe(false);
+        }
+      }
     });
 
     test('Zod and Ajv agree on validity for every action and direction', async () => {
@@ -112,7 +133,9 @@ for (const { version, schemas, fallbacks } of cases) {
       for (const [action, pair] of Object.entries(schemas)) {
         for (const direction of ['request', 'response'] as const) {
           if (fallbacks.includes(`${action}.${direction}`)) continue;
-          const raw = (await Bun.file(fileFor(version, action, direction)).json()) as Json;
+          const file = fileFor(version, action, direction, sendActions);
+          if (file === undefined) continue;
+          const raw = (await Bun.file(file).json()) as Json;
           const ajvValidate = ajvFor(raw).compile(raw);
           const zodSchema = pair[direction] as { safeParse: (x: unknown) => { success: boolean } };
           const filled = dummy(dereference(raw));

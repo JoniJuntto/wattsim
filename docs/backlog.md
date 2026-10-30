@@ -13,7 +13,6 @@ Known gaps found while building milestone 1. Not scheduled; ordered roughly by h
 
 ## Protocol
 
-- OCPP 2.1 schemas are vendored but not generated or wired.
 - Security profiles 2 and 3 (TLS, client certificates) and the certificate lifecycle messages.
 
 ## Smart charging simplifications

@@ -11,6 +11,7 @@
  */
 import type { CallFrame, OcppVersion } from '@wattsim/protocol';
 import { ocpp16 } from './adapters/ocpp16';
+import { ocpp21 } from './adapters/ocpp21';
 import { ocpp201 } from './adapters/ocpp201';
 import type {
   BootReason,
@@ -153,6 +154,7 @@ export const MAX_TX_SAMPLES = 1000;
 const RESET_DELAY_MS = 1000;
 const BOOT_RETRY_FALLBACK_MS = 60_000;
 const MANUAL_STATUSES: ReadonlySet<ConnectorStatus> = new Set<ConnectorStatus>(['Faulted', 'Reserved']);
+const ADAPTERS: Record<OcppVersion, VersionAdapter> = { 'ocpp1.6': ocpp16, 'ocpp2.0.1': ocpp201, 'ocpp2.1': ocpp21 };
 
 function toError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
@@ -226,7 +228,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       maxCurrentA: cfg.maxCurrentA ?? 32,
       phases: cfg.phases ?? 3,
     };
-    this.adapter = cfg.version === 'ocpp1.6' ? ocpp16 : ocpp201;
+    this.adapter = ADAPTERS[cfg.version];
     this.hbMs = cfg.heartbeatMs;
     this.mvMs = this.cfg.meterIntervalMs;
     this.ratedKw = (this.cfg.maxCurrentA * this.cfg.phases * this.cfg.voltageV) / 1000;
@@ -258,6 +260,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     this.conn.on('error', (e) => this.emit('error', e));
     this.conn.on('chaos', (rule, frame) => this.emit('chaos', rule, frame));
     this.conn.on('call', (call, reply, error) => this.onCall(call, reply, error));
+    this.conn.on('send', (message) => this.emit('send', message));
   }
 
   // ---- public state ----------------------------------------------------------------------------------------

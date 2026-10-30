@@ -1,5 +1,6 @@
 import type { z } from 'zod';
 import { schemas as v16Schemas } from '../generated/v16';
+import { schemas as v21Schemas } from '../generated/v21';
 import { schemas as v201Schemas } from '../generated/v201';
 import type { OcppVersion } from './version';
 
@@ -21,6 +22,7 @@ type SchemaPair = { request: z.ZodTypeAny; response: z.ZodTypeAny };
 const registry: Record<OcppVersion, Record<string, SchemaPair>> = {
   'ocpp1.6': v16Schemas,
   'ocpp2.0.1': v201Schemas,
+  'ocpp2.1': v21Schemas,
 };
 
 function lookup(v: OcppVersion, action: string): SchemaPair | undefined {

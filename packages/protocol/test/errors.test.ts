@@ -33,7 +33,10 @@ describe('CALL_ERROR_CODES', () => {
     expect(formatViolationCode('ocpp2.0.1')).toBe('FormatViolation');
     expect(occurrenceViolationCode('ocpp1.6')).toBe('OccurenceConstraintViolation');
     expect(occurrenceViolationCode('ocpp2.0.1')).toBe('OccurrenceConstraintViolation');
-    for (const v of ['ocpp1.6', 'ocpp2.0.1'] as const) {
+    expect(CALL_ERROR_CODES['ocpp2.1']).toEqual(CALL_ERROR_CODES['ocpp2.0.1']);
+    expect(formatViolationCode('ocpp2.1')).toBe('FormatViolation');
+    expect(occurrenceViolationCode('ocpp2.1')).toBe('OccurrenceConstraintViolation');
+    for (const v of ['ocpp1.6', 'ocpp2.0.1', 'ocpp2.1'] as const) {
       expect(CALL_ERROR_CODES[v]).toContain(formatViolationCode(v));
       expect(CALL_ERROR_CODES[v]).toContain(occurrenceViolationCode(v));
     }

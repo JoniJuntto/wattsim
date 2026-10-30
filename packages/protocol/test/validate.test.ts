@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { ACTIONS } from '../src/actions';
+import { ACTIONS, SEND_ACTIONS } from '../src/actions';
 import { isKnownAction, validatePayload } from '../src/validate';
 
 describe('validatePayload ocpp1.6', () => {
@@ -95,5 +95,35 @@ describe('ACTIONS', () => {
     expect(ACTIONS['ocpp1.6']).toContain('Heartbeat');
     expect(ACTIONS['ocpp2.0.1']).toContain('Heartbeat');
     expect([...ACTIONS['ocpp1.6']].sort()).toEqual([...ACTIONS['ocpp1.6']]);
+  });
+});
+
+describe('validatePayload ocpp2.1', () => {
+  test('accepts a 2.0.1-shaped BootNotification and rejects an unknown enum value', () => {
+    const chargingStation = { model: 'm', vendorName: 'v' };
+    expect(validatePayload('ocpp2.1', 'BootNotification', 'request', { reason: 'PowerUp', chargingStation })).toEqual({
+      ok: true,
+    });
+    const bad = validatePayload('ocpp2.1', 'BootNotification', 'request', { reason: 'Bogus', chargingStation });
+    expect(bad.ok).toBe(false);
+  });
+
+  test('knows 2.1-only actions and the SEND-only NotifyPeriodicEventStream', () => {
+    expect(isKnownAction('ocpp2.1', 'BatterySwap')).toBe(true);
+    expect(isKnownAction('ocpp2.0.1', 'BatterySwap')).toBe(false);
+    expect(isKnownAction('ocpp2.1', 'NotifyPeriodicEventStream')).toBe(true);
+    expect(SEND_ACTIONS['ocpp2.1']).toEqual(['NotifyPeriodicEventStream']);
+    expect(SEND_ACTIONS['ocpp2.0.1']).toEqual([]);
+    expect(SEND_ACTIONS['ocpp1.6']).toEqual([]);
+    const payload = { id: 1, pending: 0, basetime: '2024-01-01T00:00:00Z', data: [{ t: 0, v: '1' }] };
+    expect(validatePayload('ocpp2.1', 'NotifyPeriodicEventStream', 'request', payload)).toEqual({ ok: true });
+    // A SEND has no response; nothing validates as one.
+    expect(validatePayload('ocpp2.1', 'NotifyPeriodicEventStream', 'response', {}).ok).toBe(false);
+  });
+
+  test('ACTIONS lists every 2.1 action, SEND ones included', () => {
+    expect(ACTIONS['ocpp2.1']).toHaveLength(91);
+    expect(ACTIONS['ocpp2.1']).toContain('NotifyPeriodicEventStream');
+    expect([...ACTIONS['ocpp2.1']].sort()).toEqual([...ACTIONS['ocpp2.1']]);
   });
 });

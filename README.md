@@ -4,7 +4,7 @@ A spec-strict, scriptable OCPP 1.6/2.0.1/2.1 simulator for every side of the wir
 
 ## Status
 
-Milestone 1 is in progress: a Bun/TypeScript library and CLI that simulates charge points speaking OCPP 1.6J and 2.0.1 against any CSMS, driven by a scenario DSL. The CSMS side, OCPP 2.1, the UI, MCP server, vendor quirk profiles and record/replay are roadmap items, in that order. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
+A Bun/TypeScript library and CLI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL. The CSMS side, the UI, MCP server, vendor quirk profiles and record/replay are roadmap items, in that order. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
 
 ## Quick start
 
@@ -93,7 +93,7 @@ bun run build       # regenerate Zod validators (packages/protocol/generated, gi
 
 Packages, all Bun workspaces under `packages/`:
 
-- `protocol`: OCPP-J framing, vendored OCA schemas and the Zod validators generated from them
+- `protocol`: OCPP-J framing (including the 2.1 CALLRESULTERROR and SEND message types), vendored OCA schemas for 1.6, 2.0.1 and 2.1, and the Zod validators generated from them
 - `core`: clock, EV and meter models, WebSocket connection with chaos middleware, station state machine and version adapters
 - `scenario`: the DSL (lexer, parser, AST, formatter, interpreter) and JUnit reporting
 - `cli`: the `wattsim` command (`run`, `check`, `fmt`)

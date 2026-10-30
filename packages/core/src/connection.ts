@@ -3,7 +3,7 @@
  * disconnects, one CALL in flight at a time, reconnect with exponential backoff, strict schema validation and
  * chaos middleware. Every timer runs on the injected `Clock`; only the socket itself is real I/O.
  */
-import type { CallErrorFrame, CallFrame, Frame, OcppVersion, Violation } from '@wattsim/protocol';
+import type { CallErrorFrame, CallFrame, Frame, OcppVersion, SendFrame, Violation } from '@wattsim/protocol';
 import {
   decodeFrame,
   encodeFrame,
@@ -12,6 +12,7 @@ import {
   isKnownAction,
   MessageType,
   newMessageId,
+  SEND_ACTIONS,
   validatePayload,
 } from '@wattsim/protocol';
 import type { ChaosDirection, ChaosEngine, ChaosRule } from './chaos';
@@ -19,6 +20,9 @@ import type { Clock, Timer } from './clock';
 import { TypedEmitter } from './events';
 
 export type ConnectionState = 'Disconnected' | 'Connecting' | 'Connected';
+
+/** An inbound 2.1 SEND message: unconfirmed, so it is only reported, never answered. */
+export type SendMessage = { action: string; payload: unknown };
 
 export type ReconnectPolicy = { initialMs: number; maxMs: number; factor: number };
 
@@ -54,6 +58,8 @@ export type ConnectionEvents = {
   chaos: [ChaosRule, Frame];
   /** Inbound CALL. Call `reply(result)` or `error(code, description)` exactly once. */
   call: [CallFrame, (result: unknown) => void, (code: string, description: string) => void];
+  /** Inbound SEND (2.1). In strict mode only SENDs whose payload passed validation are emitted. */
+  send: [SendMessage];
 };
 
 export const DEFAULT_RECONNECT: ReconnectPolicy = { initialMs: 1000, maxMs: 60000, factor: 2 };
@@ -370,7 +376,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
         return;
       }
       case 'mutate': {
-        const f = frame.type === MessageType.CallError ? frame : { ...frame, payload: effect.fn(frame.payload) };
+        const f = 'payload' in frame ? { ...frame, payload: effect.fn(frame.payload) } : frame;
         this.transmit(f, encodeFrame(f));
         return;
       }
@@ -389,14 +395,14 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   private onRaw(raw: string): void {
     let frame: Frame;
     try {
-      frame = decodeFrame(raw);
+      frame = decodeFrame(raw, { version: this.version });
     } catch (err) {
       this.emit('error', err as Error);
       return;
     }
     this.emit('frame', 'in', frame, raw);
     const hint =
-      frame.type === MessageType.Call
+      frame.type === MessageType.Call || frame.type === MessageType.Send
         ? frame.action
         : this.inflight && this.inflight.id === frame.id
           ? this.inflight.action
@@ -434,7 +440,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
         }
         return;
       case 'mutate':
-        this.dispatch(frame.type === MessageType.CallError ? frame : { ...frame, payload: effect.fn(frame.payload) });
+        this.dispatch('payload' in frame ? { ...frame, payload: effect.fn(frame.payload) } : frame);
         return;
     }
   }
@@ -444,12 +450,21 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       this.handleCall(frame);
       return;
     }
-    const p = this.inflight;
-    if (!p || p.id !== frame.id) {
-      this.emit('error', new Error(`unexpected message id ${frame.id} (no matching CALL in flight)`));
+    if (frame.type === MessageType.Send) {
+      this.handleSend(frame);
       return;
     }
-    if (frame.type === MessageType.CallError) {
+    const p = this.inflight;
+    if (!p || p.id !== frame.id) {
+      // A CALLRESULTERROR normally answers a CALLRESULT this side sent, which has nothing pending to settle.
+      const message =
+        frame.type === MessageType.CallResultError
+          ? `CALLRESULTERROR ${frame.code} for message ${frame.id}${frame.description ? `: ${frame.description}` : ''}`
+          : `unexpected message id ${frame.id} (no matching CALL in flight)`;
+      this.emit('error', new Error(message));
+      return;
+    }
+    if (frame.type === MessageType.CallError || frame.type === MessageType.CallResultError) {
       this.settle(p, () => p.reject(new CallError(p.action, frame.code, frame.description, frame.details)));
       return;
     }
@@ -509,6 +524,27 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       return;
     }
     if (!handled) error('NotImplemented', `no handler for ${call.action}`);
+  }
+
+  /** SEND: validate in strict mode (payload, and that the action is a SEND action), then report. Never answered. */
+  private handleSend(frame: SendFrame): void {
+    if (this.strict) {
+      if (!SEND_ACTIONS[this.version].includes(frame.action)) {
+        const message = isKnownAction(this.version, frame.action)
+          ? `${frame.action} is not sent as a SEND message in ${this.version}`
+          : `unknown action ${frame.action} for ${this.version}`;
+        this.emit('violation', {
+          version: this.version,
+          action: frame.action,
+          direction: 'request',
+          path: '',
+          message,
+        });
+        return;
+      }
+      if (this.check(frame.action, 'request', frame.payload).length > 0) return;
+    }
+    this.emit('send', { action: frame.action, payload: frame.payload });
   }
 
   /** Validate and emit every violation. Returns the violations (empty when valid). */

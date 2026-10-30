@@ -124,6 +124,55 @@ describe('decodeFrame', () => {
   });
 });
 
+describe('OCPP 2.1 message types', () => {
+  const v21 = { version: 'ocpp2.1' } as const;
+
+  test('encodes a CALLRESULTERROR and a SEND exactly as OCPP-J 2.1 requires', () => {
+    expect(
+      encodeFrame({
+        type: MessageType.CallResultError,
+        id: 'id',
+        code: 'FormatViolation',
+        description: 'bad',
+        details: {},
+      }),
+    ).toBe('[5,"id","FormatViolation","bad",{}]');
+    expect(
+      encodeFrame({ type: MessageType.Send, id: 'id', action: 'NotifyPeriodicEventStream', payload: { id: 1 } }),
+    ).toBe('[6,"id","NotifyPeriodicEventStream",{"id":1}]');
+  });
+
+  test('decodes 5 and 6 for ocpp2.1 and round-trips them', () => {
+    const cre = { type: 5, id: 'r1', code: 'InternalError', description: 'x', details: { a: 1 } } as const;
+    const send = { type: 6, id: 's1', action: 'NotifyPeriodicEventStream', payload: { id: 2 } } as const;
+    expect(decodeFrame(encodeFrame(cre), v21)).toEqual(cre);
+    expect(decodeFrame(encodeFrame(send), v21)).toEqual(send);
+  });
+
+  test('2.1 still decodes the 2.0.1 message types', () => {
+    expect(decodeFrame('[2,"id","Heartbeat",{}]', v21)).toMatchObject({ type: 2, action: 'Heartbeat' });
+    expect(decodeFrame('[4,"id","GenericError","d",{}]', v21)).toMatchObject({ type: 4 });
+  });
+
+  test('5 and 6 are unknown message types without ocpp2.1', () => {
+    for (const raw of ['[5,"id","GenericError","d",{}]', '[6,"id","NotifyPeriodicEventStream",{}]']) {
+      expect(() => decodeFrame(raw)).toThrow(/unknown message type/);
+      expect(() => decodeFrame(raw, { version: 'ocpp2.0.1' })).toThrow(/unknown message type/);
+      expect(() => decodeFrame(raw, { version: 'ocpp1.6' })).toThrow(/unknown message type/);
+    }
+  });
+
+  test('checks the shape of CALLRESULTERROR and SEND', () => {
+    expect(() => decodeFrame('[5]', v21)).toThrow(/CALLRESULTERROR must have 5 elements, got 1/);
+    expect(() => decodeFrame('[6]', v21)).toThrow(/SEND must have 4 elements, got 1/);
+    expect(() => decodeFrame('[5,"id",1,"d",{}]', v21)).toThrow(/CALLRESULTERROR code and description must be strings/);
+    expect(() => decodeFrame('[5,"id","c","d",[]]', v21)).toThrow(/CALLRESULTERROR details must be a JSON object/);
+    expect(() => decodeFrame('[6,"id",1,{}]', v21)).toThrow(/SEND action must be a string/);
+    expect(() => decodeFrame('[6,"id","A",[]]', v21)).toThrow(/SEND payload must be a JSON object/);
+    expect(() => decodeFrame(`[6,"${'a'.repeat(37)}","A",{}]`, v21)).toThrow(/36/);
+  });
+});
+
 describe('newMessageId', () => {
   test('returns unique UUID strings', () => {
     const a = newMessageId();

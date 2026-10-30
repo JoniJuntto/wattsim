@@ -1,8 +1,9 @@
 /**
- * OCPP 2.0.1 adapter. One connector per EVSE (`connectorId: 1`). Transactions are TransactionEvent
- * Started/Updated/Ended with a station-generated UUID and a per-transaction `seqNo`.
+ * OCPP 2.0.1 adapter, also used for 2.1 (`createOcpp2xAdapter`). One connector per EVSE (`connectorId: 1`).
+ * Transactions are TransactionEvent Started/Updated/Ended with a station-generated UUID and a per-transaction
+ * `seqNo`.
  */
-import type { CallFrame, v201 } from '@wattsim/protocol';
+import type { CallFrame, OcppVersion, v201 } from '@wattsim/protocol';
 import type { Clock } from '../clock';
 import { isoTimestamp } from '../clock';
 import type { MeterSample } from '../meter';
@@ -382,9 +383,20 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
   }
 }
 
-export const ocpp201: VersionAdapter = {
-  version: 'ocpp2.0.1',
+/** The OCPP 2.x versions that share this adapter. */
+export type Ocpp2xVersion = Extract<OcppVersion, 'ocpp2.0.1' | 'ocpp2.1'>;
 
+/**
+ * The 2.x adapter for `version`. 2.1 is a wire superset of 2.0.1 for every message this station sends and every
+ * CALL it handles, so one implementation serves both; payload types come from `v201` because every field the
+ * station fills is shared, and station21.test.ts checks the output against the 2.1 schemas. Inbound CALLs that
+ * exist only in 2.1 fall through to `null` (NotImplemented).
+ */
+export function createOcpp2xAdapter(version: Ocpp2xVersion): VersionAdapter {
+  return { ...ocpp2xAdapter, version };
+}
+
+const ocpp2xAdapter: Omit<VersionAdapter, 'version'> = {
   bootPayload(cfg: ResolvedStationConfig, reason: BootReason): v201.BootNotificationRequest {
     const chargingStation: v201.BootNotificationRequest['chargingStation'] = {
       model: cfg.model,
@@ -461,3 +473,5 @@ export const ocpp201: VersionAdapter = {
 
   handleCall,
 };
+
+export const ocpp201: VersionAdapter = createOcpp2xAdapter('ocpp2.0.1');
