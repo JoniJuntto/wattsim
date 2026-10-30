@@ -9,10 +9,14 @@
  * - Quirk names are global to a run: the same name declared in two files is an error at the later declaration.
  * - `use quirk` cycles (`a` uses `b` uses `a`) are an error at the `use` that closes the cycle.
  * - Plugin files must exist; they are imported only by `loadPlugins`, when a run starts, never by `check`.
+ * - Limits for a host that links scenarios it did not write (the UI server): `root` confines every file read and
+ *   every plugin path to one folder, symlinks resolved; `allowPlugins: false` refuses `use plugin`; `maxStations`
+ *   caps the fleet, counted from the station ranges without expanding them.
  */
-import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Clock, Station } from '@wattsim/core';
-import type { Loc, QuirkDecl, Scenario, Stmt, UseStmt } from './ast';
+import type { Loc, NumExpr, QuirkDecl, Scenario, Stmt, UseStmt } from './ast';
 import { ParseError } from './lexer';
 import { parse } from './parser';
 
@@ -40,6 +44,15 @@ export type LinkOptions = {
   quirkFiles?: string[];
   /** Quirk names applied to every station, before its own statements, in this order. */
   quirks?: string[];
+  /**
+   * Only read files inside this folder: an `import`, quirk file or `use plugin` path that resolves outside it, after
+   * symlinks, is an error and nothing is read. Default: no limit.
+   */
+  root?: string;
+  /** False: every `use plugin` is an error (default true). */
+  allowPlugins?: boolean;
+  /** The most stations the expanded fleet may have (see `fleetSize`). Default: no limit. */
+  maxStations?: number;
   /** Test seams. */
   readFile?: (path: string) => Promise<string>;
   fileExists?: (path: string) => Promise<boolean>;
@@ -89,11 +102,84 @@ function display(abs: string): string {
   return rel && !rel.startsWith('..') && !isAbsolute(rel) ? rel : abs;
 }
 
+/** Whether `path` is `dir` or inside it (both absolute). */
+function within(dir: string, path: string): boolean {
+  const rel = relative(dir, path);
+  return rel === '' || (rel.split(sep)[0] !== '..' && !isAbsolute(rel));
+}
+
+/** `path` with symlinks resolved; the part that does not exist yet is kept as written. */
+async function realPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    const parent = dirname(path);
+    return parent === path ? path : join(await realPath(parent), basename(path));
+  }
+}
+
+/** Whether `abs` stays inside `root`, written and with symlinks resolved. Reads nothing but the directory tree. */
+async function inRoot(root: { path: string; real: string }, abs: string): Promise<boolean> {
+  return within(root.path, abs) && within(root.real, await realPath(abs));
+}
+
+/** A station range bound: an integer literal, or a `let` that holds one (through other `let`s). */
+function staticBound(e: NumExpr, lets: Map<string, Scenario['lets'][number]>): number | undefined {
+  let expr: { kind: string; value?: unknown; name?: string } = e;
+  for (let depth = 0; depth <= 32; depth++) {
+    if (expr.kind === 'number') return Number.isInteger(expr.value) ? (expr.value as number) : undefined;
+    if (expr.kind !== 'ref') return undefined;
+    const decl = lets.get(expr.name as string);
+    if (!decl) return undefined;
+    expr = decl.value;
+  }
+  return undefined;
+}
+
+/**
+ * The number of stations the scenario expands to, from its station blocks and range bounds alone (nothing is
+ * allocated), and where the count first passes `max`: the range of the block that crosses it. A bound that is not an
+ * integer counts nothing here; the run reports it.
+ */
+export function fleetSize(scenario: Scenario, max = Number.POSITIVE_INFINITY): { total: number; over?: Loc } {
+  const lets = new Map(scenario.lets.map((l) => [l.name, l]));
+  let total = 0;
+  let over: Loc | undefined;
+  for (const block of scenario.stations) {
+    if (block.range) {
+      const from = staticBound(block.range.from, lets);
+      const to = staticBound(block.range.to, lets);
+      if (from !== undefined && to !== undefined && to >= from) total += to - from + 1;
+    } else {
+      total += 1;
+    }
+    if (total > max && !over) over = block.range?.from.loc ?? block.name.loc;
+  }
+  return over ? { total, over } : { total };
+}
+
+/** The error for a fleet of `total` stations over `max`, located at `loc`. */
+export function fleetTooLarge(total: number, max: number, loc: Loc, file?: string): ParseError {
+  return located(`the fleet has ${total} stations, more than the limit of ${max}`, loc, file);
+}
+
+const NO_PLUGINS = 'use plugin is not allowed here';
+
+/** Throws at the first plugin `linked` references; for a run with `allowPlugins: false`. */
+export function refusePlugins(linked: Linked): void {
+  for (const ref of linked.plugins.values()) throw located(NO_PLUGINS, ref.loc, ref.file);
+}
+
 /** Resolve the scenario's quirks and plugin paths. Throws `ParseError` (with file and position) or `QuirkError`. */
 export async function link(scenario: Scenario, opts: LinkOptions = {}): Promise<Linked> {
   const read = opts.readFile ?? ((p: string) => Bun.file(p).text());
   const exists = opts.fileExists ?? ((p: string) => Bun.file(p).exists());
   const dir = opts.file ? dirname(resolve(opts.file)) : process.cwd();
+  if (opts.maxStations !== undefined) {
+    const { total, over } = fleetSize(scenario, opts.maxStations);
+    if (over) throw fleetTooLarge(total, opts.maxStations, over, opts.file);
+  }
+  const root = opts.root === undefined ? undefined : { path: resolve(opts.root), real: await realPath(opts.root) };
   const quirks = new Map<string, QuirkSource>();
   const plugins = new Map<string, PluginRef>();
   const seen = new Set<string>();
@@ -115,6 +201,10 @@ export async function link(scenario: Scenario, opts: LinkOptions = {}): Promise<
   /** Load a quirk file once; returns the quirks it declares itself, in order. */
   const load = async (abs: string, from?: { loc: Loc; file?: string }): Promise<QuirkSource[]> => {
     if (seen.has(abs)) return [];
+    if (root && !(await inRoot(root, abs))) {
+      if (from) throw located('import outside the scenario folder', from.loc, from.file);
+      throw new QuirkError('quirk file outside the scenario folder');
+    }
     seen.add(abs);
     const shown = display(abs);
     let src: string;
@@ -172,7 +262,11 @@ export async function link(scenario: Scenario, opts: LinkOptions = {}): Promise<
         if (!quirks.has(name)) throw located(`unknown quirk "${name}"${known(quirks)}`, use.name.loc, file);
         continue;
       }
+      if (opts.allowPlugins === false) throw located(NO_PLUGINS, use.name.loc, file);
       const abs = resolve(bdir, name);
+      if (root && !(await inRoot(root, abs))) {
+        throw located('use plugin outside the scenario folder', use.name.loc, file);
+      }
       if (!plugins.has(abs)) {
         if (!(await exists(abs))) throw located(`plugin file not found: ${display(abs)}`, use.name.loc, file);
         plugins.set(abs, { file, loc: use.name.loc });

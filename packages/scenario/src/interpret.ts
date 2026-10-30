@@ -141,7 +141,7 @@ import { EV_LABEL_PROP, EV_PROPS, evPropNames, evPropValue } from './ev-props';
 import { formatDuration, formatDurExpr } from './format';
 import { ParseError } from './lexer';
 import type { Linked, QuirkPlugin, QuirkSource } from './quirks';
-import { link, loadPlugins } from './quirks';
+import { fleetTooLarge, link, loadPlugins, refusePlugins } from './quirks';
 
 // ---- public types ----------------------------------------------------------------------------------------------
 
@@ -171,6 +171,20 @@ export type RunOptions = {
    * fleet and keeps a disjoint part of it. Barriers count the kept stations only.
    */
   select?: FleetSelection;
+  /**
+   * The scenario as `link` returned it, for a host that checked it already: the run uses it instead of linking again,
+   * so files that changed since the check are not read (`file`, `quirkFiles`, `quirks` and `root` are then ignored).
+   */
+  linked?: Linked;
+  /** Passed to `link`: only read files inside this folder. */
+  root?: string;
+  /** False: any `use plugin` fails the run before a station starts, and no plugin is imported (default true). */
+  allowPlugins?: boolean;
+  /**
+   * The most stations the expanded fleet may have; a larger fleet fails the run with a `ParseError` at the range
+   * that passes the limit, before any station is allocated. Default: no limit (`select` shards a big fleet).
+   */
+  maxStations?: number;
 };
 
 /**
@@ -589,8 +603,10 @@ class Run {
   }
 
   private async prepare(): Promise<void> {
-    const { file, quirkFiles, quirks } = this.opts;
-    this.linked = await link(this.scenario, { file, quirkFiles, quirks });
+    const { file, quirkFiles, quirks, root, allowPlugins, maxStations } = this.opts;
+    this.linked =
+      this.opts.linked ?? (await link(this.scenario, { file, quirkFiles, quirks, root, allowPlugins, maxStations }));
+    if (allowPlugins === false) refusePlugins(this.linked);
     this.plugins = await loadPlugins(this.linked);
   }
 
@@ -779,6 +795,7 @@ class Run {
    * overlapping templates) is a `ParseError` at the later block's name: two stations cannot share an identity.
    */
   private expand(): Instance[] {
+    const ranges = this.ranges();
     const out: Instance[] = [];
     const named = new Map<string, StationBlock>();
     const add = (block: StationBlock, vars: Vars, id?: number) => {
@@ -795,23 +812,44 @@ class Run {
       named.set(name, block);
       out.push({ index: out.length, name, block, vars, ...(id === undefined ? {} : { id }) });
     };
-    for (const block of this.scenario.stations) {
-      if (!block.range) {
+    for (const [k, block] of this.scenario.stations.entries()) {
+      const range = ranges[k];
+      if (!block.range || !range) {
         add(block, new Map());
         continue;
       }
-      const from = this.bound(block.range.from);
-      const to = this.bound(block.range.to);
-      if (to < from) {
-        throw new ParseError(
-          `invalid range ${from}..${to}: end must not be before start`,
-          block.loc.line,
-          block.loc.col,
-        );
-      }
-      for (let i = from; i <= to; i++) add(block, new Map([[block.range.var, i]]), i);
+      for (let i = range.from; i <= range.to; i++) add(block, new Map([[block.range.var, i]]), i);
     }
     return out;
+  }
+
+  /** Every block's resolved range (undefined without one), checked against `maxStations` before anything is built. */
+  private ranges(): ({ from: number; to: number } | undefined)[] {
+    const max = this.opts.maxStations ?? Number.POSITIVE_INFINITY;
+    let total = 0;
+    let over: Loc | undefined;
+    const ranges = this.scenario.stations.map((block) => {
+      let range: { from: number; to: number } | undefined;
+      if (block.range) {
+        const from = this.bound(block.range.from);
+        const to = this.bound(block.range.to);
+        if (to < from) {
+          throw new ParseError(
+            `invalid range ${from}..${to}: end must not be before start`,
+            block.loc.line,
+            block.loc.col,
+          );
+        }
+        range = { from, to };
+        total += to - from + 1;
+      } else {
+        total += 1;
+      }
+      if (total > max && !over) over = block.range?.from.loc ?? block.name.loc;
+      return range;
+    });
+    if (over) throw fleetTooLarge(total, max, over, this.opts.file);
+    return ranges;
   }
 }
 

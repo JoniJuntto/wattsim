@@ -1,4 +1,4 @@
-import { type RunningServer, type StreamMessage, startServer } from '../src/index';
+import { type RunningServer, type ServerOptions, type StreamMessage, startServer } from '../src/index';
 
 export type Api = {
   server: RunningServer;
@@ -9,12 +9,8 @@ export type Api = {
   del(path: string): Promise<Response>;
 };
 
-export async function boot(opts: { uiDir?: string; dataDir?: string } = {}): Promise<Api> {
-  const server = await startServer({
-    port: 0,
-    uiDir: opts.uiDir ?? '/nonexistent-wattsim-ui',
-    dataDir: opts.dataDir,
-  });
+export async function boot(opts: ServerOptions = {}): Promise<Api> {
+  const server = await startServer({ ...opts, port: 0, uiDir: opts.uiDir ?? '/nonexistent-wattsim-ui' });
   const url = server.url;
   return {
     server,

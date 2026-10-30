@@ -205,13 +205,14 @@ describe('errors', () => {
     expect(again.json.error).toContain('already plugged');
   });
 
-  test('bodies are JSON whatever the content type says', async () => {
+  test('a body must be sent as application/json (415 otherwise, as curl -d sends form encoding)', async () => {
     const res = await fetch(`${api.url}/api/validate`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: JSON.stringify({ version: 'ocpp1.6', action: 'Heartbeat', direction: 'request', payload: {} }),
     });
-    expect(await res.json()).toEqual({ ok: true, violations: [] });
+    expect(res.status).toBe(415);
+    expect(((await res.json()) as { error: string }).error).toContain('application/json');
   });
 
   test('400 for invalid bodies', async () => {

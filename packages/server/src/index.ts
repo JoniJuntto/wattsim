@@ -2,7 +2,13 @@
  * wattsim UI server: one Bun process, one port. Elysia for the JSON API, one WebSocket (`/api/stream`) pushing
  * station state and frames to the browser, the built UI served statically. Never touches OCPP sockets itself:
  * stations own those through `@wattsim/core`. Local-first, no auth (DESIGN.md §3).
+ *
+ * No auth does not mean any web page may drive it: a state-changing request (POST, PUT, PATCH, DELETE) or a stream
+ * upgrade whose `Origin` is not the server's own (nor one of `allowOrigins`) is a 403, and a request body must be
+ * `application/json` (else 415), which a cross-origin page can only send after a CORS preflight the server never
+ * grants. A request without `Origin` (curl, the MCP server, tests) is not a browser page and passes.
  */
+import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { toJUnit as csmsJUnit } from '@wattsim/csms';
 import { validatePayload } from '@wattsim/protocol';
@@ -13,7 +19,7 @@ import { Store } from './db/store';
 import { buildMeta } from './meta';
 import { fileName, sessionTrace } from './recording';
 import { Conflict, FRAMES_PER_STATION, NotFound, Registry } from './registry';
-import { Runs } from './runs';
+import { DEFAULT_RUN_LIMITS, Runs, TooManyRuns } from './runs';
 import { checkScenario, formatScenario, prepare } from './scenario';
 import type { CreateStation } from './schemas';
 import {
@@ -71,12 +77,28 @@ export type ServerOptions = {
   dataDir?: string;
   /** Port of the built-in test CSMS; default 0 (a free port). Fix it to publish the port from a container. */
   csmsPort?: number;
+  /** Stations a browser scenario may expand to, checked and run; default `DEFAULT_MAX_STATIONS`. */
+  maxStations?: number;
+  /** Scenario runs at once; one more is a 429. Default `DEFAULT_MAX_RUNS`. */
+  maxRuns?: number;
+  /** Wall-clock ms a real-time run may take before it is stopped with an error; 0: no limit. Default 1 h. */
+  maxRunMs?: number;
+  /**
+   * Origins (`scheme://host[:port]`) allowed besides the server's own, e.g. a dev server that proxies `/api` to this
+   * one. The server's own origin is the request's `Host`, so every name it is reached under works.
+   */
+  allowOrigins?: string[];
 };
 
 export type RunningServer = { url: string; stop(): Promise<void> };
 
 export const DEFAULT_PORT = 7700;
 export const DEFAULT_HOST = '127.0.0.1';
+export const DEFAULT_MAX_STATIONS = 10_000;
+export const DEFAULT_MAX_RUNS = DEFAULT_RUN_LIMITS.maxRuns;
+export const DEFAULT_MAX_RUN_MS = DEFAULT_RUN_LIMITS.maxRunMs;
+/** The folder under the data directory that browser scenarios import from; nothing outside it is read. */
+export const SCENARIO_DIR = 'scenarios';
 const DEFAULT_UI_DIR = resolve(import.meta.dir, '../../ui/dist');
 const DEFAULT_FRAME_LIMIT = 500;
 
@@ -101,6 +123,68 @@ function limitOf(raw: string | undefined, fallback: number, max: number): number
   const limit = raw === undefined ? fallback : Number(raw);
   if (!Number.isInteger(limit) || limit < 1) throw new BadRequest('limit: expected a positive integer');
   return Math.min(limit, max);
+}
+
+const forbidden = (origin: string) =>
+  json(403, { error: `cross-origin request refused: ${origin} is not this server (see wattsim ui --allow-origin)` });
+
+const STATE_CHANGING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/** Whether `origin` is the origin the request was sent to (its `Host`), or one the server was told to allow. */
+function sameOrigin(request: Request, origin: string, allowed: ReadonlySet<string>): boolean {
+  if (allowed.has(origin)) return true;
+  let host: string;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    return false; // `null` (a sandboxed frame, a file: page) and garbage
+  }
+  return host === (request.headers.get('host') ?? new URL(request.url).host);
+}
+
+/** Whether the request carries a body (which then has to be JSON). */
+function hasBody(request: Request): boolean {
+  const length = request.headers.get('content-length');
+  return (length !== null && length !== '0') || request.headers.has('transfer-encoding');
+}
+
+function isJson(contentType: string | null): boolean {
+  return contentType?.split(';')[0]?.trim().toLowerCase() === 'application/json';
+}
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+/** Whether a host name (no port) is a loopback name. */
+function isLoopback(hostname: string): boolean {
+  return LOOPBACK_HOSTS.has(hostname.toLowerCase()) || /^127\.\d+\.\d+\.\d+$/.test(hostname);
+}
+
+/** The host name of a `Host` header value, without its port; `[::1]:7700` gives `[::1]`. */
+function hostName(host: string): string {
+  return host.startsWith('[') ? host.slice(0, host.indexOf(']') + 1) : (host.split(':')[0] ?? host);
+}
+
+/**
+ * The cross-origin guard (see the module comment): a Response to refuse the request with, or undefined to let it
+ * through. `loopbackOnly` (the server listens on a loopback address, the default) also refuses any request whose
+ * `Host` is not a loopback name, reads included: a DNS-rebinding page reaches 127.0.0.1 under its own domain name,
+ * and its Origin matches that Host, so the Origin check alone would let it read and drive the server.
+ */
+function guard(request: Request, allowed: ReadonlySet<string>, loopbackOnly: boolean): Response | undefined {
+  if (loopbackOnly) {
+    const host = request.headers.get('host');
+    if (host !== null && !isLoopback(hostName(host))) {
+      return json(403, { error: `refused: Host ${host} is not this machine (the server listens on loopback only)` });
+    }
+  }
+  const upgrade = request.headers.get('upgrade')?.toLowerCase() === 'websocket';
+  if (!STATE_CHANGING.has(request.method) && !upgrade) return undefined;
+  const origin = request.headers.get('origin');
+  if (origin !== null && !sameOrigin(request, origin, allowed)) return forbidden(origin);
+  if (hasBody(request) && !isJson(request.headers.get('content-type'))) {
+    return json(415, { error: 'request bodies must be JSON with content-type: application/json' });
+  }
+  return undefined;
 }
 
 /** Request bodies arrive as text (see `onParse`) and are parsed here, so a bad one is a 400 like any other. */
@@ -129,8 +213,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
   const hub: StreamHub = new StreamHub((id): StationView | undefined => reg.view(id));
   const reg: Registry = new Registry(hub);
   const store = new Store(opts.dataDir);
-  const baseDir = resolve(opts.dataDir ?? process.cwd());
-  const runs = new Runs(store, hub, (clock) => startTestCsmsOn({ host, clock }));
+  const scenarioDir = opts.dataDir ? resolve(opts.dataDir, SCENARIO_DIR) : process.cwd();
+  if (opts.dataDir) mkdirSync(scenarioDir, { recursive: true });
+  const maxStations = opts.maxStations ?? DEFAULT_MAX_STATIONS;
+  const scenarioOpts = { dir: scenarioDir, maxStations };
+  const allowed: ReadonlySet<string> = new Set(opts.allowOrigins ?? []);
+  const runs = new Runs(store, hub, (clock) => startTestCsmsOn({ host, clock }), {
+    maxRuns: opts.maxRuns ?? DEFAULT_MAX_RUNS,
+    maxRunMs: opts.maxRunMs ?? DEFAULT_MAX_RUN_MS,
+    maxStations,
+  });
   const testCsms = new TestCsms(
     host,
     opts.csmsPort ?? 0,
@@ -139,13 +231,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     (csms, report) => store.saveReport(`test CSMS stopped ${new Date().toISOString()}`, csms.url, report),
   );
   const app = new Elysia()
-    // Every body is JSON whatever the content type says (curl defaults to form encoding); `body()` parses it.
+    .onRequest(({ request }) => guard(request, allowed, isLoopback(host.replace(/^\[|\]$/g, ''))))
+    // `guard` has checked the content type; `body()` parses the text, so a bad body is a 400 like any other.
     .onParse(({ request }) => request.text())
     .onError(({ code, error }) => {
       if (error instanceof InvalidScenario) return json(400, { error: error.message, diagnostics: error.diagnostics });
       if (error instanceof BadRequest) return json(400, { error: error.message });
       if (error instanceof NotFound) return json(404, { error: error.message });
       if (error instanceof Conflict) return json(409, { error: error.message });
+      if (error instanceof TooManyRuns) return json(429, { error: error.message });
       if (code === 'PARSE') return json(400, { error: 'body is not valid JSON' });
       if (code === 'VALIDATION') return json(400, { error: error.message });
       if (code === 'NOT_FOUND') return json(404, { error: 'not found' });
@@ -200,7 +294,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     .get('/api/session/trace', () => download(sessionTrace(reg).text, 'session.oot.jsonl', OOT_TYPE))
     // ---- scenarios: editor support, saved scenarios, runs ----
     .post('/api/scenario/check', async ({ body: raw }) =>
-      checkScenario(parseBody(scenarioSource, body(raw)).source, baseDir),
+      checkScenario(parseBody(scenarioSource, body(raw)).source, scenarioOpts),
     )
     .post('/api/scenario/format', ({ body: raw }) => {
       const r = formatScenario(parseBody(scenarioSource, body(raw)).source);
@@ -226,7 +320,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     .get('/api/runs', () => runs.list())
     .post('/api/runs', async ({ body: raw }) => {
       const b = parseBody(startRun, body(raw));
-      const p = await prepare(b.source, baseDir);
+      const p = await prepare(b.source, scenarioOpts);
       if (!p.ok) throw new InvalidScenario(p.diagnostics);
       const own = p.scenario.csms;
       const saved = b.scenarioId === undefined ? undefined : store.scenario(b.scenarioId);
@@ -245,6 +339,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
         dedicatedCsms,
         source: b.source,
         scenario: p.scenario,
+        linked: p.linked,
         file: p.file,
         name: b.name ?? saved?.name ?? 'untitled',
         scenarioId: b.scenarioId,

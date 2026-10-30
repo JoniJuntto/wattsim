@@ -1,8 +1,10 @@
 /**
  * Scenario text from the browser editor: diagnostics (`POST /api/scenario/check`), formatting, and the parse + link
- * step a run starts with. A scenario from the browser has no file of its own; `import` paths resolve against
- * `baseDir` (the data directory in server mode, else the working directory). `use plugin` is refused: it would load
- * and execute a module from the server's disk on behalf of whoever can reach the UI.
+ * step a run starts with. Neither expands the fleet: `link` counts it against `maxStations` from the station ranges.
+ * A scenario from the browser has no file of its own; `import` paths resolve against the scenario folder
+ * (`<data>/scenarios` in server mode, else the working directory) and may not leave it, symlinks included. `use
+ * plugin` is refused: it would load and execute a module from the server's disk on behalf of whoever can reach the
+ * UI.
  */
 import { join } from 'node:path';
 import type { Linked, Scenario } from '@wattsim/scenario';
@@ -53,13 +55,20 @@ export function toDiagnostic(source: string, err: unknown, file: string): Scenar
   throw err;
 }
 
+export type PrepareOptions = {
+  /** The scenario folder: relative paths resolve against it, and nothing outside it is read. */
+  dir: string;
+  /** The most stations the fleet may have; default no limit. */
+  maxStations?: number;
+};
+
 export type Prepared =
   | { ok: true; scenario: Scenario; linked: Linked; file: string }
   | { ok: false; diagnostics: ScenarioDiagnostic[] };
 
-/** Parse and link, refusing `use plugin`. */
-export async function prepare(source: string, baseDir: string): Promise<Prepared> {
-  const file = join(baseDir, EDITOR_FILE);
+/** Parse and link, refusing `use plugin`, files outside `dir` and fleets over `maxStations`. */
+export async function prepare(source: string, opts: PrepareOptions): Promise<Prepared> {
+  const file = join(opts.dir, EDITOR_FILE);
   let scenario: Scenario;
   try {
     scenario = parse(source, file);
@@ -74,29 +83,16 @@ export async function prepare(source: string, baseDir: string): Promise<Prepared
   if (own.length > 0) return { ok: false, diagnostics: own };
   let linked: Linked;
   try {
-    linked = await link(scenario, { file });
+    // A `use plugin` in an imported quirk file fails here, before the plugin file is probed.
+    linked = await link(scenario, { file, root: opts.dir, allowPlugins: false, maxStations: opts.maxStations });
   } catch (err) {
     return { ok: false, diagnostics: [toDiagnostic(source, err, file)] };
   }
-  const plugins = [...linked.plugins.values()].map((ref) =>
-    ref.file && ref.file !== file
-      ? diagnostic(
-          source,
-          `${ref.file}: use plugin is not allowed in scenarios from the browser; run it with wattsim run`,
-        )
-      : diagnostic(
-          source,
-          'use plugin is not allowed in scenarios from the browser; run it with wattsim run',
-          ref.loc.line,
-          ref.loc.col,
-        ),
-  );
-  if (plugins.length > 0) return { ok: false, diagnostics: plugins };
   return { ok: true, scenario, linked, file };
 }
 
-export async function checkScenario(source: string, baseDir: string): Promise<ScenarioCheck> {
-  const p = await prepare(source, baseDir);
+export async function checkScenario(source: string, opts: PrepareOptions): Promise<ScenarioCheck> {
+  const p = await prepare(source, opts);
   return p.ok
     ? { ok: true, stations: p.scenario.stations.length, diagnostics: [] }
     : { ok: false, stations: 0, diagnostics: p.diagnostics };

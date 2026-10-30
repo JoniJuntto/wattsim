@@ -3,12 +3,16 @@
  * fast as the sockets allow) or the wall clock (`speed` divides every DSL duration). Progress goes to the stream as
  * coalesced `run` summaries and `run.event` messages; frames are recorded as an Open OCPP Trace and stored with the
  * run. Runs are cancellable; the row is written when a run starts and again when it ends.
+ *
+ * A run executes the scenario exactly as the server checked it (`StartRun.linked`, never linked again), with
+ * `use plugin` refused and the fleet capped. At most `maxRuns` run at once, and a real-time run ends with an error
+ * after `maxRunMs` (a virtual one stops after 24 h of virtual time).
  */
 import type { Clock, Station as CoreStationType, StationConfig } from '@wattsim/core';
 import { Station, VirtualClock, WallClock } from '@wattsim/core';
 import type { Csms } from '@wattsim/csms';
-import type { RunEvent, RunResult, Scenario } from '@wattsim/scenario';
-import { driveVirtual, isIdle, run as runScenario } from '@wattsim/scenario';
+import type { Linked, RunEvent, RunResult, Scenario } from '@wattsim/scenario';
+import { driveVirtual, formatDuration, isIdle, run as runScenario } from '@wattsim/scenario';
 import { formatTrace, Recorder } from '@wattsim/trace';
 import type { RunRow, Store } from './db/store';
 import { runDetail, runSummary } from './db/store';
@@ -22,10 +26,31 @@ export const RUN_EVENTS_KEPT = 2000;
 export const RUN_EVENTS_STREAMED = 200;
 const MAX_VIRTUAL_MS = 24 * 3_600_000;
 
+export type RunLimits = {
+  /** Runs at once; another start is refused with `TooManyRuns`. */
+  maxRuns: number;
+  /** Wall-clock time a real-time run may take; 0: no limit. */
+  maxRunMs: number;
+  /** Stations per run (see `RunOptions.maxStations`). */
+  maxStations?: number;
+};
+
+export const DEFAULT_RUN_LIMITS: RunLimits = { maxRuns: 4, maxRunMs: 3_600_000 };
+
+/** Every run slot is taken: the server answers 429. */
+export class TooManyRuns extends Error {
+  constructor(max: number) {
+    super(`this server runs at most ${max} run${max === 1 ? '' : 's'} at a time; wait for one to end or cancel it`);
+    this.name = 'TooManyRuns';
+  }
+}
+
 export type StartRun = {
   source: string;
   scenario: Scenario;
-  /** The editor's virtual file, so `import` paths resolve as they did when the source was checked. */
+  /** `scenario` as the server linked it when it checked the source; the run uses it as is. */
+  linked: Linked;
+  /** The editor's virtual file. */
   file: string;
   name: string;
   scenarioId?: string;
@@ -109,14 +134,28 @@ function resultView(r: RunResult): RunResultView {
 
 export class Runs {
   private readonly live = new Map<string, Live>();
+  /** Starts past the slot check that are not in `live` yet. */
+  private starting = 0;
 
   constructor(
     private readonly store: Store,
     private readonly hub: StreamHub,
     private readonly startCsms: CsmsFactory,
+    private readonly limits: RunLimits = DEFAULT_RUN_LIMITS,
   ) {}
 
+  /** Throws `TooManyRuns` when every slot is taken. */
   async start(spec: StartRun): Promise<RunSummary> {
+    if (this.live.size + this.starting >= this.limits.maxRuns) throw new TooManyRuns(this.limits.maxRuns);
+    this.starting++;
+    try {
+      return await this.begin(spec);
+    } finally {
+      this.starting--;
+    }
+  }
+
+  private async begin(spec: StartRun): Promise<RunSummary> {
     const clock: Clock = spec.virtual ? new VirtualClock(Date.now()) : new WallClock();
     let csms: Csms | undefined;
     if (spec.dedicatedCsms) {
@@ -256,6 +295,14 @@ export class Runs {
     };
     let result: RunResult | undefined;
     let error: string | undefined;
+    const { maxRunMs, maxStations } = this.limits;
+    let timeLimit: ReturnType<typeof setTimeout> | undefined;
+    if (!(clock instanceof VirtualClock) && maxRunMs > 0) {
+      timeLimit = setTimeout(() => {
+        error = `real-time runs on this server stop after ${formatDuration({ ms: maxRunMs })}`;
+        l.controller.abort();
+      }, maxRunMs);
+    }
     try {
       const running = runScenario(spec.scenario, {
         clock,
@@ -265,6 +312,9 @@ export class Runs {
         signal: l.controller.signal,
         stationFactory,
         file: spec.file,
+        linked: spec.linked,
+        allowPlugins: false,
+        maxStations,
         onEvent: (e) => this.onEvent(l, e),
       });
       if (clock instanceof VirtualClock) {
@@ -281,6 +331,8 @@ export class Runs {
       }
     } catch (err) {
       error = err instanceof Error ? String(err) : String(err);
+    } finally {
+      clearTimeout(timeLimit);
     }
     await this.finish(l, result, error);
   }

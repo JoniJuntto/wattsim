@@ -222,6 +222,6 @@ describe('session export', () => {
     const kinds = new Set(parse(text).stations.flatMap((s) => s.body.map((b) => b.kind)));
     for (const kind of ['chaosFault', 'fault', 'meter', 'reset', 'bootLoop'])
       expect(kinds.has(kind as never)).toBe(true);
-    expect(await checkScenario(text, process.cwd())).toMatchObject({ ok: true, diagnostics: [] });
+    expect(await checkScenario(text, { dir: process.cwd() })).toMatchObject({ ok: true, diagnostics: [] });
   });
 });
