@@ -344,8 +344,8 @@ describe('run: timing and concurrency', () => {
     const mv = csms.callsFrom('CP-1', 'MeterValues').map((c) => c.payload as v16.MeterValuesRequest);
     const stamps = mv.map((m) => m.meterValue[0]?.timestamp ?? '');
     expect(stamps).toEqual([...stamps].sort());
-    // 10 s, 20 s online; 40 s generated offline and queued; the 30 s tick is lost to the drop itself.
-    expect(mv).toHaveLength(3);
+    // 10 s, 20 s online; 30 s and 40 s generated offline (the meter keeps running while dropped) and queued.
+    expect(mv).toHaveLength(4);
     // StopTransaction was issued during the drop and arrives after the meter values generated offline.
     const seen = actions('CP-1');
     expect(seen.filter((a) => a === 'StopTransaction')).toHaveLength(1);
