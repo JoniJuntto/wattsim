@@ -45,3 +45,11 @@ Duplicate station names across blocks, a range bound `let` that is not an intege
 ## 2026-10-30 A composite schedule never reports a limit before it is in force
 
 GetCompositeSchedule periods start on whole seconds from the request, but profile boundaries need not. A rise is reported at the next whole second at or after it, a drop at the whole second at or before it, so for every reported second the real limit is at least the reported one: a CSMS that trusts the composite never overloads the station. An A composite gives each period the `numberPhases` of the schedule period that sets the limit (the station's phases where none is given, or where the EVSE's rated power binds).
+
+## 2026-10-30 The MCP server uses `@modelcontextprotocol/sdk` 1.32.2 with the repo's zod 4
+
+`packages/mcp` depends on `@modelcontextprotocol/sdk`, pinned at 1.32.2, the current release of the v1 line. It provides the MCP framing, the stdio transport and an in-memory transport pair for tests, which would otherwise be a JSON-RPC implementation of our own. The SDK has also been published as v2 under split package names (`@modelcontextprotocol/server`, `/client`); the v1 package is still maintained alongside it, is the one the milestone plan names, and both lines speak the same protocol, so a later move is contained in `packages/mcp`. The v1 SDK declares `zod` `^3.25 || ^4.0` and reads tool schemas through `zod/v4` internally, so the tool input schemas use the workspace's zod 4 from the catalog and the install resolves one zod copy (a second copy is what causes the SDK's known TS2589 type-depth errors).
+
+## 2026-10-30 MCP `run_scenario` ignores the scenario's `csms` line
+
+Without a `csmsUrl` argument, `run_scenario` runs against the embedded test CSMS (`POST /api/loopback`) even when the scenario has a `csms` line. An agent can then run any example with no setup, and the file's URL usually points at a CSMS that exists only on its author's machine. Passing the URL from the file as `csmsUrl` restores `wattsim run`'s behaviour. It runs on the virtual clock by default with the CLI's 24 hour cap; a wall-clock run is aborted after `timeoutSeconds` (default 300) so a tool call cannot hang the agent.

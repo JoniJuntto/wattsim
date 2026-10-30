@@ -1,0 +1,25 @@
+{
+  "name": "@wattsim/mcp",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@wattsim/core": "workspace:*",
+    "@wattsim/protocol": "workspace:*",
+    "@wattsim/scenario": "workspace:*",
+    "@wattsim/server": "workspace:*",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "@types/bun": "catalog:"
+  }
+}

@@ -4,7 +4,7 @@ A spec-strict, scriptable OCPP 1.6/2.0.1/2.1 simulator for every side of the wir
 
 ## Status
 
-A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. The CSMS side, MCP server, vendor quirk profiles and record/replay are roadmap items, in that order. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
+A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. AI agents can drive it through an MCP server. The CSMS side, vendor quirk profiles and record/replay are in progress. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
 
 ## Quick start
 
@@ -39,6 +39,42 @@ bun packages/cli/src/index.ts ui                # serves it on http://127.0.0.1:
 ```
 
 One local process, no login. Add charge points (one, or a numbered range like `CP-{i}`) pointed at your CSMS, or switch on the built-in test CSMS to try it with nothing else running. Per station you get EVSE cards to plug in an EV and start or stop charging with live power, energy and state of charge; a live message log with every CALL paired to its reply and schema violations highlighted; a panel to send any OCPP message with live schema validation; and fault injection rules. **Export session** downloads everything you clicked as a `.ws` scenario that `wattsim run` replays. Flags: `--port`, `--host` (default `127.0.0.1`), `--no-open`.
+
+## Use it from an AI agent
+
+`wattsim mcp` serves wattsim over the [Model Context Protocol](https://modelcontextprotocol.io) on stdio. It starts the UI server on a free local port and logs that URL to stderr, so you can open it in a browser and watch what the agent does. `--attach http://127.0.0.1:7700` drives a `wattsim ui` you already have running instead; `--port <n>` fixes the embedded server's port. Stations default to the built-in test CSMS, so an agent can create a charge point and charge an EV with nothing else running.
+
+Claude Code:
+
+```sh
+claude mcp add wattsim -- bunx wattsim mcp
+```
+
+Any other MCP client:
+
+```json
+{
+  "mcpServers": {
+    "wattsim": { "command": "bunx", "args": ["wattsim", "mcp"] }
+  }
+}
+```
+
+| Tool | What it does |
+|---|---|
+| `list_stations` | Every station with its connection, boot state, EVSEs and chaos rules |
+| `create_station` | Create one station or a `CP-{i}` fleet; connects, boots and waits for the boot to be accepted |
+| `delete_station` | Disconnect and remove a station |
+| `station_action` | plug, start, stop, unplug, authorize, status, send any OCPP CALL, and the rest of the UI's actions |
+| `add_chaos_rule` / `remove_chaos_rule` | Drop, delay, duplicate, corrupt or answer wrongly a station's frames |
+| `get_frames` | A station's OCPP messages, filtered by action, direction and sequence number (100 by default) |
+| `validate_payload` | Check a payload against the OCA schema for a version, action and direction |
+| `start_test_csms` | Start the built-in accept-everything CSMS and return its URL |
+| `export_session` | Everything done so far as a `.ws` scenario |
+| `check_scenario` / `format_scenario` | Parse (errors as `line:col: message`) or canonically format scenario text |
+| `run_scenario` | Run scenario text on a virtual clock against the test CSMS or a given one; per-station asserts, violations and the first frames of failing stations |
+
+Resources: `wattsim://docs/dsl` (the DSL reference) and `wattsim://stations/{id}` (one station as JSON).
 
 ## A scenario
 
@@ -107,7 +143,8 @@ Packages, all Bun workspaces under `packages/`:
 - `scenario`: the DSL (lexer, parser, AST, formatter, interpreter) and JUnit reporting
 - `server`: the local UI server: HTTP API and browser stream over the core, the built-in test CSMS, session export
 - `ui`: the browser app (React, Vite, Tailwind, shadcn); `bun run --filter @wattsim/ui dev` runs it against a server on port 7700
-- `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`)
+- `mcp`: the MCP server for AI agents (`wattsim mcp`)
+- `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`, `mcp`)
 
 Style is Biome with two-space indent and single quotes; lefthook runs lint and typecheck on commit. Tests are `bun test` and never touch the network except through the in-repo fake CSMS.
 
