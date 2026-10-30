@@ -8,6 +8,7 @@ export type {
   ConnectionState,
   CsmsReply,
   Finding,
+  Sample,
   SessionState,
   Topology,
   TxRecord,

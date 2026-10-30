@@ -290,6 +290,18 @@ describe('sessions', () => {
     expect(s.sessions()).toHaveLength(1);
   });
 
+  test('a station that booted against an earlier CSMS process is one warning, not an error per message', async () => {
+    // EVerest 1.6 after the CSMS restarts: it reconnects and reports connectors 0..2 without a BootNotification.
+    const s = start();
+    const c = await connect(s.url, 'CP1');
+    for (const connectorId of [0, 1, 2]) {
+      c.send([2, `s${connectorId}`, 'StatusNotification', { connectorId, errorCode: 'NoError', status: 'Available' }]);
+      expect((await c.next())[0]).toBe(3);
+    }
+    expect(s.violations.map((v) => [v.rule, v.severity, v.frameId])).toEqual([['boot.not-accepted', 'warning', 's0']]);
+    expect(s.report().errors).toBe(0);
+  });
+
   test('a station that comes back with another version starts from scratch', async () => {
     const s = start();
     const a = await connect(s.url, 'CP1', ['ocpp1.6']);
@@ -450,8 +462,9 @@ describe('memory bounds', () => {
   test('maxViolations keeps the newest violations; report() still counts all of them', async () => {
     const s = start({ maxViolations: 3 });
     const c = await connect(s.url, 'CP1');
+    // Authorize first: a station that never booted (a Heartbeat first would be one warning for the session).
     for (let i = 0; i < 5; i++) {
-      c.send([2, `h${i}`, 'Heartbeat', {}]);
+      c.send([2, `h${i}`, 'Authorize', { idTag: 'TAG' }]);
       await c.next();
     }
     expect(s.violations.map((v) => v.frameId)).toEqual(['h2', 'h3', 'h4']);
@@ -508,8 +521,8 @@ describe('report', () => {
   test('groups by rule and identity, lists clean stations, renders JUnit', async () => {
     const s = start();
     const bad = await connect(s.url, 'BAD');
-    bad.send([2, 'h1', 'Heartbeat', {}]);
-    bad.send([2, 'h1', 'Heartbeat', {}]);
+    bad.send([2, 'h1', 'Authorize', { idTag: 'TAG' }]);
+    bad.send([2, 'h1', 'Authorize', { idTag: 'TAG' }]);
     await bad.next();
     await bad.next();
     const good = await connect(s.url, 'GOOD');

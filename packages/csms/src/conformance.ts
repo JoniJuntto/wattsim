@@ -62,9 +62,16 @@ export type TxRecord = {
   evseId?: number;
   ended: boolean;
   lastSeqNo?: number;
-  /** Last Energy.Active.Import.Register reading in Wh, per `phase|location`. */
-  registers: Record<string, number>;
+  /**
+   * Energy.Active.Import.Register readings per `phase|location`, oldest sample first (bounded), while the transaction
+   * runs. Readings are compared by sample time, not arrival: a 2.x Ended event and a 1.6 StopTransaction's
+   * `transactionData` repeat samples that were sent before.
+   */
+  registers: Record<string, Sample[]>;
 };
+
+/** One register reading: sample time (epoch ms) and value in Wh. */
+export type Sample = { t: number; wh: number };
 
 /** State scoped to one WebSocket connection; reset on reconnect. */
 export type ConnectionState = {
@@ -89,6 +96,10 @@ export type SessionState = {
   identity: string;
   version: OcppVersion;
   boot: { status: BootStatus; at?: number; intervalMs?: number };
+  /** A BootNotification arrived in this session, answered or not. */
+  bootSeen: boolean;
+  /** Action of the station's first CALL / SEND in this session. */
+  firstCall?: string;
   /** The heartbeat interval in force: from the accepted boot, or a later HeartbeatInterval change. */
   heartbeatIntervalMs?: number;
   lastHeartbeatAt?: number;
@@ -119,6 +130,20 @@ export type AnsweredCall = {
 const MAX_IDS = 1000;
 const MAX_ENDED_TX = 200;
 const MAX_ANSWERED = 50;
+/** Register samples kept per transaction and register; the oldest go first. */
+const MAX_SAMPLES = 500;
+/**
+ * A station whose first request is one of these behaves as already booted: it reports connector status, beats or
+ * meters a transaction. After a CSMS restart a station reconnects with exactly these, without a BootNotification.
+ */
+const ALREADY_BOOTED: ReadonlySet<string> = new Set([
+  'StatusNotification',
+  'Heartbeat',
+  'MeterValues',
+  'StartTransaction',
+  'StopTransaction',
+  'TransactionEvent',
+]);
 /**
  * Never answered from memory: their reply carries the CSMS's current time, so a stale copy would set the station's
  * clock back, and answering them again changes no transaction state. A station whose message ids restart at 1 after
@@ -182,6 +207,7 @@ export function newSessionState(identity: string, version: OcppVersion): Session
     identity,
     version,
     boot: { status: 'None' },
+    bootSeen: false,
     statuses: {},
     transactions: new Map(),
     activeByConnector: new Map(),
@@ -344,9 +370,23 @@ export function ruleBoot(s: SessionState, f: CallFrame | SendFrame, now: number,
     ];
   }
   if (!cfg.requireBoot || status === 'Accepted') return [];
+  const label = versionLabel(s.version);
+  if (status === 'None' && !s.bootSeen && ALREADY_BOOTED.has(s.firstCall ?? f.action)) {
+    // The CSMS never saw this station boot, and it behaves as booted: a boot belongs to start-up, not to each
+    // connection (1.6 §4.2, 2.0.1 B01; B04 has a reconnecting station report its connectors), so it most likely
+    // booted against an earlier CSMS process. Said once per session, on its first request.
+    if (s.firstCall !== undefined) return [];
+    return [
+      finding(
+        s,
+        'boot.not-accepted',
+        `first message from ${s.identity} is not a BootNotification: the station may have booted against an earlier CSMS`,
+        { severity: 'warning', ref: v16 ? '1.6 §4.2 Boot Notification' : `${label} B01 / B04` },
+      ),
+    ];
+  }
   if (status === 'Pending' && s.instructed.has(f.action)) return [];
   if (status === 'Pending' && (s.triggered.get(f.action) ?? 0) > 0) return [];
-  const label = versionLabel(s.version);
   const ref = v16
     ? '1.6 §4.2 Boot Notification'
     : `${label} ${status === 'None' ? 'B01' : status === 'Pending' ? 'B02' : 'B03'}`;
@@ -453,17 +493,26 @@ export function ruleConnectorZero(s: SessionState, f: CallFrame | SendFrame): Fi
 }
 
 type Reading = { key: string; wh: number };
+/** A reading with the time it was sampled: epoch ms, NaN when the timestamp does not parse. */
+type TimedReading = Reading & { t: number };
+
+type MeterValue16 = v16.MeterValuesRequest['meterValue'][number];
 
 /** Energy.Active.Import.Register readings of 1.6 meter values, in Wh. Signed and unparsable values are skipped. */
-export function registers16(meterValue: readonly v16.MeterValuesRequest['meterValue'][number][]): Reading[] {
-  const out: Reading[] = [];
+export function registers16(meterValue: readonly MeterValue16[]): Reading[] {
+  return samples16(meterValue).map(({ key, wh }) => ({ key, wh }));
+}
+
+function samples16(meterValue: readonly MeterValue16[]): TimedReading[] {
+  const out: TimedReading[] = [];
   for (const mv of meterValue) {
+    const t = Date.parse(mv.timestamp);
     for (const sv of mv.sampledValue) {
       if ((sv.measurand ?? REGISTER) !== REGISTER || sv.format === 'SignedData') continue;
       const n = Number(sv.value);
       if (sv.value.trim() === '' || !Number.isFinite(n)) continue;
       const wh = sv.unit === 'kWh' ? n * 1000 : sv.unit === undefined || sv.unit === 'Wh' ? n : undefined;
-      if (wh !== undefined) out.push({ key: `${sv.phase ?? ''}|${sv.location ?? 'Outlet'}`, wh });
+      if (wh !== undefined) out.push({ key: `${sv.phase ?? ''}|${sv.location ?? 'Outlet'}`, wh, t });
     }
   }
   return out;
@@ -473,15 +522,20 @@ type MeterValue2x = NonNullable<v201.TransactionEventRequest['meterValue']>[numb
 
 /** Energy.Active.Import.Register readings of 2.x meter values, in Wh (unit and multiplier applied). */
 export function registers2x(meterValue: readonly MeterValue2x[]): Reading[] {
-  const out: Reading[] = [];
+  return samples2x(meterValue).map(({ key, wh }) => ({ key, wh }));
+}
+
+function samples2x(meterValue: readonly MeterValue2x[]): TimedReading[] {
+  const out: TimedReading[] = [];
   for (const mv of meterValue) {
+    const t = Date.parse(mv.timestamp);
     for (const sv of mv.sampledValue) {
       if ((sv.measurand ?? REGISTER) !== REGISTER) continue;
       const unit = sv.unitOfMeasure?.unit ?? 'Wh';
       const scale = 10 ** (sv.unitOfMeasure?.multiplier ?? 0);
       const wh = unit === 'kWh' ? sv.value * scale * 1000 : unit === 'Wh' ? sv.value * scale : undefined;
       if (wh !== undefined && Number.isFinite(wh))
-        out.push({ key: `${sv.phase ?? ''}|${sv.location ?? 'Outlet'}`, wh });
+        out.push({ key: `${sv.phase ?? ''}|${sv.location ?? 'Outlet'}`, wh, t });
     }
   }
   return out;
@@ -498,24 +552,74 @@ function decreased(prev: number, next: number): boolean {
   return !((Number.isInteger(prev) || Number.isInteger(next)) && drop < 1);
 }
 
-/** Readings that go below the previous one for the same register (stored, or earlier in the same message). */
-function backwards(tx: TxRecord, readings: readonly Reading[]): Array<{ key: string; from: number; to: number }> {
-  const last = { ...tx.registers };
-  const out: Array<{ key: string; from: number; to: number }> = [];
+/** Index of the first sample in `list` (sorted by time) sampled after `t`. */
+function after(list: readonly Sample[], t: number): number {
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((list[mid] as Sample).t <= t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** A sample without a usable timestamp counts as the newest one. */
+function sampleOf(list: readonly Sample[], r: TimedReading): Sample {
+  return { t: Number.isNaN(r.t) ? (list.at(-1)?.t ?? 0) : r.t, wh: r.wh };
+}
+
+/**
+ * The pair that shows the register going down when `r` joins `list`: the highest reading sampled at or before `r`
+ * when `r` is below it, else `r` and the lowest reading sampled after it when that is below `r` (a late sample).
+ * Readings with equal timestamps count in arrival order, so `r` comes after them.
+ */
+function decrease(list: readonly Sample[], r: Sample): { from: Sample; to: Sample } | undefined {
+  const i = after(list, r.t);
+  let max: Sample | undefined;
+  for (let j = 0; j < i; j++) if (!max || (list[j] as Sample).wh > max.wh) max = list[j];
+  if (max && decreased(max.wh, r.wh)) return { from: max, to: r };
+  let min: Sample | undefined;
+  for (let j = i; j < list.length; j++) if (!min || (list[j] as Sample).wh < min.wh) min = list[j];
+  if (min && decreased(r.wh, min.wh)) return { from: r, to: min };
+  return undefined;
+}
+
+/** Add `r` in time order; an identical sample (a repeat) is not stored twice. Drops the oldest beyond the bound. */
+function insertSample(list: Sample[], r: Sample): void {
+  const i = after(list, r.t);
+  for (let j = i - 1; j >= 0 && (list[j] as Sample).t === r.t; j--) if ((list[j] as Sample).wh === r.wh) return;
+  list.splice(i, 0, r);
+  if (list.length > MAX_SAMPLES) list.shift();
+}
+
+type Decrease = { key: string; from: Sample; to: Sample };
+
+/**
+ * Readings that show a register going down, by sample time: below a reading of the same register sampled at or
+ * before it (stored, or earlier in the same message), or above one sampled after it. Does not modify `tx`.
+ */
+function backwards(tx: TxRecord, readings: readonly TimedReading[]): Decrease[] {
+  const lists: Record<string, Sample[]> = {};
+  const out: Decrease[] = [];
   for (const r of readings) {
-    const prev = last[r.key];
-    if (prev !== undefined && decreased(prev, r.wh)) out.push({ key: r.key, from: prev, to: r.wh });
-    last[r.key] = r.wh;
+    lists[r.key] ??= [...(tx.registers[r.key] ?? [])];
+    const list = lists[r.key] as Sample[];
+    const sample = sampleOf(list, r);
+    const d = decrease(list, sample);
+    if (d) out.push({ key: r.key, ...d });
+    insertSample(list, sample);
   }
   return out;
 }
 
-function meterFindings(s: SessionState, tx: TxRecord, readings: readonly Reading[], what: string): Finding[] {
+function meterFindings(s: SessionState, tx: TxRecord, readings: readonly TimedReading[], what: string): Finding[] {
+  const at = (t: number) => new Date(t).toISOString();
   return backwards(tx, readings).map((b) =>
     finding(
       s,
       'meter.backwards',
-      `${what}: Energy.Active.Import.Register of transaction ${tx.id}${b.key === '|Outlet' ? '' : ` (${b.key})`} went from ${b.from} Wh to ${b.to} Wh`,
+      `${what}: Energy.Active.Import.Register of transaction ${tx.id}${b.key === '|Outlet' ? '' : ` (${b.key})`} went from ${b.from.wh} Wh to ${b.to.wh} Wh (sampled ${b.from.t === b.to.t ? `both at ${at(b.to.t)}` : `at ${at(b.from.t)} and ${at(b.to.t)}`})`,
     ),
   );
 }
@@ -559,7 +663,7 @@ function transactions16(s: SessionState, f: CallFrame | SendFrame): Finding[] {
           }),
         ];
       }
-      return meterFindings(s, tx, registers16(p.meterValue), 'MeterValues');
+      return meterFindings(s, tx, samples16(p.meterValue), 'MeterValues');
     }
     case 'StopTransaction': {
       const p = f.payload as v16.StopTransactionRequest;
@@ -568,11 +672,17 @@ function transactions16(s: SessionState, f: CallFrame | SendFrame): Finding[] {
         return [finding(s, 'tx.unknown-stop', `StopTransaction for transaction ${p.transactionId}, never issued`)];
       }
       if (tx.ended) return [finding(s, 'tx.unknown-stop', `StopTransaction for transaction ${tx.id}, already stopped`)];
-      return meterFindings(s, tx, [{ key: MAIN_REGISTER, wh: p.meterStop }], 'StopTransaction meterStop');
+      // transactionData repeats samples sent before (Transaction.Begin, periodic, clock-aligned): checked by time.
+      return meterFindings(s, tx, stopReadings(p), 'StopTransaction');
     }
     default:
       return [];
   }
+}
+
+/** A 1.6 StopTransaction's register readings: its `transactionData`, then meterStop at the stop time. */
+function stopReadings(p: v16.StopTransactionRequest): TimedReading[] {
+  return [...samples16(p.transactionData ?? []), { key: MAIN_REGISTER, wh: p.meterStop, t: Date.parse(p.timestamp) }];
 }
 
 function transactions2x(s: SessionState, f: CallFrame | SendFrame): Finding[] {
@@ -607,7 +717,7 @@ function transactions2x(s: SessionState, f: CallFrame | SendFrame): Finding[] {
       );
     }
   }
-  out.push(...meterFindings(s, tx, registers2x(p.meterValue ?? []), `TransactionEvent ${p.eventType}`));
+  out.push(...meterFindings(s, tx, samples2x(p.meterValue ?? []), `TransactionEvent ${p.eventType}`));
   return out;
 }
 
@@ -676,6 +786,8 @@ export function ruleHeartbeat(s: SessionState, f: CallFrame | SendFrame, now: nu
 /** Note a station CALL / SEND as seen (and a CALL as in flight). Consumes one TriggerMessage for its action. */
 export function recordStationCall(s: SessionState, f: CallFrame | SendFrame, now: number): void {
   addBounded(s.conn.seenIds, f.id);
+  s.firstCall ??= f.action;
+  if (f.action === 'BootNotification') s.bootSeen = true;
   if (f.type === 2) s.conn.inflight = { id: f.id, action: f.action, at: now };
   const pending = s.triggered.get(f.action) ?? 0;
   if (pending > 0) {
@@ -732,8 +844,12 @@ export function applyCsmsReply(s: SessionState, f: CallFrame, reply: CsmsReply, 
   }
 }
 
-function setRegisters(tx: TxRecord, readings: readonly Reading[]): void {
-  for (const r of readings) tx.registers[r.key] = r.wh;
+function setRegisters(tx: TxRecord, readings: readonly TimedReading[]): void {
+  for (const r of readings) {
+    tx.registers[r.key] ??= [];
+    const list = tx.registers[r.key] as Sample[];
+    insertSample(list, sampleOf(list, r));
+  }
 }
 
 function applyTx16(s: SessionState, f: CallFrame, r: Record<string, unknown>): void {
@@ -741,19 +857,22 @@ function applyTx16(s: SessionState, f: CallFrame, r: Record<string, unknown>): v
     const p = f.payload as v16.StartTransactionRequest;
     if (typeof r.transactionId !== 'number') return;
     const id = String(r.transactionId);
-    s.transactions.set(id, { id, evseId: p.connectorId, ended: false, registers: { [MAIN_REGISTER]: p.meterStart } });
+    const tx: TxRecord = { id, evseId: p.connectorId, ended: false, registers: {} };
+    setRegisters(tx, [{ key: MAIN_REGISTER, wh: p.meterStart, t: Date.parse(p.timestamp) }]);
+    s.transactions.set(id, tx);
     s.activeByConnector.set(p.connectorId, id);
     pruneTransactions(s);
   } else if (f.action === 'MeterValues') {
     const p = f.payload as v16.MeterValuesRequest;
     const tx = p.transactionId === undefined ? undefined : s.transactions.get(String(p.transactionId));
-    if (tx && !tx.ended) setRegisters(tx, registers16(p.meterValue));
+    if (tx && !tx.ended) setRegisters(tx, samples16(p.meterValue));
   } else if (f.action === 'StopTransaction') {
     const p = f.payload as v16.StopTransactionRequest;
     const tx = s.transactions.get(String(p.transactionId));
     if (!tx || tx.ended) return;
+    // Nothing is compared against an ended transaction's readings.
     tx.ended = true;
-    tx.registers[MAIN_REGISTER] = p.meterStop;
+    tx.registers = {};
     if (tx.evseId !== undefined && s.activeByConnector.get(tx.evseId) === tx.id) s.activeByConnector.delete(tx.evseId);
   }
 }
@@ -771,8 +890,13 @@ function applyTx2x(s: SessionState, f: CallFrame): void {
   if (tx.ended) return;
   tx.evseId ??= p.evse?.id;
   tx.lastSeqNo = tx.lastSeqNo === undefined ? p.seqNo : Math.max(tx.lastSeqNo, p.seqNo);
-  setRegisters(tx, registers2x(p.meterValue ?? []));
-  if (p.eventType === 'Ended') tx.ended = true;
+  if (p.eventType === 'Ended') {
+    // Nothing is compared against an ended transaction's readings.
+    tx.ended = true;
+    tx.registers = {};
+  } else {
+    setRegisters(tx, samples2x(p.meterValue ?? []));
+  }
 }
 
 /** Forget the oldest ended transactions beyond `MAX_ENDED_TX`, so a long session's state stays small. */

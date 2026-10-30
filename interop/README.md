@@ -264,8 +264,10 @@ What the checker raised in the other runs:
 2. `boot.not-accepted` x3 (1.6, harness-made): when the CSMS process restarts under a running EVerest, EVerest 1.6
    reconnects and re-sends `StatusNotification` for connectors 0-2 without a new `BootNotification`. OCPP 1.6 §4.2 ties
    BootNotification to start-up, not to each connection, so EVerest is right; the new CSMS process simply never saw
-   the boot. **Checker false positive** (a fresh CSMS cannot tell this from a station that skipped its boot). EVerest
-   2.0.1 sends nothing on such a reconnect. The script avoids it by stopping EVerest before the CSMS.
+   the boot. **Fixed in the checker** (2026-10-30): a station whose first message to a CSMS that never saw its boot is
+   a StatusNotification, Heartbeat, MeterValues or transaction message now gets one `boot.not-accepted` warning per
+   session instead of an error per message. EVerest 2.0.1 sends nothing on such a reconnect. The script still stops
+   EVerest before the CSMS.
 3. `meter.backwards` (2.0.1, once): "went from 23 Wh to 0 Wh" on `TransactionEvent` Ended, where the Ended event's
    `meterValue` was `Transaction.Begin` 0 @t0, `Sample.Clock` 23 @t0+11 s, `Sample.Periodic` 170, `Transaction.End` 211:
    monotonic in time. An `Updated` (`MeterValueClock`, 23 Wh @t0+11 s) had been sent before it. **Checker false
@@ -276,7 +278,9 @@ What the checker raised in the other runs:
    `backwards()` in `packages/csms/src/conformance.ts` compares in message order against the last stored reading and
    ignores `meterValue[].timestamp`. Intermittent: it needs EVerest to send a clock-aligned `Updated` during the
    session, which happened in 1 of the 10 2.x version runs here (that run had `EVEREST_SIL_RESET_METER=true`, but the
-   readings involved are all from one monotonic session, so the default switches can hit it too). Not fixed here (packages/csms is out of scope); this is why the `everest` CI job is `continue-on-error`.
+   readings involved are all from one monotonic session, so the default switches can hit it too). **Fixed in the
+   checker** (2026-10-30): register readings are compared by sample timestamp, so a repeated older sample is not
+   backwards. The `everest` CI job stays `continue-on-error` for EVerest's own SIL timing races and the large image pull.
 
 ### Caveats
 

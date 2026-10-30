@@ -387,7 +387,7 @@ describe('retransmission after a reconnect', () => {
 describe('boot.not-accepted', () => {
   test('flags any request before a BootNotification was accepted', () => {
     const h = harness('ocpp2.0.1');
-    const fs = h.call('Heartbeat', {});
+    const fs = h.call('Authorize', { idToken: { idToken: 'TAG', type: 'ISO14443' } });
     expect(rules(fs)).toEqual(['boot.not-accepted']);
     expect(fs[0]?.specRef).toBe('2.0.1 B01');
   });
@@ -428,6 +428,102 @@ describe('boot.not-accepted', () => {
     h.advance(5 * MIN);
     expect(h.call('Heartbeat', {})).toEqual([]);
     expect(harness('ocpp1.6', { requireBoot: false }).call('Heartbeat', {})).toEqual([]);
+  });
+});
+
+describe('boot.not-accepted: a station that booted against an earlier CSMS', () => {
+  const EARLIER =
+    'first message from CS1 is not a BootNotification: the station may have booted against an earlier CSMS';
+
+  test('1.6: StatusNotifications for every connector without a boot are one warning per session', () => {
+    // EVerest after a CSMS restart: it reconnects and reports connectors 0..2, no BootNotification (1.6 §4.2).
+    const h = harness('ocpp1.6');
+    startConnection(h.s, h.now);
+    const first = h.call('StatusNotification', status16(0));
+    expect(rules(first)).toEqual(['boot.not-accepted']);
+    expect(first[0]?.severity).toBe('warning');
+    expect(first[0]?.message).toBe(EARLIER);
+    expect(first[0]?.specRef).toBe('1.6 §4.2 Boot Notification');
+    expect(h.call('StatusNotification', status16(1))).toEqual([]);
+    expect(h.call('StatusNotification', status16(2))).toEqual([]);
+    h.advance(5 * MIN);
+    expect(h.call('Heartbeat', {})).toEqual([]);
+    expect(h.call('Authorize', { idTag: 'TAG' })).toEqual([]);
+    // Still once per session after a reconnect.
+    h.advance(10 * SEC);
+    startConnection(h.s, h.now);
+    expect(h.call('StatusNotification', status16(1))).toEqual([]);
+  });
+
+  test('1.6: a Heartbeat, MeterValues or transaction message first counts as already booted', () => {
+    for (const [action, payload] of [
+      ['Heartbeat', {}],
+      ['MeterValues', { connectorId: 1, meterValue: [mv16(100, T0)] }],
+      ['StopTransaction', stop16(7, 2000, T0)],
+    ] as const) {
+      const h = harness('ocpp1.6');
+      const fs = only(h.call(action, payload), 'boot.not-accepted');
+      expect({ action, severity: fs.map((f) => f.severity) }).toEqual({ action, severity: ['warning'] });
+      h.advance(5 * MIN);
+      expect({ action, next: only(h.call('Heartbeat', {}), 'boot.not-accepted') }).toEqual({ action, next: [] });
+    }
+  });
+
+  test('2.0.1 and 2.1: the same, citing B01 / B04', () => {
+    for (const version of ['ocpp2.0.1', 'ocpp2.1'] as const) {
+      const h = harness(version);
+      const first = h.call('StatusNotification', status2x(1));
+      expect(rules(first)).toEqual(['boot.not-accepted']);
+      expect(first[0]?.severity).toBe('warning');
+      expect(first[0]?.specRef).toBe(version === 'ocpp2.1' ? '2.1 B01 / B04' : '2.0.1 B01 / B04');
+      expect(h.call('StatusNotification', status2x(2))).toEqual([]);
+    }
+  });
+
+  test('a later Accepted boot is checked as usual, and a Rejected one makes requests errors again', () => {
+    const h = harness('ocpp1.6');
+    h.call('StatusNotification', status16(1));
+    expect(h.boot('Rejected', 60)).toEqual([]);
+    const fs = h.call('StatusNotification', status16(1));
+    expect(rules(fs)).toEqual(['boot.not-accepted']);
+    expect(fs[0]?.severity).toBe('error');
+  });
+
+  test('still an error per request when the first request is not one a booted station starts with', () => {
+    const h = harness('ocpp1.6');
+    for (const [action, payload] of [
+      ['Authorize', { idTag: 'TAG' }],
+      ['StatusNotification', status16(1)],
+      ['Heartbeat', {}],
+    ] as const) {
+      const fs = h.call(action, payload);
+      expect({ action, rules: rules(fs), severity: fs[0]?.severity }).toEqual({
+        action,
+        rules: ['boot.not-accepted'],
+        severity: 'error',
+      });
+      h.advance(5 * MIN);
+    }
+  });
+
+  test('still an error per request when the CSMS saw a boot that was not accepted', () => {
+    // A BootNotification the CSMS has not answered (or answered with a CALLERROR): the station is booting now.
+    const h = harness('ocpp1.6');
+    h.call('BootNotification', { chargePointVendor: 'v', chargePointModel: 'm' }, null);
+    h.advance(31 * SEC);
+    for (const connectorId of [0, 1]) {
+      const fs = only(h.call('StatusNotification', status16(connectorId)), 'boot.not-accepted');
+      expect(fs.map((f) => f.severity)).toEqual(['error']);
+    }
+    // Pending (2.x) and Rejected (1.6) as before: every uninstructed request is an error.
+    const h2 = harness('ocpp2.0.1');
+    h2.boot('Pending', 60);
+    expect(h2.call('StatusNotification', status2x(1)).map((f) => f.severity)).toEqual(['error']);
+    expect(h2.call('StatusNotification', status2x(2)).map((f) => f.severity)).toEqual(['error']);
+    const h16 = harness('ocpp1.6');
+    h16.boot('Rejected', 60);
+    expect(h16.call('Heartbeat', {}).map((f) => f.severity)).toEqual(['error']);
+    expect(h16.call('StatusNotification', status16(1)).map((f) => f.severity)).toEqual(['error']);
   });
 });
 
@@ -724,6 +820,132 @@ describe('meter.backwards', () => {
       ],
     };
     expect(h.call('TransactionEvent', mixed)).toEqual([]);
+  });
+});
+
+describe('meter.backwards: readings compared by sample timestamp', () => {
+  const reg = (value: number, context: string) => ({
+    value,
+    context,
+    measurand: 'Energy.Active.Import.Register',
+    unitOfMeasure: { unit: 'Wh' },
+  });
+  const sample = (ms: number, value: number, context = 'Sample.Periodic') => ({
+    timestamp: iso(ms),
+    sampledValue: [reg(value, context)],
+  });
+
+  /** EVerest 2025.10: Started with Begin, a clock-aligned Updated, then Ended with the whole TxEnded history. */
+  function everest(end: Array<ReturnType<typeof sample>>) {
+    const h = harness('ocpp2.0.1');
+    h.boot();
+    const t0 = h.now;
+    const ti = { transactionId: 'tx-1' };
+    h.call('TransactionEvent', {
+      ...txEvent('Started', 'tx-1', 0, t0),
+      meterValue: [sample(t0, 0, 'Transaction.Begin')],
+    });
+    h.advance(11 * SEC);
+    const updated = h.call('TransactionEvent', {
+      ...txEvent('Updated', 'tx-1', 1, h.now),
+      triggerReason: 'MeterValueClock',
+      meterValue: [sample(h.now, 23, 'Sample.Clock')],
+    });
+    expect(updated).toEqual([]);
+    h.advance(64 * SEC);
+    return h.call('TransactionEvent', {
+      ...txEvent('Ended', 'tx-1', 2, h.now),
+      triggerReason: 'EVCommunicationLost',
+      transactionInfo: { ...ti, stoppedReason: 'EVDisconnected' },
+      meterValue: end.map((m) => ({ ...m, timestamp: iso(t0 + Date.parse(m.timestamp) - T0) })),
+    });
+  }
+
+  test('2.0.1: an Ended event that repeats the TxEnded samples from Transaction.Begin passes', () => {
+    const fs = everest([
+      sample(T0, 0, 'Transaction.Begin'),
+      sample(T0 + 11 * SEC, 23, 'Sample.Clock'),
+      sample(T0 + 61 * SEC, 170),
+      sample(T0 + 75 * SEC, 211, 'Transaction.End'),
+    ]);
+    expect(fs).toEqual([]);
+  });
+
+  test('2.0.1: a TxEnded sample below an earlier one is still flagged', () => {
+    const fs = everest([
+      sample(T0, 0, 'Transaction.Begin'),
+      sample(T0 + 11 * SEC, 23, 'Sample.Clock'),
+      sample(T0 + 75 * SEC, 20, 'Transaction.End'),
+    ]);
+    expect(rules(fs)).toEqual(['meter.backwards']);
+    expect(fs[0]?.message).toContain('23 Wh');
+    expect(fs[0]?.message).toContain('to 20 Wh');
+  });
+
+  test('2.0.1: a late sample is checked against the samples on both sides of it', () => {
+    const h = harness('ocpp2.0.1');
+    h.boot();
+    const t0 = h.now;
+    h.call('TransactionEvent', { ...txEvent('Started', 't1', 0, t0), meterValue: [sample(t0, 100)] });
+    h.call('TransactionEvent', { ...txEvent('Updated', 't1', 1, t0 + MIN), meterValue: [sample(t0 + 2 * MIN, 300)] });
+    // Between 100 and 300 in time: fine, even though it arrives after 300.
+    expect(
+      h.call('TransactionEvent', { ...txEvent('Updated', 't1', 2, t0 + 2 * MIN), meterValue: [sample(t0 + MIN, 200)] }),
+    ).toEqual([]);
+    // Older than 300 but higher: the register went down between the two samples.
+    const late = h.call('TransactionEvent', {
+      ...txEvent('Updated', 't1', 3, t0 + 2 * MIN),
+      meterValue: [sample(t0 + 90 * SEC, 350)],
+    });
+    expect(rules(late)).toEqual(['meter.backwards']);
+    expect(late[0]?.message).toContain('350 Wh to 300 Wh');
+    // A later sample below one already reported is flagged as before.
+    const low = h.call('TransactionEvent', {
+      ...txEvent('Updated', 't1', 4, t0 + 3 * MIN),
+      meterValue: [sample(t0 + 3 * MIN, 250)],
+    });
+    expect(rules(low)).toEqual(['meter.backwards']);
+    expect(low[0]?.message).toContain('350 Wh to 250 Wh');
+  });
+
+  test('1.6: StopTransaction transactionData that repeats earlier samples passes', () => {
+    const h = harness('ocpp1.6');
+    h.boot();
+    const t0 = h.now;
+    h.call('StartTransaction', start16(t0, 1000));
+    h.advance(MIN);
+    expect(h.call('MeterValues', { connectorId: 1, transactionId: 1, meterValue: [mv16(1100, h.now)] })).toEqual([]);
+    h.advance(MIN);
+    expect(h.call('MeterValues', { connectorId: 1, transactionId: 1, meterValue: [mv16(1200, h.now)] })).toEqual([]);
+    h.advance(30 * SEC);
+    const stop = {
+      ...stop16(1, 1250, h.now),
+      transactionData: [mv16(1000, t0), mv16(1100, t0 + MIN), mv16(1200, t0 + 2 * MIN), mv16(1250, h.now)],
+    };
+    expect(h.call('StopTransaction', stop)).toEqual([]);
+  });
+
+  test('1.6: a transactionData sample below an earlier one is flagged', () => {
+    const h = harness('ocpp1.6');
+    h.boot();
+    const t0 = h.now;
+    h.call('StartTransaction', start16(t0, 1000));
+    h.advance(2 * MIN);
+    h.call('MeterValues', { connectorId: 1, transactionId: 1, meterValue: [mv16(1200, h.now)] });
+    h.advance(30 * SEC);
+    const stop = { ...stop16(1, 1250, h.now), transactionData: [mv16(1000, t0), mv16(1150, t0 + 2 * MIN)] };
+    const fs = h.call('StopTransaction', stop);
+    expect(rules(fs)).toEqual(['meter.backwards']);
+    expect(fs[0]?.message).toContain('1200 Wh to 1150 Wh');
+  });
+
+  test('1.6: a MeterValues sample older than meterStart and above it is flagged', () => {
+    const h = harness('ocpp1.6');
+    h.boot();
+    const t0 = h.now;
+    h.call('StartTransaction', start16(t0, 1000));
+    const fs = h.call('MeterValues', { connectorId: 1, transactionId: 1, meterValue: [mv16(1100, t0 - MIN)] });
+    expect(rules(fs)).toEqual(['meter.backwards']);
   });
 });
 
