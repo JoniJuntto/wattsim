@@ -163,7 +163,7 @@ Out of the box it behaves like a reasonable CSMS for every station-initiated act
 | `rpc.send-misuse` | error | 2.1: SEND for a CALL action, or CALL for a SEND action |
 | `rpc.call-in-flight` | warning | a CALL while the previous one is unanswered (OCPP-J synchronicity) |
 | `rpc.unknown-result-id` | error | a CALLRESULT / CALLERROR / CALLRESULTERROR for no pending CALL (warning when it is merely late) |
-| `rpc.message-id-reuse` | error | a message id used twice on one connection |
+| `rpc.message-id-reuse` | error, warning | a message id used twice on one connection (error), or reused with a different payload on a later connection (warning); an exact resend after a reconnect is a retransmission and is answered with the original reply |
 | `boot.not-accepted` | error | requests before an accepted BootNotification; while Pending only what the CSMS asked for (1.6 §4.2, 2.0.1 B01–B03) |
 | `boot.retry-too-soon` | error | BootNotification again before a Rejected (error) or Pending (warning) interval elapsed |
 | `topology.unknown-evse` | error | an EVSE / connector outside `topology`, or a transaction on connector / EVSE 0 |

@@ -131,6 +131,32 @@ describe('full sessions are conformant', () => {
     });
   }
 
+  for (const version of ['ocpp1.6', 'ocpp2.0.1'] as const) {
+    test(`${version}: offline 15 min mid-transaction, stop and unplug while offline: the backlog drains clean`, async () => {
+      const server = startServer();
+      const st = await station(version, `OFF-${version}`);
+      await st.boot();
+      await settled(st);
+      await st.plugIn(1, { batteryKwh: 60, initialSoc: 0.2 });
+      await settled(st);
+      await st.startTransaction(1, 'TAG');
+      await advance(st, 3 * MIN);
+      await st.disconnect();
+      // Offline: no socket I/O to settle, only the clock moves.
+      for (let i = 0; i < 15; i++) await clock.advance(MIN);
+      void st.stopTransaction(1).catch(() => {});
+      void st.unplug(1).catch(() => {});
+      for (let i = 0; i < 10; i++) await clock.advance(MIN);
+      await st.connect();
+      await until(() => st.pendingRequests === 0, 5000, 'the offline queue to drain');
+      // The queued StatusNotifications carry the time of the status change, 10 min before they arrive.
+      const statuses = server.session(st.id)?.calls('StatusNotification') ?? [];
+      const last = statuses.at(-1)?.payload as { timestamp: string };
+      expect(clock.now() - Date.parse(last.timestamp)).toBe(10 * MIN);
+      expect(server.violations).toEqual([]);
+    });
+  }
+
   test('three stations of different versions at once', async () => {
     const server = startServer();
     const all = await Promise.all([

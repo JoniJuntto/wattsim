@@ -10,10 +10,12 @@ import {
   checkStationReply,
   DEFAULT_CHECKER_CONFIG,
   expireCsmsCall,
+  findRetransmission,
   newConnectionState,
   newSessionState,
   recordStationCall,
   registers2x,
+  startConnection,
 } from '../src/conformance';
 import { defaultReply } from '../src/defaults';
 import type { RuleId } from '../src/rules';
@@ -312,6 +314,76 @@ describe('rpc.message-id-reuse', () => {
   });
 });
 
+describe('retransmission after a reconnect', () => {
+  /** Drop the connection and open a new one 10 s later. */
+  function reconnect(h: ReturnType<typeof harness>): void {
+    h.advance(10 * SEC);
+    startConnection(h.s, h.now);
+  }
+
+  test('a CALL answered on an earlier connection and resent unchanged is found, with the reply that was sent', () => {
+    const h = harness('ocpp1.6');
+    startConnection(h.s, h.now);
+    h.boot();
+    h.call('StartTransaction', start16(h.now));
+    const stop: CallFrame = { type: 2, id: 'x1', action: 'StopTransaction', payload: stop16(1, 2000, h.now) };
+    h.frame(stop);
+    // On the same connection a repeat is no retransmission: today's id-reuse rule applies.
+    expect(findRetransmission(h.s, stop)).toBeUndefined();
+    reconnect(h);
+    // Key order does not matter.
+    const reordered = { timestamp: iso(T0), meterStop: 2000, transactionId: 1 };
+    expect(findRetransmission(h.s, { ...stop, payload: reordered })).toEqual({ result: {} });
+    reconnect(h);
+    expect(findRetransmission(h.s, stop)).toEqual({ result: {} });
+  });
+
+  test('the same id for a different message on a new connection is rpc.message-id-reuse (warning)', () => {
+    const h = harness('ocpp1.6');
+    startConnection(h.s, h.now);
+    h.boot();
+    h.call('StatusNotification', status16(1, 'Preparing', iso(h.now)), undefined, 'same');
+    reconnect(h);
+    const fs = h.call('StatusNotification', status16(1, 'Charging', iso(h.now)), undefined, 'same');
+    expect(rules(fs)).toEqual(['rpc.message-id-reuse']);
+    expect(fs[0]?.severity).toBe('warning');
+    expect(fs[0]?.message).toContain('earlier connection');
+  });
+
+  test('BootNotification and Heartbeat are never answered from memory', () => {
+    const h = harness('ocpp2.0.1');
+    startConnection(h.s, h.now);
+    const boot: CallFrame = {
+      type: 2,
+      id: 'b1',
+      action: 'BootNotification',
+      payload: { reason: 'PowerUp', chargingStation: { vendorName: 'v', model: 'm' } },
+    };
+    h.frame(boot, { status: 'Accepted', currentTime: iso(h.now), interval: 300 });
+    const hb: CallFrame = { type: 2, id: 'h1', action: 'Heartbeat', payload: {} };
+    h.frame(hb);
+    reconnect(h);
+    expect(findRetransmission(h.s, boot)).toBeUndefined();
+    expect(findRetransmission(h.s, hb)).toBeUndefined();
+  });
+
+  test('remembers the last 50 answered CALLs', () => {
+    const h = harness('ocpp2.0.1');
+    startConnection(h.s, h.now);
+    h.boot();
+    const frames: CallFrame[] = [];
+    for (let i = 0; i <= 50; i++) {
+      const f: CallFrame = { type: 2, id: `sn${i}`, action: 'StatusNotification', payload: status2x(1, 1, h.now) };
+      frames.push(f);
+      h.frame(f);
+    }
+    reconnect(h);
+    expect(findRetransmission(h.s, frames[0] as CallFrame)).toBeUndefined();
+    expect(findRetransmission(h.s, frames[1] as CallFrame)).toEqual({ result: {} });
+    expect(findRetransmission(h.s, frames[50] as CallFrame)).toEqual({ result: {} });
+  });
+});
+
 describe('boot.not-accepted', () => {
   test('flags any request before a BootNotification was accepted', () => {
     const h = harness('ocpp2.0.1');
@@ -605,6 +677,35 @@ describe('meter.backwards', () => {
     expect(readings).toEqual([{ key: '|Outlet', wh: 20_000 }]);
   });
 
+  test('1.6: a whole-Wh meterStop or reading may sit less than 1 Wh below a finer reading', () => {
+    const h = harness('ocpp1.6');
+    h.boot();
+    h.call('StartTransaction', start16(h.now, 0));
+    const kwh = (v: string) => ({ connectorId: 1, transactionId: 1, meterValue: [mv16(v, h.now, 'kWh')] });
+    expect(h.call('MeterValues', kwh('1.2345'))).toEqual([]);
+    // 1234.5 Wh, then 1234 Wh in whole Wh: truncation, not a decrease.
+    expect(h.call('MeterValues', { connectorId: 1, transactionId: 1, meterValue: [mv16(1234, h.now)] })).toEqual([]);
+    expect(h.call('MeterValues', kwh('1.2345'))).toEqual([]);
+    expect(h.call('StopTransaction', stop16(1, 1234, h.now))).toEqual([]);
+  });
+
+  test('1.6: still flags a whole-Wh drop of 1 Wh or more, and any drop between two finer readings', () => {
+    const h = harness('ocpp1.6');
+    h.boot();
+    h.call('StartTransaction', start16(h.now, 0));
+    const kwh = (v: string) => ({ connectorId: 1, transactionId: 1, meterValue: [mv16(v, h.now, 'kWh')] });
+    h.call('MeterValues', kwh('1.2345'));
+    expect(rules(h.call('MeterValues', kwh('1.2344')))).toEqual(['meter.backwards']);
+    expect(rules(h.call('StopTransaction', stop16(1, 1233, h.now)))).toEqual(['meter.backwards']);
+  });
+
+  test('2.x: a whole-Wh value less than 1 Wh below a finer reading passes', () => {
+    const h = harness('ocpp2.0.1');
+    h.boot();
+    h.call('TransactionEvent', txEvent('Started', 't1', 0, h.now, 1234.5));
+    expect(h.call('TransactionEvent', txEvent('Ended', 't1', 1, h.now, 1234))).toEqual([]);
+  });
+
   test('passes other measurands and phase registers kept apart', () => {
     const h = harness('ocpp2.0.1');
     h.boot();
@@ -635,6 +736,24 @@ describe('time.skew', () => {
     expect(ahead[0]?.severity).toBe('warning');
     expect(rules(h.call('StatusNotification', status16(1, 'Available', iso(h.now - 10 * MIN))))).toEqual(['time.skew']);
     expect(rules(h.call('StartTransaction', start16(h.now + 10 * MIN)))).toEqual(['time.skew']);
+  });
+
+  test('passes past timestamps for the first 60 s of a reconnection (the offline backlog), not later', () => {
+    const h = harness('ocpp1.6');
+    startConnection(h.s, h.now);
+    h.boot();
+    const old = () => status16(1, 'Available', iso(h.now - 10 * MIN));
+    // A first connection has no backlog.
+    expect(rules(h.call('StatusNotification', old()))).toEqual(['time.skew']);
+    h.advance(10 * MIN);
+    startConnection(h.s, h.now);
+    expect(h.call('StatusNotification', old())).toEqual([]);
+    h.advance(60 * SEC);
+    expect(h.call('StatusNotification', old())).toEqual([]);
+    // Future skew is never excused.
+    expect(rules(h.call('StatusNotification', status16(1, 'Available', iso(h.now + 10 * MIN))))).toEqual(['time.skew']);
+    h.advance(1 * SEC);
+    expect(rules(h.call('StatusNotification', old()))).toEqual(['time.skew']);
   });
 
   test('passes small skew, and old timestamps on messages replayed from the offline queue', () => {

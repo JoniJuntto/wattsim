@@ -37,14 +37,16 @@ import {
   checkStationReply,
   DEFAULT_CHECKER_CONFIG,
   expireCsmsCall,
-  newConnectionState,
+  findRetransmission,
   newSessionState,
+  recordRetransmission,
   recordStationCall,
+  startConnection,
 } from './conformance';
 import { defaultReply } from './defaults';
 import { Emitter } from './emitter';
 import type { ConformanceReport } from './report';
-import { buildReport } from './report';
+import { addToReport, emptyReport } from './report';
 import type { ConformanceViolation } from './rules';
 
 export type TlsServerOptions = {
@@ -95,6 +97,13 @@ export type CsmsOptions = {
   checker?: Partial<Omit<CheckerConfig, 'topology'>>;
   /** Frames kept per session in `received` / `sent`; default 1000. */
   frameHistory?: number;
+  /** Violations kept in `Csms.violations`, newest last; default 10000. `report()` counts every one regardless. */
+  maxViolations?: number;
+  /**
+   * Forget the session of a station disconnected this long (injected clock); default 1 h. It is checked like a new
+   * station if it comes back. `Infinity` keeps every session until the CSMS stops.
+   */
+  forgetAfterMs?: number;
 };
 
 /** Return this from a responder to answer with a CALLERROR instead of a CALLRESULT. */
@@ -164,7 +173,7 @@ export type CsmsEvents = {
   disconnected: [Session, { code: number; reason: string }];
   frame: [FrameEvent];
   violation: [ConformanceViolation];
-  /** Every inbound station CALL (and 2.1 SEND), before it is answered. */
+  /** Every inbound station CALL (and 2.1 SEND), before it is answered; retransmissions answered from memory too. */
   call: [Session, CallFrame | SendFrame];
   /** Responder, signer and listener failures. Never thrown into the socket. */
   error: [Error];
@@ -212,7 +221,10 @@ function peek(raw: string): { type?: unknown; id?: string } {
   }
 }
 
-/** One station, across reconnects. Created on its first connection; state survives until the CSMS stops. */
+/**
+ * One station, across reconnects. Created on its first connection; its state survives until the CSMS stops, or
+ * until the station has been disconnected for `CsmsOptions.forgetAfterMs`.
+ */
 export class Session {
   readonly identity: string;
   /** The checker's view of this station. Read-only for callers. */
@@ -223,6 +235,7 @@ export class Session {
   readonly sent: Frame[] = [];
 
   private ws: Socket | undefined;
+  private lastDisconnect: number | undefined;
   private readonly responders = new Map<string, Responder>();
   private readonly queue: PendingCall[] = [];
   private inflight: PendingCall | undefined;
@@ -244,6 +257,11 @@ export class Session {
 
   get connected(): boolean {
     return this.ws !== undefined;
+  }
+
+  /** When the station's last connection closed (CSMS clock); undefined while connected. */
+  get disconnectedAt(): number | undefined {
+    return this.ws ? undefined : this.lastDisconnect;
   }
 
   /** Inbound station CALLs, optionally of one action. */
@@ -299,11 +317,8 @@ export class Session {
 
   /** @internal */
   attach(ws: Socket): void {
-    if (ws.data.version !== this.state.version) {
-      this.state = newSessionState(this.identity, ws.data.version);
-    } else {
-      this.state.conn = newConnectionState();
-    }
+    if (ws.data.version !== this.state.version) this.state = newSessionState(this.identity, ws.data.version);
+    startConnection(this.state, this.host.clock.now());
     this.ws = ws;
   }
 
@@ -311,6 +326,7 @@ export class Session {
   detach(ws: Socket): boolean {
     if (this.ws !== ws) return false;
     this.ws = undefined;
+    this.lastDisconnect = this.host.clock.now();
     const pending = [...(this.inflight ? [this.inflight] : []), ...this.queue.splice(0)];
     this.inflight = undefined;
     for (const p of pending) {
@@ -370,6 +386,14 @@ export class Session {
   // ---- inbound -------------------------------------------------------------------------------------------------
 
   private onStationCall(f: CallFrame | SendFrame, now: number): void {
+    const resent = findRetransmission(this.state, f);
+    if (resent && f.type === MessageType.Call) {
+      // The connection that should have carried the answer dropped: answer again, exactly as before.
+      recordRetransmission(this.state, f);
+      this.host.emit('call', this, f);
+      this.send(replyFrame(f.id, resent));
+      return;
+    }
     const findings = checkStationCall(this.state, f, now, this.host.checker);
     recordStationCall(this.state, f, now);
     this.host.findings(this, findings, f.id, f.action);
@@ -448,7 +472,10 @@ export class Session {
     }
     reply ??= { type: MessageType.CallResult, id: f.id, payload: out };
     this.send(reply);
-    const result: CsmsReply = reply.type === MessageType.CallResult ? { result: reply.payload } : { error: reply.code };
+    const result: CsmsReply =
+      reply.type === MessageType.CallResult
+        ? { result: reply.payload }
+        : { error: reply.code, description: reply.description, details: reply.details };
     applyCsmsReply(this.state, f, result, this.host.clock.now());
     this.host.afterReply(this, f, result);
   }
@@ -505,6 +532,18 @@ export class Session {
   }
 }
 
+/** The CALLRESULT / CALLERROR frame for a reply to CALL `id`. */
+function replyFrame(id: string, r: CsmsReply): CallResultFrame | CallErrorFrame {
+  if ('result' in r) return { type: MessageType.CallResult, id, payload: r.result };
+  return {
+    type: MessageType.CallError,
+    id,
+    code: r.error,
+    description: r.description ?? '',
+    details: (r.details ?? {}) as Record<string, unknown>,
+  };
+}
+
 /** Decode `Authorization: Basic ...` into user and password. */
 function basicCredentials(header: string | null): { user: string; password: string } | undefined {
   const m = header?.match(/^Basic\s+(\S+)$/i);
@@ -523,7 +562,7 @@ function urlHost(host: string): string {
 export class Csms extends Emitter<CsmsEvents> {
   readonly url: string;
   readonly port: number;
-  /** Every violation found, in order. */
+  /** The newest violations found (at most `maxViolations`), oldest first. `report()` counts every one. */
   readonly violations: ConformanceViolation[] = [];
 
   private readonly server: Bun.Server<SocketData>;
@@ -532,6 +571,10 @@ export class Csms extends Emitter<CsmsEvents> {
   private readonly responders = new Map<string, Responder>();
   private readonly host: Host;
   private nextTransactionId = 1;
+  /** Exact counts of every violation, including those trimmed from `violations`. */
+  private readonly totals: ConformanceReport = emptyReport();
+  private readonly maxViolations: number;
+  private readonly forgetAfterMs: number;
 
   constructor(opts: CsmsOptions = {}) {
     super();
@@ -546,6 +589,8 @@ export class Csms extends Emitter<CsmsEvents> {
       topology: typeof topology === 'function' ? topology(identity) : topology,
     });
     const signer = opts.signer;
+    this.maxViolations = opts.maxViolations ?? 10_000;
+    this.forgetAfterMs = opts.forgetAfterMs ?? 3_600_000;
 
     this.host = {
       clock: this.clock,
@@ -591,7 +636,9 @@ export class Csms extends Emitter<CsmsEvents> {
             ...(frameId === undefined ? {} : { frameId }),
             ...(action === undefined ? {} : { action }),
           };
+          addToReport(this.totals, v);
           this.violations.push(v);
+          if (this.violations.length > this.maxViolations) this.violations.shift();
           this.safeEmit('violation', v);
         }
       },
@@ -665,6 +712,7 @@ export class Csms extends Emitter<CsmsEvents> {
       websocket: {
         open: (ws) => {
           const { identity, version } = ws.data;
+          this.forgetIdle();
           let session = this.bySession.get(identity);
           if (!session) {
             session = new Session({ ...this.host, checker: checkerFor(identity) }, identity, version);
@@ -681,6 +729,7 @@ export class Csms extends Emitter<CsmsEvents> {
         close: (ws, code, reason) => {
           const session = this.bySession.get(ws.data.identity);
           if (session) this.detach(session, ws, code, reason);
+          this.forgetIdle();
         },
         message: (ws, message) => {
           const session = this.bySession.get(ws.data.identity);
@@ -728,14 +777,29 @@ export class Csms extends Emitter<CsmsEvents> {
     };
   }
 
-  /** Violations grouped by rule and by identity, with totals. Every station seen is listed, clean ones too. */
+  /**
+   * Violations grouped by rule and by identity, with totals. Every station with a session is listed, clean ones
+   * too. The counts cover every violation found; `violations` holds the retained ones (see `maxViolations`).
+   */
   report(): ConformanceReport {
-    return buildReport(this.violations, [...this.bySession.keys()]);
+    const { violations: _, ...counts } = this.totals;
+    const r: ConformanceReport = { ...structuredClone(counts), violations: [...this.violations] };
+    for (const id of this.bySession.keys()) r.byIdentity[id] ??= { total: 0, errors: 0, warnings: 0, byRule: {} };
+    return r;
   }
 
   async stop(): Promise<void> {
     for (const session of this.bySession.values()) session.close(1001, 'CSMS stopping');
     await this.server.stop(true);
+  }
+
+  /** Drop the sessions of stations disconnected for `forgetAfterMs` or longer. */
+  private forgetIdle(): void {
+    const now = this.clock.now();
+    for (const [identity, session] of this.bySession) {
+      const since = session.disconnectedAt;
+      if (since !== undefined && now - since >= this.forgetAfterMs) this.bySession.delete(identity);
+    }
   }
 
   private detach(session: Session, ws: Socket, code: number, reason: string): void {

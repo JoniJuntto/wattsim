@@ -23,23 +23,32 @@ function count(t: Tally, v: ConformanceViolation): void {
   else t.warnings++;
 }
 
+/** A report with nothing in it. */
+export function emptyReport(): ConformanceReport {
+  return { ...tally(), byRule: {}, byIdentity: {}, violations: [] };
+}
+
+/** Count `v` in the totals of `r`. Leaves `r.violations` alone, so running totals can outlive a trimmed list. */
+export function addToReport(r: ConformanceReport, v: ConformanceViolation): void {
+  count(r, v);
+  const rule = r.byRule[v.rule] ?? { ...tally(), summary: RULES[v.rule].summary };
+  r.byRule[v.rule] = rule;
+  count(rule, v);
+  const station = r.byIdentity[v.identity] ?? { ...tally(), byRule: {} };
+  r.byIdentity[v.identity] = station;
+  count(station, v);
+  station.byRule[v.rule] = (station.byRule[v.rule] ?? 0) + 1;
+}
+
 /** Summarise `violations`. `identities` adds stations with no violations, so they show up as clean. */
 export function buildReport(
   violations: readonly ConformanceViolation[],
   identities: readonly string[] = [],
 ): ConformanceReport {
-  const r: ConformanceReport = { ...tally(), byRule: {}, byIdentity: {}, violations: [...violations] };
+  const r = emptyReport();
+  r.violations = [...violations];
   for (const id of identities) r.byIdentity[id] = { ...tally(), byRule: {} };
-  for (const v of violations) {
-    count(r, v);
-    const rule = r.byRule[v.rule] ?? { ...tally(), summary: RULES[v.rule].summary };
-    r.byRule[v.rule] = rule;
-    count(rule, v);
-    const station = r.byIdentity[v.identity] ?? { ...tally(), byRule: {} };
-    r.byIdentity[v.identity] = station;
-    count(station, v);
-    station.byRule[v.rule] = (station.byRule[v.rule] ?? 0) + 1;
-  }
+  for (const v of violations) addToReport(r, v);
   return r;
 }
 

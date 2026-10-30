@@ -35,6 +35,11 @@ export type CheckerConfig = {
   bootRetrySlackMs: number;
   /** Default true: every request before an accepted BootNotification is a violation. */
   requireBoot: boolean;
+  /**
+   * How long after a reconnect the station may still be draining its offline queue: past timestamps on any CALL
+   * received this soon after the connection opened are not `time.skew`. Default 60 s.
+   */
+  offlineDrainMs: number;
   topology?: Topology;
 };
 
@@ -44,6 +49,7 @@ export const DEFAULT_CHECKER_CONFIG: CheckerConfig = {
   heartbeatMinFraction: 0.5,
   bootRetrySlackMs: 1000,
   requireBoot: true,
+  offlineDrainMs: 60_000,
 };
 
 export type Finding = { rule: RuleId; severity: Severity; message: string; specRef: string };
@@ -62,6 +68,10 @@ export type TxRecord = {
 
 /** State scoped to one WebSocket connection; reset on reconnect. */
 export type ConnectionState = {
+  /** 1 for the station's first connection, one more per reconnect; 0 before `startConnection`. */
+  seq: number;
+  /** When this connection opened (CSMS clock), when started with `startConnection`. */
+  openedAt?: number;
   /** The station CALL the CSMS has not answered yet. */
   inflight?: { id: string; action: string; at: number };
   /** Message ids of station CALL / SEND frames on this connection (bounded). */
@@ -91,11 +101,30 @@ export type SessionState = {
   instructed: Set<string>;
   /** Outstanding TriggerMessage requests, per station action. */
   triggered: Map<string, number>;
+  /** The last answered station CALLs by message id (bounded): what a retransmission after a reconnect repeats. */
+  answered: Map<string, AnsweredCall>;
   conn: ConnectionState;
+};
+
+/** A station CALL the CSMS answered, and the answer. */
+export type AnsweredCall = {
+  action: string;
+  /** The payload as canonical JSON (object keys sorted). */
+  payload: string;
+  /** `ConnectionState.seq` of the connection it arrived on. */
+  connection: number;
+  reply: CsmsReply;
 };
 
 const MAX_IDS = 1000;
 const MAX_ENDED_TX = 200;
+const MAX_ANSWERED = 50;
+/**
+ * Never answered from memory: their reply carries the CSMS's current time, so a stale copy would set the station's
+ * clock back, and answering them again changes no transaction state. A station whose message ids restart at 1 after
+ * a reboot would otherwise get its old BootNotification reply.
+ */
+const FRESH_REPLY: ReadonlySet<string> = new Set(['BootNotification', 'Heartbeat']);
 /** Station actions whose timestamps may legitimately lie in the past: they are replayed from the offline queue. */
 const QUEUEABLE: ReadonlySet<string> = new Set([
   'MeterValues',
@@ -106,8 +135,46 @@ const QUEUEABLE: ReadonlySet<string> = new Set([
 ]);
 const REGISTER = 'Energy.Active.Import.Register';
 
-export function newConnectionState(): ConnectionState {
-  return { seenIds: new Set(), csmsPending: new Map(), csmsExpired: new Set(), csmsResultIds: new Set() };
+export function newConnectionState(seq = 0, openedAt?: number): ConnectionState {
+  return {
+    seq,
+    ...(openedAt === undefined ? {} : { openedAt }),
+    seenIds: new Set(),
+    csmsPending: new Map(),
+    csmsExpired: new Set(),
+    csmsResultIds: new Set(),
+  };
+}
+
+/** A new WebSocket connection of the station opened at `now`: per-connection state starts over. */
+export function startConnection(s: SessionState, now: number): void {
+  s.conn = newConnectionState(s.conn.seq + 1, now);
+}
+
+/** JSON with object keys sorted, so payloads that differ only in key order compare equal. */
+function canonical(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) =>
+    v !== null && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : v,
+  );
+}
+
+/**
+ * The reply to send again when `f` retransmits a CALL the CSMS answered on an earlier connection: same message id,
+ * action and payload (OCPP-J delivers at least once, and a station resends a CALL whose answer the dropped
+ * connection lost). Undefined for anything else, a repeat on the same connection included. Does not modify `s`.
+ */
+export function findRetransmission(s: SessionState, f: CallFrame | SendFrame): CsmsReply | undefined {
+  if (f.type !== 2) return undefined;
+  const prev = s.answered.get(f.id);
+  if (!prev || prev.connection === s.conn.seq) return undefined;
+  return prev.action === f.action && prev.payload === canonical(f.payload) ? prev.reply : undefined;
+}
+
+/** Note a retransmission as seen on this connection. It is answered from memory: nothing else changes. */
+export function recordRetransmission(s: SessionState, f: CallFrame | SendFrame): void {
+  addBounded(s.conn.seenIds, f.id);
 }
 
 export function newSessionState(identity: string, version: OcppVersion): SessionState {
@@ -120,6 +187,7 @@ export function newSessionState(identity: string, version: OcppVersion): Session
     activeByConnector: new Map(),
     instructed: new Set(),
     triggered: new Map(),
+    answered: new Map(),
     conn: newConnectionState(),
   };
 }
@@ -179,10 +247,25 @@ export function checkStationCall(
   return out;
 }
 
-/** `rpc.message-id-reuse`: a message id already used by a station CALL / SEND on this connection. */
+/**
+ * `rpc.message-id-reuse`: a message id already used by a station CALL / SEND on this connection (error), or one
+ * the CSMS answered on an earlier connection for a different message (warning: OCPP-J only requires ids to be
+ * unique per connection, but such a CALL cannot be told apart from a retransmission).
+ */
 export function ruleMessageId(s: SessionState, f: CallFrame | SendFrame): Finding[] {
-  if (!s.conn.seenIds.has(f.id)) return [];
-  return [finding(s, 'rpc.message-id-reuse', `message id ${f.id} (${f.action}) was already used on this connection`)];
+  if (s.conn.seenIds.has(f.id)) {
+    return [finding(s, 'rpc.message-id-reuse', `message id ${f.id} (${f.action}) was already used on this connection`)];
+  }
+  const prev = s.answered.get(f.id);
+  if (!prev || prev.connection === s.conn.seq || findRetransmission(s, f)) return [];
+  return [
+    finding(
+      s,
+      'rpc.message-id-reuse',
+      `message id ${f.id} (${f.action}) was used on an earlier connection for a different ${prev.action}; it cannot be told apart from a retransmission`,
+      { severity: 'warning' },
+    ),
+  ];
 }
 
 /** `rpc.call-in-flight`: a CALL while the previous station CALL is unanswered and not yet timed out. */
@@ -404,13 +487,24 @@ export function registers2x(meterValue: readonly MeterValue2x[]): Reading[] {
   return out;
 }
 
+/**
+ * Whether going from `prev` to `next` Wh is a decrease. When either value is a whole number of Wh (1.6 meterStart /
+ * meterStop are integers, and many meters report whole Wh), it has 1 Wh resolution, so a drop of less than 1 Wh is
+ * truncation or rounding of a finer reading, not the register going down.
+ */
+function decreased(prev: number, next: number): boolean {
+  const drop = prev - next;
+  if (drop <= 1e-6) return false;
+  return !((Number.isInteger(prev) || Number.isInteger(next)) && drop < 1);
+}
+
 /** Readings that go below the previous one for the same register (stored, or earlier in the same message). */
 function backwards(tx: TxRecord, readings: readonly Reading[]): Array<{ key: string; from: number; to: number }> {
   const last = { ...tx.registers };
   const out: Array<{ key: string; from: number; to: number }> = [];
   for (const r of readings) {
     const prev = last[r.key];
-    if (prev !== undefined && r.wh < prev - 1e-6) out.push({ key: r.key, from: prev, to: r.wh });
+    if (prev !== undefined && decreased(prev, r.wh)) out.push({ key: r.key, from: prev, to: r.wh });
     last[r.key] = r.wh;
   }
   return out;
@@ -531,10 +625,19 @@ function timestampsOf(payload: unknown): string[] {
   return out;
 }
 
-/** `time.skew`: future timestamps always; past ones except on queueable (offline-replayed) messages. */
+/** True while a reconnected station may still be sending what it queued offline (`offlineDrainMs` after a reconnect). */
+function draining(s: SessionState, now: number, cfg: CheckerConfig): boolean {
+  const opened = s.conn.openedAt;
+  return s.conn.seq > 1 && opened !== undefined && now - opened <= cfg.offlineDrainMs;
+}
+
+/**
+ * `time.skew`: future timestamps always; past ones except on queueable (offline-replayed) messages and on any CALL
+ * in the first `offlineDrainMs` of a reconnection, when the station may be draining its offline queue.
+ */
 export function ruleTimestamps(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
   const offline = (f.payload as { offline?: unknown }).offline === true;
-  const pastOk = offline || QUEUEABLE.has(f.action);
+  const pastOk = offline || QUEUEABLE.has(f.action) || draining(s, now, cfg);
   for (const ts of timestampsOf(f.payload)) {
     const t = Date.parse(ts);
     if (Number.isNaN(t)) continue;
@@ -582,11 +685,24 @@ export function recordStationCall(s: SessionState, f: CallFrame | SendFrame, now
   }
 }
 
-export type CsmsReply = { result: unknown } | { error: string };
+/** The CSMS's answer to a station CALL. A CALLERROR's description and details are kept for a retransmission. */
+export type CsmsReply = { result: unknown } | { error: string; description?: string; details?: unknown };
+
+/** Remember `f` and its answer, the newest `MAX_ANSWERED` only, for `findRetransmission`. */
+function rememberAnswer(s: SessionState, f: CallFrame, reply: CsmsReply): void {
+  if (FRESH_REPLY.has(f.action)) return;
+  s.answered.delete(f.id);
+  s.answered.set(f.id, { action: f.action, payload: canonical(f.payload), connection: s.conn.seq, reply });
+  if (s.answered.size > MAX_ANSWERED) {
+    const oldest = s.answered.keys().next().value;
+    if (oldest !== undefined) s.answered.delete(oldest);
+  }
+}
 
 /** The CSMS answered station CALL `f`. A CALLRESULT advances the state machine; a CALLERROR leaves it as it was. */
 export function applyCsmsReply(s: SessionState, f: CallFrame, reply: CsmsReply, now: number): void {
   if (s.conn.inflight?.id === f.id) s.conn.inflight = undefined;
+  rememberAnswer(s, f, reply);
   if (!('result' in reply)) return;
   addBounded(s.conn.csmsResultIds, f.id);
   const r = reply.result as Record<string, unknown>;

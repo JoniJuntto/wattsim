@@ -339,6 +339,171 @@ describe('sessions', () => {
   });
 });
 
+describe('retransmission after a reconnect', () => {
+  const T = new Date(T0).toISOString();
+  const BOOT2X = { reason: 'PowerUp', chargingStation: { vendorName: 'v', model: 'm' } };
+
+  /** Close `c` and open a new connection for the same station once the CSMS saw the close. */
+  async function reconnect(s: Csms, c: Client, identity: string, protocols = ['ocpp1.6']): Promise<Client> {
+    c.close();
+    await until(() => s.session(identity)?.connected === false);
+    return connect(s.url, identity, protocols);
+  }
+
+  test('1.6: a StopTransaction resent after its reply was lost gets the same reply and no finding', async () => {
+    const s = start({ clock: new VirtualClock(T0) });
+    let c = await connect(s.url, 'CP1');
+    await booted(c);
+    c.send([2, 's1', 'StartTransaction', { connectorId: 1, idTag: 'T', meterStart: 0, timestamp: T }]);
+    const txId = ((await c.next())[2] as { transactionId: number }).transactionId;
+    const stop = [2, 'st1', 'StopTransaction', { transactionId: txId, meterStop: 1000, timestamp: T, idTag: 'T' }];
+    c.send(stop);
+    const first = await c.next();
+    c = await reconnect(s, c, 'CP1');
+    c.send(stop);
+    expect(await c.next()).toEqual(first);
+    expect(s.violations).toEqual([]);
+  });
+
+  test('1.6: a StartTransaction resent after a reconnect gets the same transactionId; no second transaction', async () => {
+    const s = start({ clock: new VirtualClock(T0) });
+    let c = await connect(s.url, 'CP1');
+    await booted(c);
+    const startTx = [2, 's1', 'StartTransaction', { connectorId: 1, idTag: 'T', meterStart: 0, timestamp: T }];
+    c.send(startTx);
+    const first = await c.next();
+    c = await reconnect(s, c, 'CP1');
+    c.send(startTx);
+    expect(await c.next()).toEqual(first);
+    const txId = (first[2] as { transactionId: number }).transactionId;
+    c.send([2, 'st1', 'StopTransaction', { transactionId: txId, meterStop: 1000, timestamp: T }]);
+    await c.next();
+    // A new transaction on the same connector is not "started twice": the first one was stopped.
+    c.send([2, 's2', 'StartTransaction', { connectorId: 1, idTag: 'T', meterStart: 1000, timestamp: T }]);
+    expect(((await c.next())[2] as { transactionId: number }).transactionId).toBe(txId + 1);
+    expect(s.violations).toEqual([]);
+  });
+
+  test('2.0.1: TransactionEvent Updated and Ended resent after reconnects pass', async () => {
+    const s = start({ clock: new VirtualClock(T0) });
+    const v = ['ocpp2.0.1'];
+    const ev = (id: string, eventType: string, seqNo: number, triggerReason: string) => [
+      2,
+      id,
+      'TransactionEvent',
+      {
+        eventType,
+        timestamp: T,
+        triggerReason,
+        seqNo,
+        transactionInfo: { transactionId: 'tx1' },
+        evse: { id: 1, connectorId: 1 },
+      },
+    ];
+    let c = await connect(s.url, 'CS1', v);
+    c.send([2, 'b1', 'BootNotification', BOOT2X]);
+    await c.next();
+    c.send(ev('t0', 'Started', 0, 'CablePluggedIn'));
+    await c.next();
+    const updated = ev('t1', 'Updated', 1, 'ChargingStateChanged');
+    c.send(updated);
+    await c.next();
+    c = await reconnect(s, c, 'CS1', v);
+    c.send(updated);
+    await c.next();
+    const ended = ev('t2', 'Ended', 2, 'EVCommunicationLost');
+    c.send(ended);
+    const first = await c.next();
+    c = await reconnect(s, c, 'CS1', v);
+    c.send(ended);
+    expect(await c.next()).toEqual(first);
+    expect(s.violations).toEqual([]);
+  });
+
+  test('the same id with another payload on a new connection is a new CALL and rpc.message-id-reuse', async () => {
+    const s = start({ clock: new VirtualClock(T0) });
+    let c = await connect(s.url, 'CP1');
+    await booted(c);
+    c.send([2, 's1', 'StartTransaction', { connectorId: 1, idTag: 'T', meterStart: 0, timestamp: T }]);
+    const first = await c.next();
+    c = await reconnect(s, c, 'CP1');
+    c.send([2, 's1', 'StartTransaction', { connectorId: 2, idTag: 'T', meterStart: 0, timestamp: T }]);
+    const second = await c.next();
+    expect(second[2]).not.toEqual(first[2]);
+    expect(s.violations.map((x) => `${x.severity} ${x.rule}`)).toEqual(['warning rpc.message-id-reuse']);
+  });
+
+  test('a repeat on the same connection is still rpc.message-id-reuse, as before', async () => {
+    const s = start({ clock: new VirtualClock(T0) });
+    const c = await connect(s.url, 'CP1');
+    await booted(c);
+    const sn = [2, 'n1', 'StatusNotification', { connectorId: 1, errorCode: 'NoError', status: 'Available' }];
+    c.send(sn);
+    await c.next();
+    c.send(sn);
+    await c.next();
+    expect(s.violations.map((x) => `${x.severity} ${x.rule}`)).toEqual(['error rpc.message-id-reuse']);
+  });
+});
+
+describe('memory bounds', () => {
+  test('maxViolations keeps the newest violations; report() still counts all of them', async () => {
+    const s = start({ maxViolations: 3 });
+    const c = await connect(s.url, 'CP1');
+    for (let i = 0; i < 5; i++) {
+      c.send([2, `h${i}`, 'Heartbeat', {}]);
+      await c.next();
+    }
+    expect(s.violations.map((v) => v.frameId)).toEqual(['h2', 'h3', 'h4']);
+    const r = s.report();
+    expect(r.total).toBe(5);
+    expect(r.errors).toBe(5);
+    expect(r.byRule['boot.not-accepted']?.total).toBe(5);
+    expect(r.byIdentity.CP1?.byRule).toEqual({ 'boot.not-accepted': 5 });
+    expect(r.violations).toHaveLength(3);
+  });
+
+  test('the state of a station disconnected for an hour (injected clock) is forgotten', async () => {
+    const clock = new VirtualClock(T0);
+    const s = start({ clock });
+    const a = await connect(s.url, 'OLD');
+    a.send([2, 'h1', 'Heartbeat', {}]);
+    await a.next();
+    a.close();
+    await until(() => s.session('OLD')?.connected === false);
+    await clock.advance(59 * 60_000);
+    const b = await connect(s.url, 'NEW');
+    await until(() => s.session('NEW')?.connected === true);
+    expect(s.session('OLD')).toBeDefined();
+    await clock.advance(60_000);
+    b.close();
+    await until(() => s.session('NEW')?.connected === false);
+    expect(s.session('OLD')).toBeUndefined();
+    expect(s.sessions().map((x) => x.identity)).toEqual(['NEW']);
+    // Its violations still count.
+    expect(s.report().byIdentity.OLD?.total).toBe(1);
+    // A station that comes back after that starts from scratch.
+    const c = await connect(s.url, 'OLD');
+    await until(() => s.session('OLD')?.connected === true);
+    expect(s.session('OLD')?.state.boot.status).toBe('None');
+    c.close();
+  });
+
+  test('forgetAfterMs: Infinity keeps every session', async () => {
+    const clock = new VirtualClock(T0);
+    const s = start({ clock, forgetAfterMs: Number.POSITIVE_INFINITY });
+    const a = await connect(s.url, 'OLD');
+    await booted(a);
+    a.close();
+    await until(() => s.session('OLD')?.connected === false);
+    await clock.advance(24 * 3_600_000);
+    const b = await connect(s.url, 'OLD');
+    await until(() => s.session('OLD')?.connected === true);
+    expect(s.session('OLD')?.state.boot.status).toBe('Accepted');
+    b.close();
+  });
+});
+
 describe('report', () => {
   test('groups by rule and identity, lists clean stations, renders JUnit', async () => {
     const s = start();
