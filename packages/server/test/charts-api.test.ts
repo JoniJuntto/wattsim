@@ -58,10 +58,16 @@ describe('time series endpoints', () => {
       2000,
       'a series point with power',
     );
-    await Bun.sleep(400);
+    // Points are coalesced (at most four rows a second), so wait for the count rather than a fixed time: a busy
+    // machine can deliver fewer in any given window.
+    const chargingPoints = () =>
+      stream
+        .of('series')
+        .flatMap((m) => (m.stationId === 'TS-1' ? m.points : []))
+        .filter((p) => p.evse === 1 && p.kw > 0);
+    await until(() => chargingPoints().length > 2, 5000, 'three charging points');
 
-    const points = stream.of('series').flatMap((m) => (m.stationId === 'TS-1' ? m.points : []));
-    const charging = points.filter((p) => p.evse === 1 && p.kw > 0);
+    const charging = chargingPoints();
     expect(charging.length).toBeGreaterThan(2);
     const p = charging.at(-1);
     expect(p?.status).toBe('Charging');
