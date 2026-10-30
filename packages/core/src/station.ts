@@ -295,11 +295,13 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     this.ensureMeterTimer();
   }
 
-  /** Close the socket and stop every timer, including a pending Reset. Queued CALLs stay queued for the next `connect()`. */
+  /**
+   * Close the socket and stop the heartbeat, boot retry and any pending Reset. The meter timer keeps running while a
+   * transaction is active: a real meter counts regardless of connectivity, and the MeterValues it produces queue in the
+   * Connection and flush in order on the next `connect()`.
+   */
   async disconnect(): Promise<void> {
     this.stopHeartbeat();
-    this.mvTimer?.cancel();
-    this.mvTimer = undefined;
     this.bootRetry?.cancel();
     this.bootRetry = undefined;
     this.resetTimer?.cancel();

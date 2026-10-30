@@ -184,6 +184,24 @@ describe('Review Focus 2: network drop mid-transaction', () => {
     expect(stop.transactionData?.length).toBe(5);
   });
 
+  test('an explicit disconnect() keeps metering: MeterValues produced offline flush on connect()', async () => {
+    const station = await booted({ heartbeatMs: 30_000 });
+    await station.plugIn(1);
+    await station.startTransaction(1, 'TAG');
+    await until(() => station.pendingRequests === 0);
+    await station.disconnect();
+    await clock.advance(3 * MINUTE);
+    await Bun.sleep(20);
+    expect(calls('MeterValues').length).toBe(0);
+    expect(station.pendingRequests).toBe(3);
+    await station.connect();
+    await until(() => calls('MeterValues').length === 3, 3000);
+    const energies = calls('MeterValues').map((c) =>
+      Number(payload<v16.MeterValuesRequest>(c).meterValue[0]?.sampledValue[0]?.value),
+    );
+    expect(energies).toEqual([368, 736, 1104]);
+  });
+
   test('start and stop issued while offline go out in order after reconnect and both resolve', async () => {
     const station = await booted({ reconnect: { initialMs: 60_000, maxMs: 60_000, factor: 1 } });
     await station.plugIn(1);

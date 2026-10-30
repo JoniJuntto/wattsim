@@ -374,6 +374,9 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
     }
     case 'GetBaseReport':
       return { result: { status: 'Accepted' } satisfies v201.GetBaseReportResponse };
+    case 'CostUpdated':
+      // Cost display is not modelled; acknowledging is what a conformant station does.
+      return { result: {} satisfies v201.CostUpdatedResponse };
     default:
       return null;
   }

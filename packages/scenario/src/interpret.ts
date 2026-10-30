@@ -23,10 +23,9 @@
  *   their body (procs, `at`, `repeat` and every `choose` branch included; counted in a pre-pass). An instance
  *   that finishes or fails without arriving counts as arrived, so a barrier never deadlocks on it.
  *   `wait until B` with no instance declaring `barrier B` resolves immediately.
- * - `net drop d` = `station.disconnect()`, sleep `d`, `station.connect()`. `Station.disconnect()` stops the
- *   meter timer, so while dropped the interpreter ticks the station itself at its meter interval: MeterValues and
- *   StopTransaction generated offline queue in the Connection and flush in order on reconnect, as the reference
- *   says.
+ * - `net drop d` = `station.disconnect()`, sleep `d`, `station.connect()`. The station keeps metering while
+ *   disconnected, so MeterValues and StopTransaction generated offline queue in the Connection and flush in order
+ *   on reconnect, as the reference says.
  * - `clock skew` / `clock drift` wrap the station's clock in a `SkewedClock`; they must appear before
  *   `connect`/`boot` (and before any statement that needs the station), otherwise the station fails. The DSL's
  *   own timing (`wait`, `at`, `net drop`, `within`) always runs on the run clock, not the skewed one.
@@ -990,14 +989,7 @@ class InstanceRunner {
   private async netDrop(d: Duration): Promise<void> {
     const station = this.ensureStation('net drop');
     await this.race(station.disconnect());
-    // Station.disconnect() stops the meter timer; keep sampling so offline MeterValues queue and flush later.
-    const interval = station.meterIntervalMs;
-    const ticker = interval > 0 ? station.clock.setInterval(() => station.tick(), interval) : undefined;
-    try {
-      await this.sleep(this.scaled(d));
-    } finally {
-      ticker?.cancel();
-    }
+    await this.sleep(this.scaled(d));
     await this.race(station.connect());
   }
 

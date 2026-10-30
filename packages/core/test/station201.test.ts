@@ -490,4 +490,13 @@ describe('Station 2.0.1: inbound CALLs', () => {
     await clock.advance(1000);
     await until(() => calls('BootNotification').length === 2, 3000);
   });
+  test('CostUpdated from the CSMS is acknowledged with an empty result', async () => {
+    const station = await booted();
+    await station.plugIn(1);
+    await station.startTransaction(1, 'TAG');
+    await until(() => station.pendingRequests === 0);
+    const txId = station.evse(1)?.transactionId;
+    const result = await call('CostUpdated', { totalCost: 1.5, transactionId: txId });
+    expect(result).toEqual({});
+  });
 });
