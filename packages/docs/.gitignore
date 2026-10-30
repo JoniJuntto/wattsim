@@ -1,0 +1,12 @@
+# Next.js and Fumadocs MDX build output
+.next/
+out/
+.source/
+next-env.d.ts
+*.tsbuildinfo
+
+# Written by scripts/generate.ts from their single sources; never edit or commit
+content/docs/reference/dsl.md
+content/docs/reference/cli.md
+content/docs/reference/conformance-rules.md
+content/docs/reference/mcp-tools.md

@@ -1,0 +1,38 @@
+{
+  "name": "@wattsim/docs",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "generate": "bun scripts/generate.ts",
+    "dev": "bun scripts/generate.ts && next dev",
+    "build": "bun scripts/generate.ts && next build && bun scripts/check-links.ts",
+    "check-links": "bun scripts/check-links.ts",
+    "typecheck": "tsc --noEmit -p scripts/tsconfig.json"
+  },
+  "dependencies": {
+    "fumadocs-core": "16.17.9",
+    "fumadocs-mdx": "15.4.10",
+    "fumadocs-ui": "16.17.9",
+    "next": "16.4.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/bun": "1.4.0",
+    "@types/mdx": "2.0.14",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@wattsim/csms": "workspace:*",
+    "@wattsim/mcp": "workspace:*",
+    "citty": "0.2.2",
+    "postcss": "8.5.32",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "wattsim": "workspace:*"
+  }
+}

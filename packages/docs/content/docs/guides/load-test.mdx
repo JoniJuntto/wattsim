@@ -1,0 +1,115 @@
+---
+title: Test your CSMS against 1000 chargers
+description: A fleet scenario with realistic session lengths and injected faults, run in CI with a JUnit report and Prometheus metrics.
+---
+
+This guide builds a fleet of 1000 OCPP 2.0.1 stations where most sit idle and some charge for about 45 minutes, adds a few network faults, and runs it against your CSMS in CI.
+
+## Write the fleet
+
+A `station` block with `for i in FROM..TO` is a template: it runs once per number in the range, and each instance is an independent charge point whose identity is the interpolated name. Save this as `fleet.ws`:
+
+```
+wattsim 1
+
+csms "ws://localhost:9000/ocpp"
+let size = 1000
+let session = normal(45min, 10min)
+
+station "CP-{i}" for i in 1..size {
+  version 2.0.1
+  serial "SN-{i}"
+  heartbeat 5min
+  meterInterval 1min
+  boot
+  choose {
+    70%: {
+      wait session
+    }
+    30%: {
+      ev plug evse 1 { battery 75kWh soc 15% target 80% }
+      authorize "TAG-{i}"
+      start evse 1 tag "TAG-{i}"
+      wait session
+      stop evse 1
+      ev unplug evse 1
+    }
+  }
+}
+```
+
+- `choose` sends each station down exactly one branch. The weights must add up to 100%.
+- `normal(45min, 10min)` is a distribution: every station draws its own session length, so the stops spread out instead of arriving in one burst.
+- Both draws come from a random generator seeded by `--seed`, the station name and the statement's position, so the same seed gives the same fleet on every run. Change the seed to get a different, equally reproducible split.
+
+`examples/fleet.ws` in the repository is the same scenario with 200 stations.
+
+## Run it
+
+```sh
+wattsim run fleet.ws --csms ws://your-csms:9000/ocpp --virtual --seed 1 --quiet --junit fleet.xml
+```
+
+With `--virtual` the run clock jumps forward whenever every station is idle, so the 45 minute sessions finish in seconds of wall time. On a laptop this 1000-station scenario completes in a few seconds against the CSMS simulator; your CSMS's response time sets the pace against a real one. The summary table has one row per station, and `fleet.xml` has one JUnit test case per station.
+
+### Virtual time and a real CSMS
+
+On a virtual clock the stations' timestamps run ahead of your CSMS's wall clock, and their heartbeats and meter values arrive far more often in wall time than the intervals say. That is what you want for functional tests (does every session start, meter and stop correctly?) but it misleads anything in your CSMS that checks timing. For timing-sensitive tests use the wall clock instead:
+
+- `--speed 10` runs every scenario duration ten times faster than real time, and timestamps stay on wall time.
+- No flag runs in real time, which is the right setting for soak tests.
+
+## Add faults
+
+Real chargers lose connections and messages. Add rules to the station block, before `boot` so they cover the BootNotification too:
+
+```
+  chaos drop out MeterValues every 50 probability 20%
+  chaos delay 2s in probability 5%
+  at +20min {
+    net drop 30s
+  }
+```
+
+- The first rule drops each station's 50th, 100th, 150th... outgoing MeterValues with a 20% chance each.
+- The second holds 5% of the frames your CSMS sends for two seconds before the station sees them.
+- `net drop 30s` closes the WebSocket 20 minutes into the scenario and reconnects 30 seconds later. Messages generated meanwhile queue up and are sent in order on reconnect, following the offline behavior of the station's OCPP version.
+
+Probabilities are seeded like the distributions above, so a failing run can be replayed exactly with the same `--seed`. The [chaos reference](/docs/reference/dsl#chaos) lists every fault and trigger.
+
+To assert on what your CSMS does about a fault, add an `expect` after it, for example `expect StatusNotification {status: "Available"} within 30s`. A failed `expect` fails that station's test case and makes `run` exit 1, while the other stations carry on.
+
+## Watch it while it runs
+
+```sh
+wattsim run fleet.ws --csms ws://your-csms:9000/ocpp --speed 60 --metrics 9464
+```
+
+`--metrics 9464` serves Prometheus metrics on `http://localhost:9464/metrics` for the length of the run:
+
+| Metric | What it counts |
+|---|---|
+| `wattsim_stations_connected` | Stations with an open WebSocket |
+| `wattsim_messages_total` | Frames that crossed the socket, by direction, action and OCPP version |
+| `wattsim_transactions_active` | Transactions running |
+| `wattsim_energy_wh_total` | Energy metered, in Wh |
+| `wattsim_violations_total` | Schema violations detected, by action |
+| `wattsim_request_duration_ms` | Time from a station CALL to your CSMS's CALLRESULT or CALLERROR, on the station clock |
+
+## Run it in CI
+
+`wattsim run` exits 0 when every assertion passed, 1 when any failed and 2 when the scenario could not start, so it can gate a pipeline directly. A GitHub Actions step:
+
+```yaml
+- uses: oven-sh/setup-bun@v2
+  with:
+    bun-version: 1.4.4
+- run: bun install --frozen-lockfile && bun run build
+- run: bun packages/cli/src/index.ts run fleet.ws --csms "$CSMS_URL" --virtual --seed 1 --quiet --junit fleet.xml
+```
+
+Keep the seed fixed in CI so a failure reproduces locally with the same command.
+
+## Larger fleets
+
+The design target is around ten thousand idle stations per process. There is no coordinator: to go beyond one process, split the range (`1..5000` in one scenario file, `5001..10000` in another) and run the instances side by side, on one machine or several.

@@ -1,0 +1,83 @@
+---
+title: CSMS simulator
+description: The @wattsim/csms API, its default replies, and how it reports conformance findings.
+---
+
+`@wattsim/csms` is a central system for testing real or simulated chargers, and a conformance checker: every frame a charger sends is checked against the OCA schema of its version and against the protocol's state machines. It is a library; there is no CLI command for it yet. The [conformance guide](/docs/guides/conformance) walks through using it.
+
+```ts
+import { startCsms, toJUnit } from '@wattsim/csms';
+
+const csms = startCsms({ port: 9000, topology: { evses: 2 } });   // ws://127.0.0.1:9000/<identity>
+csms.on('violation', (v) => console.log(`${v.identity} [${v.rule}] ${v.message} (${v.specRef})`));
+
+const station = await csms.waitForConnection('CP-1');
+await station.call('TriggerMessage', { requestedMessage: 'StatusNotification' });
+station.respondWith('Authorize', () => ({ idTagInfo: { status: 'Invalid' } }));   // a 1.6 reply
+
+const report = csms.report();          // totals, byRule, byIdentity, violations
+await Bun.write('csms.xml', toJUnit(report));
+await csms.stop();
+```
+
+From a checkout, import from `./packages/csms/src/index.ts` instead of `@wattsim/csms` until the packages are published.
+
+## Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `port` | `0` (a free port) | Port to listen on |
+| `host` | `127.0.0.1` | Interface to bind; `0.0.0.0` for chargers on the network |
+| `versions` | 1.6, 2.0.1 and 2.1 | Subprotocols accepted. The first one in the charger's offer that is in this list wins; a charger offering none gets HTTP 400 |
+| `clock` | wall clock | A core `VirtualClock` fits, for tests that step time |
+| `tls` | none | `{ cert, key, ca?, requestCert?, rejectUnauthorized?, passphrase? }` serves `wss://`. `requestCert` asks stations for a client certificate that must chain to `ca` (security profile 3) |
+| `basicAuth` | none | A password per identity, or a check function. The user name must be the identity, as in security profile 1; a failed check is HTTP 401 |
+| `heartbeatInterval` | `300` | BootNotification `interval`, in seconds |
+| `blockedIdTokens` | none | Tags answered `Blocked` in Authorize, StartTransaction and TransactionEvent |
+| `signer` | none | Signs CSRs: every accepted SignCertificate is followed by a CertificateSigned CALL carrying the chain it returns |
+| `topology` | none | EVSE layout per station, for the `topology.unknown-evse` rule. Unset, that rule only flags transactions on EVSE or connector 0 |
+| `callTimeoutMs` | `30000` | Timeout of CSMS-to-station CALLs |
+| `strict` | `true` | A reply that fails its own schema is not sent; the station gets `InternalError` |
+| `checker` | | Thresholds: `clockSkewMs` (5 min), `stationCallTimeoutMs` (30 s), `heartbeatMinFraction` (0.5), `bootRetrySlackMs` (1 s), `requireBoot` (true), `offlineDrainMs` (60 s, past timestamps this soon after a reconnect are not skew) |
+| `frameHistory` | `1000` | Frames kept per session |
+| `maxViolations` | `10000` | Violations kept in `csms.violations`; `report()` counts every one regardless |
+| `forgetAfterMs` | 1 hour | Forget the session of a station disconnected this long; it is checked like a new station if it comes back |
+
+## Default behavior
+
+Out of the box the simulator answers every station-initiated action of 1.6 (with the security extension), 2.0.1 and 2.1 like a reasonable CSMS: BootNotification Accepted with `heartbeatInterval`, Authorize Accepted unless the token is in `blockedIdTokens`, StartTransaction with increasing transaction ids, TransactionEvent and notifications accepted, DataTransfer `UnknownVendorId`, SignCertificate Accepted.
+
+A session keeps its boot and transaction state across reconnects, since a 1.6 station does not boot again after a network drop.
+
+## Replies
+
+`respondWith(action, fn)` overrides the reply to an action for every station (`csms.respondWith`) or one (`session.respondWith`). `fn(payload, session, next)` returns:
+
+- the CALLRESULT payload,
+- a `CsmsCallError(code, description?, details?)` to answer with a CALLERROR,
+- or `undefined` to send nothing, so the station's request times out.
+
+`next()` returns the built-in default, so a responder can change one field of it.
+
+## Calls to the station
+
+`session.call(action, payload)` validates the payload before sending (an invalid one throws `PayloadValidationError` and nothing goes out), keeps one CALL in flight per station, and resolves with the CALLRESULT payload. A CALLERROR rejects with `CallRejectedError`, a timeout with `CallTimeoutError`, and a disconnect rejects too. `csms.waitForConnection(identity)` resolves with the session once that station connects.
+
+## Events
+
+| Event | Payload |
+|---|---|
+| `connected` | The `Session` |
+| `disconnected` | The `Session` and `{ code, reason }` |
+| `frame` | Every frame in either direction |
+| `call` | The `Session` and every station CALL (and 2.1 SEND) before it is answered, retransmissions included |
+| `violation` | A `ConformanceViolation` |
+| `error` | Responder, signer and listener failures; never thrown into the socket |
+
+## Findings
+
+Every violation carries `identity`, `version`, `rule`, `severity`, `message`, `specRef`, `at` (epoch ms on the CSMS clock) and, when the offending frame has one, its `frameId` and `action`. The rules and their spec references are in the [conformance rule table](/docs/reference/conformance-rules).
+
+`csms.report()` returns totals plus the findings grouped `byRule` and `byIdentity`. `toJUnit(report)` renders it as JUnit XML with one test case per station, one failure per error and warnings in system-out.
+
+The rules are plain functions over a session state and a frame, exported for use without sockets: `newSessionState`, `startConnection`, `checkStationCall`, `checkStationReply`, `applyCsmsCall`, `applyCsmsReply`, `applyStationReply` and the rest. `quirk derive` uses them to check a recorded trace.

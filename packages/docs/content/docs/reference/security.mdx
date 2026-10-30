@@ -1,0 +1,67 @@
+---
+title: Security and certificates
+description: Security profiles 1 to 3, the built-in test CA, and the certificate messages a simulated station handles.
+---
+
+Simulated stations speak OCPP security profiles 1, 2 and 3, and `@wattsim/pki` provides a test certificate authority so TLS and the certificate messages run end to end with no setup.
+
+## Profiles
+
+| Profile | Transport | Station authenticates with |
+|---|---|---|
+| 1 | `ws://` | HTTP Basic auth (`basicAuth`) |
+| 2 | `wss://`, server certificate checked against `security.ca` (or the system CAs when unset) | HTTP Basic auth |
+| 3 | `wss://` with mutual TLS | Its client certificate; no Basic auth header |
+
+In a scenario, `auth "CP-1" "password"` sets the Basic auth credentials. From TypeScript:
+
+```ts
+import { createTestCa, issueClientCert, issueServerCert } from '@wattsim/pki';
+import { Station, WallClock } from '@wattsim/core';
+
+const ca = await createTestCa({ subCa: true });                       // root + issuing sub-CA, ECDSA P-256
+const server = await issueServerCert(ca, ['localhost', '127.0.0.1']); // { certPem, keyPem } for the CSMS
+const client = await issueClientCert(ca, 'CP-1');                     // CN = identity, for profile 3
+
+const station = new Station({
+  id: 'CP-1', version: 'ocpp2.0.1', clock: new WallClock(), csmsUrl: 'wss://localhost:9443',
+  basicAuth: { user: 'CP-1', password: 'a-long-password' },
+  security: { profile: 2, ca: ca.rootPem },
+  // profile 3: { profile: 3, ca: ca.rootPem, clientCert: client.certPem, clientKey: client.keyPem }
+});
+```
+
+A profile that does not fit the URL scheme is a constructor error. Profile 3 without a client certificate fails `connect()` before any socket opens. A server certificate the CA does not vouch for, or a client certificate the CSMS refuses, fails the handshake with a `HandshakeError` whose `kind` is `server-certificate`, `client-certificate`, `unauthorized` or `tls`, on the station's `error` event. With `reconnect: false` the same text ends up in the `connect()` rejection.
+
+The [CSMS simulator](/docs/reference/csms) takes `tls` and `basicAuth` options for the other end, so all three profiles can run on one machine.
+
+## Certificate messages
+
+In 1.6 (Security Whitepaper) and in 2.0.1 / 2.1:
+
+| Message | What the station does |
+|---|---|
+| SignCertificate | `station.signCertificate(use?)`, or TriggerMessage `SignChargingStationCertificate` / `SignV2GCertificate` / `SignCombinedCertificate` (1.6: ExtendedTriggerMessage `SignChargePointCertificate`). A fresh key pair and a real PKCS#10 CSR with CN = identity and O = `security.organization` |
+| CertificateSigned | Installs the chain if it reaches an installed CSMS root (V2G root for V2G certificates) on the station clock and matches the pending key. Otherwise Rejected, `InvalidCertificate` with the reason, and an InvalidChargingStationCertificate security event. A new station certificate is used from the next connection |
+| InstallCertificate | Accepts a valid self-signed CA certificate; Rejected otherwise, Failed when the 20-entry store is full. CSMS roots become the TLS trust for the next connection |
+| DeleteCertificate | By hash data. Failed for the station's own certificate, and for the last CSMS root while on profile 2 or 3 |
+| GetInstalledCertificateIds | Hash data (SHA-256) per installed certificate, V2G chains with their sub-CAs as children |
+| GetCertificateStatus, Get15118EVCertificate | `station.getCertificateStatus(...)`, `station.get15118EvCertificate(...)` (2.x). There is no ISO 15118 stack: the EXI request is a fixed placeholder |
+| SetNetworkProfile, 1.6 `SecurityProfile` | Upgrade only. The station reconnects at once with the new profile (and URL) and falls back to the old one if that attempt fails. 1.6 uses `security.upgradeUrl`, or the current URL switched to `wss://` |
+| SignedUpdateFirmware, UpdateFirmware | Checks the signing certificate against the manufacturer roots (InvalidCertificate otherwise), then reports Downloading through Installed. Nothing is downloaded |
+
+## Security events
+
+SecurityEventNotification starts once a station has security state: from boot when `security` is configured, otherwise after its first certificate or security message. The station reports StartupOfTheDevice, ResetOrReboot, ReconfigurationOfSecurityParameters, InvalidCsmsCertificate (on the next successful connection), FailedToAuthenticateAtCsms, InvalidChargingStationCertificate, InvalidFirmwareSigningCertificate and FirmwareUpdated. 1.6 uses its own names, such as InvalidCentralSystemCertificate.
+
+## The CSMS side of the test CA
+
+| Function | Use |
+|---|---|
+| `signCsr(ca, csrPem, { identity })` | The PEM chain for CertificateSigned. As the CSMS simulator's signer: `signer: ({ csr, identity }) => signCsr(ca, csr, { identity })` |
+| `ocspResponse(ca, hashData)` | A signed OCSP response for GetCertificateStatus, from the CA's revocation table (`revokeCertificate`) |
+| `cannedEv15118Response()` | An answer for Get15118EVCertificate |
+| `certificateHashData(pem, issuerPem)`, `verifyChain`, `fingerprint` | Hash data, chain checks and fingerprints |
+| `createCsr`, `generateKeyPair` | CSRs and key pairs, `'ec'` or `'rsa'` |
+
+Certificates are backdated an hour and valid for ten years by default; pass `now` to line them up with a virtual clock.

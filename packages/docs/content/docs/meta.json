@@ -1,0 +1,23 @@
+{
+  "title": "wattsim",
+  "pages": [
+    "index",
+    "getting-started",
+    "---Guides---",
+    "guides/load-test",
+    "guides/record-replay",
+    "guides/conformance",
+    "guides/mcp",
+    "guides/quirks",
+    "ui",
+    "---Reference---",
+    "reference/dsl",
+    "reference/cli",
+    "reference/csms",
+    "reference/conformance-rules",
+    "reference/security",
+    "reference/trace",
+    "reference/mcp-tools",
+    "reference/library"
+  ]
+}

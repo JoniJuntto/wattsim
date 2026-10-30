@@ -1,0 +1,30 @@
+---
+title: Overview
+description: What wattsim simulates, how its parts fit together, and where to start.
+---
+
+wattsim simulates the parties of an OCPP connection so you can test the one you are building. It speaks OCPP 1.6J (with the security whitepaper extensions), 2.0.1 and 2.1 over WebSocket, validates every message against the Open Charge Alliance JSON schemas, and runs on a virtual clock so long sessions finish in seconds.
+
+## The parts
+
+| Part | What it does | Start here |
+|---|---|---|
+| Station simulator | Charge points with EVSEs, an EV model (battery, state of charge, charging curve) and meter values that stay consistent in voltage, current, power and energy. Driven by a `.ws` scenario, the browser UI, the MCP server or TypeScript. | [Getting started](/docs/getting-started) |
+| Fault injection | Rules that drop, delay, duplicate or corrupt frames, answer with the wrong message id or a CALLERROR, or never answer. Deterministic by default ("the 3rd MeterValues"), seeded probabilities for fleets. | [Test your CSMS against 1000 chargers](/docs/guides/load-test) |
+| CSMS simulator | A central system that accepts real or simulated chargers and checks every frame they send against the schema and the protocol's state machines, citing the spec section each finding breaks. | [Check a charger for spec conformance](/docs/guides/conformance) |
+| Proxy, record and replay | Sits between a charger and your CSMS, records the traffic as Open OCPP Trace, injects faults on the way, and replays a recording against another CSMS. | [Record a real charger and replay it](/docs/guides/record-replay) |
+| Quirk profiles | A charger's oddities (a 15 s heartbeat, late StatusNotifications, an ignored remote stop) packed into a reusable block any simulated station can apply. | [Emulate a misbehaving charger](/docs/guides/quirks) |
+| Browser UI | Add stations, plug in EVs and watch the message log as a sequence diagram. Every click can be exported as a scenario. | [UI tour](/docs/ui) |
+| MCP server | Lets an AI agent such as Claude create stations, charge EVs, inject faults and run scenarios. | [Drive wattsim from Claude via MCP](/docs/guides/mcp) |
+
+All of these are thin layers over one TypeScript library. The [library overview](/docs/reference/library) lists its packages.
+
+## What it is strict about
+
+- Every inbound and outbound payload is checked against the OCA schema for its version and action. A station that receives an invalid CALL answers with the precise CALLERROR the spec asks for.
+- State-machine legality is enforced: no `TransactionEvent Updated` before `Started`, no StatusNotification for an EVSE that does not exist, nothing but BootNotification before the CSMS accepted a boot.
+- Illegal traffic only appears when you ask for it, through an explicit `chaos` rule or a scripted `on` reply. The run then records it as a violation, so a test can tell a deliberate fault from a bug in wattsim or in your system.
+
+## What it does not do
+
+OCPP 1.6 SOAP, OCPP 1.5 and older, OCPI, a real ISO 15118 stack (EXI over PLC) and hardware interfaces are out of scope. ISO 15118 exists only as modeled EV behavior and as the OCPP certificate messages around it.

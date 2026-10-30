@@ -1,0 +1,95 @@
+---
+title: Check a charger for spec conformance
+description: Point a real or simulated charger at the CSMS simulator and get every schema and protocol violation with the spec section it breaks.
+---
+
+The CSMS simulator in `@wattsim/csms` is a central system that behaves like a reasonable CSMS and, at the same time, checks every frame a charger sends. Each finding names a rule, a severity and the spec section, so a charger maker can fix firmware against it and a CSMS team can see which oddities a charger will bring.
+
+There are two ways to use it: point the charger at the simulator directly, or record it against your own CSMS and check the recording afterwards.
+
+## Point the charger at the simulator
+
+The simulator is a TypeScript library; there is no CLI command for it yet. Save this as `conformance.ts` in the root of the wattsim checkout:
+
+```ts title="conformance.ts"
+import { startCsms, toJUnit } from './packages/csms/src/index.ts';
+
+const csms = startCsms({ host: '0.0.0.0', port: 9000, topology: { evses: 2 } });
+console.log('listening on ws://<this host>:9000/<identity>');
+
+csms.on('connected', (s) => console.log(`${s.identity} connected (${s.version})`));
+csms.on('violation', (v) => console.log(`${v.severity} ${v.identity} [${v.rule}] ${v.message} (${v.specRef})`));
+
+process.on('SIGINT', async () => {
+  const report = csms.report();
+  console.log(`\n${report.errors} errors, ${report.warnings} warnings`);
+  for (const [rule, t] of Object.entries(report.byRule)) console.log(`  ${rule}: ${t.total}`);
+  await Bun.write('conformance.xml', toJUnit(report));
+  await csms.stop();
+  process.exit(report.errors > 0 ? 1 : 0);
+});
+```
+
+Run it with `bun conformance.ts` and set the charger's CSMS URL to `ws://<this host>:9000/<identity>`. The simulator takes the identity from the last path segment and picks the first OCPP subprotocol in the charger's offer that it speaks (1.6, 2.0.1 or 2.1; `versions` narrows that). Then exercise the charger: boot it, plug in, start and stop a session, unplug. Press Ctrl+C for the summary and a JUnit file with one test case per charger.
+
+`topology: { evses: 2 }` tells the checker how many EVSEs the charger has, so a message about EVSE 3 is flagged. Leave it out if you do not know; that rule then only flags transactions on EVSE or connector 0.
+
+### What the charger sees
+
+Out of the box the simulator answers every charger-initiated message the way a permissive CSMS would: BootNotification Accepted with a 300 s heartbeat interval, Authorize Accepted, StartTransaction with increasing transaction ids, TransactionEvent, StatusNotification and the other notifications accepted, DataTransfer `UnknownVendorId`, SignCertificate Accepted. A reply that would fail its own schema is never sent.
+
+Change a reply for every charger, or for one, with `respondWith`. The function returns the payload, a `CsmsCallError`, or `undefined` for no answer at all, and `next()` gives the default:
+
+```ts
+import { CsmsCallError } from './packages/csms/src/index.ts';
+
+csms.respondWith('Authorize', () => ({ idTagInfo: { status: 'Invalid' } }));        // 1.6: reject every tag
+csms.respondWith('DataTransfer', () => new CsmsCallError('NotImplemented'));         // answer with a CALLERROR
+csms.respondWith('Heartbeat', () => undefined);                                      // never answer, test the timeout
+```
+
+### Sending CSMS-initiated messages
+
+To check how the charger handles a remote start, a reset or a charging profile, send the CALL from the session:
+
+```ts
+csms.on('connected', async (session) => {
+  await session.call('TriggerMessage', { requestedMessage: 'StatusNotification' });
+  const result = await session.call('RemoteStartTransaction', { connectorId: 1, idTag: 'TAG-1' });
+  console.log('RemoteStartTransaction ->', result);
+});
+```
+
+`session.call` validates the payload before it is sent (an invalid one throws instead of going out), keeps one CALL in flight per charger, and resolves with the CALLRESULT. A CALLERROR, a timeout (30 s by default, `callTimeoutMs`) or a disconnect rejects. The charger's answer is checked against the response schema like everything else.
+
+## Check a recording instead
+
+If the charger is in the field behind your own CSMS, record it through the [proxy](/docs/guides/record-replay) and check the trace:
+
+```sh
+wattsim proxy --listen 0.0.0.0:9000 --upstream ws://your-csms/ocpp --record charger.jsonl
+wattsim quirk derive charger.jsonl -o findings.ws
+```
+
+`quirk derive` runs every frame of the trace through the same checker and writes each finding as a comment with its spec reference and the trace line, followed by a draft [quirk profile](/docs/guides/quirks) that reproduces what it can.
+
+## Reading a finding
+
+```
+error CP-7 [tx.seqno] seqNo 4 of transaction tx-81 repeats or precedes seqNo 4 (2.0.1 E, TransactionEventRequest.seqNo)
+```
+
+| Field | Meaning |
+|---|---|
+| `severity` | `error` where the spec says SHALL or MUST, `warning` for SHOULD and for heuristics such as clock skew |
+| `identity` | The charger |
+| `rule` | A stable id, so a test can count or ignore one kind of finding |
+| `message` | What happened, in this charger's terms |
+| `specRef` | The section of the spec version the charger speaks: 1.6 section numbers, the OCPP-J RPC framework section, or the 2.0.1 / 2.1 use case id |
+| `frameId` | The OCPP-J message id of the offending frame, to find it in a log |
+
+Every rule, with its severity and references for each version, is in the [conformance rule table](/docs/reference/conformance-rules). The full API of the simulator is in the [CSMS simulator reference](/docs/reference/csms).
+
+## Against simulated stations
+
+The simulator also works as the CSMS for wattsim's own stations, which is how to check a [quirk profile](/docs/guides/quirks) or a scenario you wrote by hand. Start the script above, run `wattsim run <scenario> --csms ws://127.0.0.1:9000`, then stop the script with Ctrl+C; it exits 1 if it saw any error. With `--virtual` the stations' clocks run ahead of the simulator's wall clock, so expect `time.skew` and `heartbeat.too-often` warnings. Run on the wall clock (no flag, or `--speed`) when those two rules matter.

@@ -1,0 +1,76 @@
+---
+title: Record, replay and proxy
+description: Trace file formats, how the proxy forwards and records, how replay matches answers, and the @wattsim/trace API.
+---
+
+The task-oriented walkthrough is [Record a real charger and replay it](/docs/guides/record-replay). This page is the reference. Every flag of `proxy` and `replay` is in the [CLI reference](/docs/reference/cli).
+
+## Trace files
+
+Recordings use the [Open OCPP Trace Format](https://github.com/open-ocpp-trace/specification) v1.1 by default (`--format oot`): one JSON record per message, with the verbatim frame in `raw`. Its Apache-2.0 schema and conformance fixtures are vendored under `packages/trace/schemas/open-ocpp-trace`.
+
+v1.1 has no record for text that is not an OCPP-J array, nor for the 2.1 message types SEND and CALLRESULTERROR. Those are left out of an `oot` file and the proxy prints a warning. `--format frames` writes wattsim's own line format instead, which keeps everything:
+
+```json
+{"ts": "2026-10-30T12:00:00.000Z", "dir": "out", "identity": "CP-1", "version": "ocpp1.6", "frame": [2, "19", "Heartbeat", {}]}
+```
+
+`dir` is relative to the charger: `out` is charger to CSMS, `in` is CSMS to charger. A frame that is not JSON is kept as a string.
+
+Reading accepts Open OCPP Trace records, frames lines and bare `[2, ...]` frames, one per line and mixed freely, or a JSON array of records. A bare frame has no direction: a CALL takes its action's initiator (DataTransfer counts as the charger's), and a response goes opposite to its CALL. `--version 1.6` supplies the OCPP version for lines that carry none.
+
+## Proxy
+
+`wattsim proxy --listen <port> --upstream <url>` accepts chargers at `ws://<host>:<port>/<any path>/<identity>` and opens `<upstream>/<identity>` for each. It offers the charger's subprotocols upstream, passes the `Authorization` header on, and completes the charger's handshake with the subprotocol the CSMS chose. A refusal upstream reaches the charger as the same HTTP status.
+
+Frames are forwarded byte for byte, including ones that do not decode. A close on one side closes the other with the same code; an abnormal close, which has no code to send, is passed on as an abrupt close. The proxy does not queue or reorder anything, so keeping one CALL in flight stays the endpoints' job.
+
+### Chaos in the proxy
+
+`--chaos` takes DSL chaos statements without the `chaos` keyword, several separated by `;`. Counters run per connection, and `--seed` fixes `probability` draws.
+
+A frame a rule touches is still recorded as its sender sent it, with the rule and outcome in `meta.wattsim.chaos`: `delivered` holds the text passed on when the rule changed it, `copies` the count for a duplicate. With `callError` on a CALL the proxy answers the sender itself, and that CALLERROR is recorded with `meta.wattsim.injected`.
+
+## Replay
+
+`wattsim replay <trace> --csms <url>` connects once per identity in the trace and sends the charger's frames again: at the recorded pace, `--speed n` times faster, or with `--virtual` as soon as the CSMS has answered what came before.
+
+Each CSMS frame in the trace becomes an expectation:
+
+- A CALL matches the next CALL of the same action.
+- A response matches the answer to the charger CALL it answered.
+- Payloads are compared like `expect` in a scenario: keys in the recording must match, extra keys are fine. Timestamps and CSMS-assigned ids are removed first: `transactionId`, `requestId`, `remoteStartId`, `reservationId`, `chargingProfileId`, a top-level `id`, `chargingProfile.id`, `chargingSchedule.id` and `message.id`. `evse.id`, `evseId` and `connectorId` are always compared.
+
+Replay sends what reached the CSMS when the trace was made: frames a chaos rule dropped are skipped, changed ones go out as delivered, and duplicates as many times as they were sent. A charger answer to a CSMS CALL goes out under the message id the live CSMS used.
+
+Mismatches print as `trace.jsonl:<line>: <identity>: <what differed>`, and so do CSMS frames the trace does not have.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Everything matched |
+| 1 | At least one mismatch, a refused connection included |
+| 2 | Unreadable input or a bad flag |
+
+## Trace to scenario
+
+`wattsim replay <trace> --export out.ws` (or `-` for stdout) writes the trace as a scenario instead of replaying it.
+
+- Charger messages become `boot`, `heartbeat` and `authorize` where those send exactly the recorded message and nothing more. A BootNotification becomes `boot` only when it was accepted and followed by exactly the StatusNotifications `boot` sends itself; otherwise it is `send BootNotification`.
+- Everything else becomes `send ACTION {payload}`, so the scenario sends the trace's charger messages and nothing else.
+- The CSMS's answers become `expect result` and `expect error`, its CALLs `expect call`, and the charger's recorded answers become `on` handlers.
+- `wait` statements keep the recorded gaps.
+
+The output passes `wattsim check` and `wattsim fmt --check`.
+
+## From TypeScript
+
+`@wattsim/trace` exports:
+
+| Export | Use |
+|---|---|
+| `new Recorder({ path }).attach(station)` | Record a core `Station` to a trace file |
+| `startProxy(...)` | Run the proxy |
+| `replay(entries, { csmsUrl, virtual })` | Replay entries and return a report |
+| `toScenario(entries)` | Trace entries as `.ws` text |
+| `readTrace`, `parseTrace`, `formatTrace`, `writeTrace` | Read and write trace files |
+| `parseChaosRules(text)` | Parse the proxy's `--chaos` syntax into core chaos rules |

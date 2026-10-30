@@ -1,0 +1,11 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "build": {
+      "inputs": ["$TURBO_DEFAULT$", "../../docs/dsl.md", "../../quirks/**"],
+      "outputs": ["out/**", "content/docs/reference/*.md"],
+      "env": ["DOCS_BASE_PATH"]
+    }
+  }
+}

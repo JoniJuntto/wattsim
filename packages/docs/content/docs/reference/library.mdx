@@ -1,0 +1,83 @@
+---
+title: Library API overview
+description: The TypeScript packages under every wattsim surface, and how to drive a station or a scenario from code.
+---
+
+The CLI, the browser UI, the MCP server and the scenario language are thin adapters over one TypeScript library. When a test needs computation the DSL deliberately lacks (a loop over a CSV of tags, a reply computed from a database), write it against the library.
+
+The packages are Bun workspaces under `packages/`. They are not published to npm yet; from a checkout, import a package's source directly (`./packages/core/src/index.ts`) or add it as a `workspace:*` dependency of a package in the repo.
+
+## Packages
+
+| Package | What it holds |
+|---|---|
+| `@wattsim/protocol` | OCPP-J framing (including the 2.1 CALLRESULTERROR and SEND message types), the vendored OCA schemas for 1.6, 2.0.1 and 2.1, and the Zod validators generated from them. `validatePayload(version, action, direction, payload)`, `decodeFrame`, `encodeFrame` |
+| `@wattsim/core` | Clocks (`WallClock`, `VirtualClock`, `SkewedClock`), the EV and meter models, the WebSocket connection with chaos middleware, the `Station` state machine and its version adapters, Prometheus metrics |
+| `@wattsim/scenario` | The DSL: lexer, parser, AST, formatter, interpreter, quirk linking and JUnit output |
+| `@wattsim/csms` | The [CSMS simulator](/docs/reference/csms) and conformance checker |
+| `@wattsim/pki` | The [test certificate authority](/docs/reference/security): certificates, CSR signing, OCSP |
+| `@wattsim/trace` | [Open OCPP Trace](/docs/reference/trace) reading and writing, the recording proxy, replay, trace-to-scenario |
+| `@wattsim/server` | The local UI server: HTTP API and browser stream over the core, the built-in test CSMS, session export |
+| `@wattsim/mcp` | The [MCP server](/docs/guides/mcp) |
+| `wattsim` | The CLI |
+
+## Drive a station
+
+```ts
+import { Station, WallClock } from '@wattsim/core';
+
+const station = new Station({
+  id: 'CP-1',
+  version: 'ocpp2.0.1',
+  csmsUrl: 'ws://localhost:9000/ocpp',   // the station connects to <csmsUrl>/CP-1
+  clock: new WallClock(),
+  evses: 2,
+});
+station.on('frame', (direction, frame) => console.log(direction, frame));
+station.on('violation', (v) => console.error('violation', v));
+
+await station.connect();
+await station.boot();
+await station.plugIn(1, { batteryKwh: 75, initialSoc: 0.2, targetSoc: 0.8 });
+await station.startTransaction(1, 'TAG-1');
+// ... meter values flow at meterIntervalMs (default 60 s)
+await station.stopTransaction(1);
+await station.unplug(1);
+await station.disconnect();
+```
+
+`StationConfig` also takes `vendor`, `model`, `serial`, `firmware`, `heartbeatMs`, `meterIntervalMs`, `voltageV`, `maxCurrentA`, `phases`, `basicAuth`, `security`, `chaos` (a `ChaosEngine`), `strict`, `requestTimeoutMs`, `reconnect` and `maxQueue`. `station.sendRaw(action, payload)` sends any CALL, and `station.interceptCall(fn)` answers inbound CALLs before the built-in handler does, which is what a scenario's `on` compiles to.
+
+Every state change goes through the same validation as a scenario: an invalid payload is reported as a violation, and an illegal transition (a stop with no transaction) throws.
+
+## Run a scenario from code
+
+```ts
+import { VirtualClock } from '@wattsim/core';
+import { driveVirtual, parse, run, toJUnit } from '@wattsim/scenario';
+
+const file = 'examples/basic.ws';
+const scenario = parse(await Bun.file(file).text(), file);
+const clock = new VirtualClock(Date.now());
+
+const result = await driveVirtual(clock, run(scenario, { clock, file, csmsUrl: 'ws://localhost:9000/ocpp', seed: 1 }));
+console.log(result.ok ? 'passed' : 'failed', result.stations.length, 'stations');
+await Bun.write('basic.xml', toJUnit(result));
+```
+
+`run` resolves when every station has finished. With a `VirtualClock`, `driveVirtual` advances the clock whenever the stations are idle, which is what `wattsim run --virtual` does; with a `WallClock` just await `run`. `RunOptions` also takes `speed`, `onEvent` (every frame, log line, assertion and violation as it happens), `signal` to abort, and `quirkFiles` / `quirks` like `--quirk`.
+
+## Clocks
+
+Every component takes a `Clock`, never `Date.now()`. `VirtualClock` only moves when you call `advance(ms)`, `advanceTo(epochMs)` or `runUntilIdle(maxMs)`, and fires timers in due-time order, so a test can step a four hour session deterministically. `SkewedClock` wraps another clock with an offset and a drift in ppm, which is how a scenario's `clock skew` and `clock drift` work.
+
+## Validation
+
+```ts
+import { validatePayload } from '@wattsim/protocol';
+
+const r = validatePayload('ocpp1.6', 'StartTransaction', 'request', { connectorId: 1, idTag: 'TAG-1' });
+if (!r.ok) for (const v of r.violations) console.log(v.path, v.message);
+```
+
+The validators are generated from the OCA schemas at build time (`bun run build`) into a gitignored folder.

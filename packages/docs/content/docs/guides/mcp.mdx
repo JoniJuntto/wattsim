@@ -1,0 +1,77 @@
+---
+title: Drive wattsim from Claude via MCP
+description: Connect wattsim's MCP server to Claude Code or another MCP client and test a CSMS by asking for it in plain words.
+---
+
+`wattsim mcp` serves wattsim over the [Model Context Protocol](https://modelcontextprotocol.io) on stdio. An agent connected to it can create charge points, plug in EVs, start and stop sessions, inject faults, read the OCPP traffic and run whole scenarios. It is useful for exploratory testing ("what does our CSMS do if the charger reboots mid-session?") and for having an agent write the scenario that reproduces a bug.
+
+## Connect it
+
+From a wattsim checkout, with Claude Code:
+
+```sh
+claude mcp add wattsim -- bun /path/to/wattsim/packages/cli/src/index.ts mcp
+```
+
+Once wattsim is published to npm this becomes `claude mcp add wattsim -- bunx wattsim mcp`.
+
+Any other MCP client takes the same command in its server configuration:
+
+```json
+{
+  "mcpServers": {
+    "wattsim": {
+      "command": "bun",
+      "args": ["/path/to/wattsim/packages/cli/src/index.ts", "mcp"]
+    }
+  }
+}
+```
+
+## Watch what the agent does
+
+`wattsim mcp` starts the same local server as `wattsim ui` on a free port and prints its address to stderr:
+
+```
+wattsim mcp: serving http://127.0.0.1:53817 (open it in a browser to watch)
+```
+
+Open it and every station the agent creates appears in the [UI](/docs/ui), with its EVSEs and live message log. You can click along: the agent and you drive the same stations.
+
+To have the agent work on a UI you already have open, start `wattsim ui` yourself and register the server with `--attach`:
+
+```sh
+claude mcp add wattsim -- bun /path/to/wattsim/packages/cli/src/index.ts mcp --attach http://127.0.0.1:7700
+```
+
+`--port <n>` fixes the embedded server's port instead of picking a free one.
+
+## Point it at your CSMS
+
+Stations default to the built-in test CSMS, which accepts everything, so an agent can charge an EV with nothing else running. To test your own CSMS, say so in the request: `create_station` and `run_scenario` take a `csmsUrl`.
+
+## Things to ask
+
+> Create three OCPP 2.0.1 stations CP-1 to CP-3 against ws://localhost:9000/ocpp. Plug an EV into CP-2, start a session with tag TAG-7, and tell me what TransactionEvents our CSMS answered.
+
+> Add a chaos rule to CP-1 that drops every second MeterValues, charge for a while, and check whether the CSMS asks for missing meter data.
+
+> Write a scenario in which a 1.6 station answers every RemoteStartTransaction with Rejected, run it against ws://localhost:9000/ocpp, and tell me what our CSMS did after the rejection.
+
+> Export what we just did as a scenario and run it again on a virtual clock.
+
+The last one is often the point of the session: `export_session` turns everything done so far, by the agent or by you in the UI, into a `.ws` scenario, and `run_scenario` runs scenario text against a CSMS and returns per-station assertions, violations and the first frames of any failing station. The result is a regression test you can commit and run with `wattsim run`.
+
+## What the agent gets
+
+The tools an agent uses most:
+
+| Tool | What it does |
+|---|---|
+| `create_station` | One station or a numbered `CP-{i}` fleet; connects, boots and waits for the boot to be accepted |
+| `station_action` | plug, start, stop, unplug, authorize, status, send any OCPP CALL, and the rest of the UI's actions |
+| `add_chaos_rule` | Drop, delay, duplicate, corrupt or answer wrongly a station's frames |
+| `get_frames` | A station's OCPP messages, filtered by action, direction and sequence number |
+| `run_scenario` | Run scenario text on a virtual clock and return the results |
+
+The [MCP tools reference](/docs/reference/mcp-tools) lists every tool with its parameters, generated from the server itself. The server also exposes `wattsim://docs/dsl`, the [scenario DSL reference](/docs/reference/dsl), so the agent can write scenarios without guessing the syntax.

@@ -1,0 +1,96 @@
+---
+title: Emulate a misbehaving charger
+description: Apply quirk profiles to simulated stations, write your own, and draft one from a recording.
+---
+
+Real chargers bend the spec in ways a CSMS has to survive: a heartbeat every 15 seconds whatever the CSMS asks for, StatusNotifications that lag the state they report, a remote stop answered Accepted and then ignored. A quirk profile packs one such behavior into a named block of the scenario DSL, so any simulated station can borrow it, and a fleet can carry a realistic mix.
+
+## Apply one
+
+The repository ships six generic profiles in `quirks/`:
+
+| Profile | What the station does |
+|---|---|
+| `slow-boot` | Sends every BootNotification 20 s late, retries after Pending included, and keeps a one-hour heartbeat whatever the CSMS asks for |
+| `lossy-meter` | Loses every third MeterValues on the way to the CSMS |
+| `chatty-heartbeat` | Sends a Heartbeat every 15 s and ignores the interval in the BootNotification answer |
+| `ignores-remote-stop` | Answers RemoteStopTransaction (1.6) and RequestStopTransaction (2.x) with Accepted and keeps charging |
+| `clock-drift` | Starts 90 s fast and gains 2000 ppm |
+| `late-status` | Sends each StatusNotification 10 s after the change it reports |
+
+Apply profiles to every station of a scenario from the command line:
+
+```sh
+wattsim run examples/basic.ws --virtual --quirk quirks/late-status.ws
+wattsim run fleet.ws --virtual --quirk quirks/chatty-heartbeat.ws --quirk quirks/lossy-meter.ws
+```
+
+A `.ws` value loads the file and applies every quirk it declares; any other value names one quirk from a file loaded earlier (`--quirk lib.ws --quirk late-status`). `--quirk` is repeatable and applies in order, before each station's own statements.
+
+Or choose per station inside the scenario:
+
+```
+wattsim 1
+
+import "../quirks/late-status.ws"
+import "../quirks/lossy-meter.ws"
+
+station "CP-{i}" for i in 1..100 {
+  version 1.6
+  choose {
+    80%: {
+      log "well-behaved"
+    }
+    20%: {
+      use quirk "late-status"
+      use quirk "lossy-meter"
+    }
+  }
+  boot
+}
+```
+
+`import` paths resolve against the importing file. A quirk's statements run where `use quirk` stands, so a later `heartbeat 30s` in the station overrides the quirk's, and `chaos` rules and `on` replies accumulate in the order they run.
+
+## Write one
+
+A quirk is a top-level `quirk "name" { ... }` block. It may hold configuration (`heartbeat`, `meterInterval`, `vendor`, `model`, `serial`, `evses`, `connectors`, `auth`), `chaos` rules, `on` replies, `clock skew` and `clock drift`, and `log`. Statements that act, such as `boot`, `wait` or `ev plug`, are a parse error inside one: the scenario drives the station, the quirk only shapes how it behaves.
+
+```
+wattsim 1
+
+// Answers a remote stop with Accepted, then keeps charging.
+quirk "ignores-remote-stop" {
+  on RemoteStopTransaction always {
+    reply {status: "Accepted"}
+  }
+  on RequestStopTransaction always {
+    reply {status: "Accepted"}
+  }
+}
+```
+
+A scripted `on` reply replaces the station's built-in handler and has no side effects, which is exactly the misbehavior here: the CSMS is told the stop was accepted and the transaction carries on. Check a profile like any scenario:
+
+```sh
+wattsim check quirks/my-quirk.ws
+wattsim fmt --check quirks/my-quirk.ws
+```
+
+When a behavior needs code (a reboot after a firmware update, a reply computed from the request), write a plugin and load it with `use plugin "./my-quirk.ts"`. It gets the core `Station` when the station is created, so it can listen to frames, intercept CALLs or drive the station. A plugin is local code that runs with your permissions. The [DSL reference](/docs/reference/dsl#quirk-profiles) has the full syntax.
+
+## Draft one from a recording
+
+Record the charger through the [proxy](/docs/guides/record-replay), then:
+
+```sh
+wattsim quirk derive session.jsonl -o draft.ws
+```
+
+`derive` runs every frame through the [conformance checker](/docs/guides/conformance) and writes a quirk named `derived`. Comments at the top list each finding with its spec reference and trace line. The block holds what the trace shows: `vendor`, `model` and `serial`, the heartbeat and meter intervals, the clock offset and drift, `on` replies for CSMS CALLs the charger refused or answered with an invalid payload, and `chaos` rules for CALLs it never answered, frames it sent twice and meter samples missing from a regular series. A finding no DSL statement reproduces becomes a `// TODO` line. The draft passes `check` and `fmt --check`.
+
+Edit the draft before using it: delete what is ordinary behavior of that recording, rename the quirk after what the station does, and remove the vendor, model and serial lines if you plan to share it.
+
+## No vendor names
+
+The project ships no profile named after a vendor or a product. A profile is named after what the station does (`late-status`, not the model that does it): real chargers differ by firmware version, configuration and site, and a brand on a profile would read as a claim about every unit of that brand. [quirks/README.md](https://github.com/JoniJuntto/wattsim/blob/main/quirks/README.md) explains how to contribute one.

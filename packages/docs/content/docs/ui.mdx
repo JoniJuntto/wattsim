@@ -1,0 +1,49 @@
+---
+title: UI tour
+description: The local browser UI for clicking through charging sessions, reading the message log and exporting what you did as a scenario.
+---
+
+```sh
+wattsim ui
+```
+
+One local process serves the UI on `http://127.0.0.1:7700` and opens a browser. There is no login: it binds to the loopback interface by default (`--host` changes that, `--port` the port, `--no-open` skips the browser). Everything you do drives real simulated stations over real WebSockets, the same ones a scenario uses.
+
+The screenshots on this page follow the site's light or dark theme; the UI has both, plus a "follow the system" setting in the top bar.
+
+## Fleet
+
+<Screenshot name="fleet" alt="The fleet page: six stations with their EVSE status chips, power, connection state and CSMS host, above a bar showing how many connectors are in each status." />
+
+The fleet page lists every station. The bar at the top counts connectors by status across the fleet, with the legend under it. Each card shows the station's OCPP version, one chip per EVSE colored by status, the power it is delivering, its connection state, the CSMS host and, when there are any, its chaos rules and violations.
+
+**Add station** opens a form for one station or a numbered range (`CP-{i}` from 1 to 50, say), with the CSMS URL, OCPP version, number of EVSEs, vendor and model, heartbeat and meter intervals, voltage, phases, maximum current and Basic auth credentials. Switch on the built-in test CSMS to try everything with no CSMS of your own: it accepts every request.
+
+## Station
+
+<Screenshot name="station" alt="A station page: an EVSE card charging at 16 kW with the EV's state of charge, next to the message log with paired requests and replies." />
+
+A station page has the controls on the left and the message log on the right.
+
+Each EVSE card shows the connector status and transaction id, the power being delivered against what is offered and the smart-charging limit in force, the energy of the session and a power sparkline. Below it is the EV: plug one in with a battery size, state of charge, target and maximum power, then authorize a tag and start a transaction. **Ready to charge**, **Suspend** and **Resume** drive the EV side (IEC 61851 states), so you can produce SuspendedEV while the CSMS thinks the session is running. **Set status** forces a connector status, Faulted for example, and sends the StatusNotification.
+
+The header has **Disconnect**, **Boot** and **Heartbeat** for the connection itself. Further down the page:
+
+- **Send message** sends any OCPP CALL. Pick the action, edit the JSON payload, and it is checked against the schema for the station's version as you type.
+- **Chaos rules** adds fault injection rules: drop, delay, duplicate or corrupt frames, answer with a wrong message id or a CALLERROR, or swallow a CALL so it is never answered. A rule can match every frame, only the n-th, every n-th or a random share, in one direction or both, for one action or all.
+
+## Message log
+
+<Screenshot name="message-log-gutter" alt="Close-up of the message log: each row has a small sequence diagram with a CP lane and a CSMS lane, arrows for the request and the dashed reply, and problem rows highlighted in red." />
+
+The log is drawn as a sequence diagram. Each row is one exchange: the gutter has a lane for the charge point and one for the CSMS, a solid arrow for the request in the direction it travelled and a dashed arrow underneath for the reply. Rows with a CSMS-initiated CALL point the other way, so a SetChargingProfile or a RemoteStartTransaction stands out among the MeterValues.
+
+Next to the gutter are the action, the request payload, the reply (when it says something worth reading, such as `{"status":"Rejected"}`) and the round-trip time. Rows with a problem are highlighted: a CALLERROR such as `NotImplemented`, a schema violation in either payload, a malformed frame, or a reply that answers no CALL. **Problems** filters the log down to those rows. The search box matches action names, message ids and payload text, and the direction buttons show only what the station sent or only what the CSMS sent. Click a row to see both frames in full, with violations pointing at the offending field.
+
+## Export session
+
+**Export session** in the top bar downloads everything you clicked, across all stations, as a `session.ws` scenario. Run it with `wattsim run session.ws` to repeat the session, or use it as the starting point of a test: add `expect` lines, multiply a station into a fleet, add chaos rules.
+
+## Same server, other clients
+
+The UI talks to a local HTTP API and one WebSocket that streams station state. The [MCP server](/docs/guides/mcp) drives the same API, so stations an agent creates show up in the UI while it works, and you can click along.

@@ -1,0 +1,91 @@
+---
+title: Getting started
+description: Install wattsim, run a first scenario against your CSMS, and read the result.
+---
+
+## Install
+
+wattsim needs [Bun](https://bun.sh) 1.4 or newer. Until the packages are published to npm, run it from a checkout:
+
+```sh
+git clone https://github.com/JoniJuntto/wattsim.git
+cd wattsim
+bun install
+bun run build    # generates the Zod validators from the vendored OCA schemas and builds the UI
+```
+
+The commands on this site are written as `wattsim <command>`. From a checkout that is `bun packages/cli/src/index.ts <command>`; an alias saves typing:
+
+```sh
+alias wattsim="bun $PWD/packages/cli/src/index.ts"
+```
+
+## Run a scenario
+
+A scenario is a `.ws` file: a version header, the CSMS to connect to, and one or more station blocks. This is `examples/basic.ws`, one OCPP 1.6 station going through a full charging session with an assertion on every step:
+
+```
+// One charging session on an OCPP 1.6 station, checking each step.
+wattsim 1
+
+csms "ws://localhost:9000/ocpp"
+
+station "CP-1" {
+  version 1.6
+  heartbeat 1min
+  meterInterval 30s
+  boot
+  expect result BootNotification {status: "Accepted"} within 10s
+  ev plug evse 1 { battery 60kWh soc 20% target 80% }
+  expect StatusNotification {status: "Preparing"} within 5s
+  authorize "TAG-1"
+  expect Authorize {idTagInfo: {status: "Accepted"}} within 5s
+  start evse 1 tag "TAG-1"
+  expect call StartTransaction within 5s
+  expect StatusNotification {status: "Charging"} within 5s
+  // Charge for half an hour; at a 30 s meter interval MeterValues keep coming.
+  wait 30min
+  expect MeterValues {connectorId: 1} within 30s
+  stop evse 1
+  expect call StopTransaction within 5s
+  ev unplug evse 1
+  expect StatusNotification {status: "Available"} within 5s
+}
+```
+
+Check that it parses, then run it against your CSMS:
+
+```sh
+wattsim check examples/basic.ws
+wattsim run examples/basic.ws --csms ws://localhost:9000/ocpp --virtual
+```
+
+`--csms` overrides the `csms` line in the file. The station connects to the URL with its name appended (`ws://localhost:9000/ocpp/CP-1`), the way chargers identify themselves in OCPP-J.
+
+`--virtual` runs the scenario on a virtual clock that jumps to the next scheduled event as soon as the stations are idle, so the 30 minute `wait` takes milliseconds. Leave it out to run in real time, or use `--speed 10` to run ten times faster on the wall clock.
+
+## Read the output
+
+`run` prints one line per frame as it crosses the socket, then a table with one row per station: whether it passed, how many of its `expect` assertions held, how long it ran in scenario time, and the first error. The exit code is 0 only if every assertion passed and no station failed, 1 if any did, and 2 if the scenario could not start (a parse error, or two stations with the same name). That makes `wattsim run` usable as a CI step on its own:
+
+```sh
+wattsim run examples/basic.ws --csms "$CSMS_URL" --virtual --quiet --junit wattsim.xml
+```
+
+`--quiet` drops the per-frame lines and `--junit` writes one test case per station for your CI's test report view.
+
+## No CSMS yet?
+
+To try wattsim with nothing else running, start the browser UI and switch on the built-in test CSMS when you add a station:
+
+```sh
+wattsim ui
+```
+
+It serves on `http://127.0.0.1:7700` and opens a browser. See the [UI tour](/docs/ui).
+
+## Next
+
+- [Test your CSMS against 1000 chargers](/docs/guides/load-test): fleets, distributions, fault injection and metrics.
+- [Scenario DSL reference](/docs/reference/dsl): every statement.
+- [CLI reference](/docs/reference/cli): every command and flag.
