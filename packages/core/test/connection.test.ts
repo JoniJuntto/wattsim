@@ -36,17 +36,21 @@ function make(opts: Partial<ConstructorParameters<typeof Connection>[0]> = {}): 
 /**
  * Connect a fresh Connection, retrying when the host refuses the local socket (ephemeral-port exhaustion). The
  * reconnect backoff runs on the virtual clock, which no test advances during open, so a refused first open would
- * otherwise hang until the 5 s test timeout.
+ * otherwise hang until the 5 s test timeout. The whole retry budget (OPEN_ATTEMPTS x OPEN_WAIT_MS) stays well under
+ * that timeout, so a give-up is reported by this helper and never left running between tests.
  */
+const OPEN_ATTEMPTS = 4;
+const OPEN_WAIT_MS = 800;
+
 async function connected(opts: Partial<ConstructorParameters<typeof Connection>[0]> = {}): Promise<Connection> {
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < OPEN_ATTEMPTS; attempt++) {
     const conn = make(opts);
     const opened = await Promise.race([
       conn.connect().then(
         () => true,
         () => false,
       ),
-      Bun.sleep(1500).then(() => false),
+      Bun.sleep(OPEN_WAIT_MS).then(() => false),
     ]);
     if (opened) return conn;
     await conn.disconnect();
@@ -57,13 +61,13 @@ async function connected(opts: Partial<ConstructorParameters<typeof Connection>[
 
 /** `conn.connect()` with the same refused-socket retry as `connected()`, for tests that attach listeners first. */
 async function openConn(conn: Connection): Promise<void> {
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < OPEN_ATTEMPTS; attempt++) {
     const opened = await Promise.race([
       conn.connect().then(
         () => true,
         () => false,
       ),
-      Bun.sleep(1500).then(() => false),
+      Bun.sleep(OPEN_WAIT_MS).then(() => false),
     ]);
     if (opened) return;
     await conn.disconnect();

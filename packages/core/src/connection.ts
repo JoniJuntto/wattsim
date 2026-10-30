@@ -468,17 +468,19 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       this.handleSend(frame);
       return;
     }
-    const p = this.inflight;
-    if (!p || p.id !== frame.id) {
-      // A CALLRESULTERROR normally answers a CALLRESULT this side sent, which has nothing pending to settle.
-      const message =
-        frame.type === MessageType.CallResultError
-          ? `CALLRESULTERROR ${frame.code} for message ${frame.id}${frame.description ? `: ${frame.description}` : ''}`
-          : `unexpected message id ${frame.id} (no matching CALL in flight)`;
-      this.emit('error', new Error(message));
+    if (frame.type === MessageType.CallResultError) {
+      // OCPP 2.1 part 4: a CALLRESULTERROR only ever answers a CALLRESULT this side sent, so it never settles a
+      // pending CALL, even one with the same id (that would be a CSMS protocol error; the CALL waits for its reply).
+      const detail = frame.description ? `: ${frame.description}` : '';
+      this.emit('error', new Error(`CALLRESULTERROR ${frame.code} for message ${frame.id}${detail}`));
       return;
     }
-    if (frame.type === MessageType.CallError || frame.type === MessageType.CallResultError) {
+    const p = this.inflight;
+    if (!p || p.id !== frame.id) {
+      this.emit('error', new Error(`unexpected message id ${frame.id} (no matching CALL in flight)`));
+      return;
+    }
+    if (frame.type === MessageType.CallError) {
       this.settle(p, () => p.reject(new CallError(p.action, frame.code, frame.description, frame.details)));
       return;
     }

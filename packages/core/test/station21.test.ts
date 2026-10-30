@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { CallFrame, Frame, v21 } from '@wattsim/protocol';
 import { CALL_ERROR_CODES, MessageType, validatePayload } from '@wattsim/protocol';
 import type { StationConfig } from '../src/index';
-import { CallError, Station, VirtualClock } from '../src/index';
+import { Station, VirtualClock } from '../src/index';
 import { FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
@@ -234,8 +234,11 @@ describe('Station 2.1: transactions', () => {
 });
 
 describe('Station 2.1: CALLRESULTERROR and SEND', () => {
-  test('a CALLRESULTERROR for the CALL in flight rejects it like a CALLERROR', async () => {
+  test('a CALLRESULTERROR carrying the id of the CALL in flight is a CSMS protocol error, not its answer', async () => {
+    // OCPP 2.1 part 4: CALLRESULTERROR only answers a CALLRESULT. The CALL stays pending for its real reply.
     const station = await booted();
+    const errors: Error[] = [];
+    station.on('error', (e) => errors.push(e));
     csms.respondWith('Heartbeat', () => undefined);
     const pending = station.request('Heartbeat', {});
     pending.catch(() => {});
@@ -248,12 +251,12 @@ describe('Station 2.1: CALLRESULTERROR and SEND', () => {
       description: 'oops',
       details: {},
     });
-    const err = await pending.then(
-      () => undefined,
-      (e: unknown) => e,
-    );
-    expect(err).toBeInstanceOf(CallError);
-    expect(err).toMatchObject({ action: 'Heartbeat', code: 'InternalError', description: 'oops' });
+    await until(() => errors.length === 1);
+    expect(errors[0]?.message).toContain('CALLRESULTERROR InternalError');
+    expect(station.pendingRequests).toBe(1);
+    const currentTime = new Date(clock.now()).toISOString();
+    csms.send('CS1', { type: MessageType.CallResult, id, payload: { currentTime } });
+    expect(await pending).toEqual({ currentTime });
     expect(station.pendingRequests).toBe(0);
   });
 

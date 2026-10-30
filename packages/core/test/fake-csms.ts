@@ -194,12 +194,13 @@ export class FakeCsms {
       void this.handleCall(ws, frame);
       return;
     }
+    // Only a CALLRESULT or CALLERROR answers a CALL; SEND and CALLRESULTERROR (2.1) are recorded above and settle nothing.
+    if (frame.type !== MessageType.CallResult && frame.type !== MessageType.CallError) return;
     const pending = this.pendingCalls.get(frame.id);
     if (!pending) return;
     this.pendingCalls.delete(frame.id);
     if (frame.type === MessageType.CallResult) pending.resolve(frame.payload);
-    else if (frame.type === MessageType.CallError)
-      pending.reject(new Error(`CALLERROR ${frame.code}: ${frame.description}`));
+    else pending.reject(new Error(`CALLERROR ${frame.code}: ${frame.description}`));
   }
 
   private async handleCall(ws: Socket, call: CallFrame): Promise<void> {
