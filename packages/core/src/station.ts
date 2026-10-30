@@ -152,8 +152,14 @@ export type StartOptions = {
 export const DEFAULT_ID_TAG = 'WATTSIM';
 export const MAX_TX_SAMPLES = 1000;
 const RESET_DELAY_MS = 1000;
+/** Longest delay `setTimeout` honours; longer ones fire almost at once. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 const BOOT_RETRY_FALLBACK_MS = 60_000;
 const MANUAL_STATUSES: ReadonlySet<ConnectorStatus> = new Set<ConnectorStatus>(['Faulted', 'Reserved']);
+/** What a call interceptor answers with; `undefined` lets the next interceptor (or the adapter) handle the CALL. */
+export type CallAnswer = { result: unknown } | { error: [code: string, description: string] } | undefined;
+export type CallInterceptor = (call: CallFrame) => CallAnswer;
+
 const ADAPTERS: Record<OcppVersion, VersionAdapter> = { 'ocpp1.6': ocpp16, 'ocpp2.0.1': ocpp201, 'ocpp2.1': ocpp21 };
 
 function toError(err: unknown): Error {
@@ -209,6 +215,8 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
    */
   private bootHold = false;
   private held: Array<() => void> = [];
+  /** Installed by `interceptCall`; undefined (not empty) when there are none, so the inbound path pays one check. */
+  private interceptors: CallInterceptor[] | undefined;
 
   constructor(cfg: StationConfig) {
     super();
@@ -418,6 +426,20 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   }
 
   // ---- OCPP side -------------------------------------------------------------------------------------------
+
+  /**
+   * Answer inbound CALLs before the adapter. Interceptors run in install order; the first that returns an
+   * answer wins and the built-in handler is skipped. `undefined` falls through. A `{result}` is sent like an
+   * adapter result (strict mode validates it and reports violations); an `{error}` is sent as a CALLERROR.
+   * Neither has side effects on the station. Returns an uninstall function.
+   */
+  interceptCall(fn: CallInterceptor): () => void {
+    this.interceptors = [...(this.interceptors ?? []), fn];
+    return () => {
+      const rest = this.interceptors?.filter((f) => f !== fn);
+      this.interceptors = rest && rest.length > 0 ? rest : undefined;
+    };
+  }
 
   async authorize(idTag: string): Promise<boolean> {
     const res = await this.request('Authorize', this.adapter.authorizePayload(idTag));
@@ -684,6 +706,16 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   }
 
   private onCall(call: CallFrame, reply: (r: unknown) => void, error: (code: string, description: string) => void) {
+    if (this.interceptors) {
+      // Install and uninstall replace the array, so a one-shot interceptor removing itself cannot disturb this loop.
+      for (const fn of this.interceptors) {
+        const answer = fn(call);
+        if (answer === undefined) continue;
+        if ('error' in answer) error(answer.error[0], answer.error[1]);
+        else reply(answer.result);
+        return;
+      }
+    }
     const outcome = this.adapter.handleCall(this, call);
     if (outcome === null) {
       error('NotImplemented', `${call.action} is not supported by this station`);
@@ -769,10 +801,15 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     if (empty) return;
     const next = this.charging.nextChange(now);
     if (next === undefined) return;
-    this.limitTimer = this.clock.setTimeout(() => {
-      this.limitTimer = undefined;
-      this.updateLimits();
-    }, next - now);
+    // Timers clamp delays above 2^31-1 ms to ~1 ms (a validTo a month ahead would spin): wake up early instead;
+    // updateLimits finds nothing changed and re-arms for the remainder.
+    this.limitTimer = this.clock.setTimeout(
+      () => {
+        this.limitTimer = undefined;
+        this.updateLimits();
+      },
+      Math.min(next - now, MAX_TIMER_MS),
+    );
   }
 
   private deriveStatus(evse: EvseState): ConnectorStatus {

@@ -104,7 +104,12 @@ station "CP-{i}" for i in 1..200 {
 }
 ```
 
-`station NAME { ... }` declares one station. Adding `for VAR in FROM..TO` instantiates the block once per integer in the inclusive range, with `VAR` bound for string interpolation and as a statement argument (`start evse i`). `FROM` and `TO` are integers or `let` names (`for i in 1..size`). The range end must not be before the start. The parser does not check that the name actually uses `{VAR}`; a template whose name is constant yields duplicate station names at run time.
+`station NAME { ... }` declares one station. Adding `for VAR in FROM..TO` instantiates the block once per integer in the inclusive range, with `VAR` bound for string interpolation and as a statement argument (`start evse i`). `FROM` and `TO` are integers or `let` names (`for i in 1..size`). The range end must not be before the start.
+
+The station name is its OCPP identity, so every instance needs its own:
+
+- A template name must use its loop variable: `station "CP-1" for i in 1..3` is a parse error at the name, `station name "CP-1" does not use the loop variable {i}: every instance of the range would get the same name`.
+- Two blocks must not produce the same name. Two literal names (`station "CP-1"` twice) are a parse error. Names that depend on `let`s or ranges are compared when the run starts, before anything connects: `station "CP-{i}" for i in 1..3` next to `station "CP-{n}" for n in 3..4` fails `wattsim run` with `file:7:9: duplicate station name "CP-3": the station block at 3:1 has it` and exit code 2.
 
 ## Statements
 
@@ -204,7 +209,13 @@ on Reset {
 
 `on ACTION [pattern] [always] { reply PAYLOAD }` or `{ error CODE ["description"] }` answers the next inbound CSMS CALL of `ACTION` whose payload matches `pattern` (a partial match, as in `expect`) with the given CALLRESULT payload or CALLERROR, instead of the station's built-in handler. With `always` the handler stays installed for every later match. A `{` after the action opens the handler body unless it starts with `key:`, which makes it the pattern.
 
-Not yet runnable: `on` parses, formats and is documented, but running it fails the station with `LINE:COL: 'on' is not supported yet` until the core offers a hook to answer an inbound CALL.
+- `on` returns at once; the handler is installed for the rest of the station's life (or until its one match). Written before `boot` it is installed when the station is created, so it also covers CALLs that arrive right after boot.
+- A CALL that matches no handler goes to the built-in one. Handlers are tried in the order their `on` statements ran; the first match answers.
+- A scripted answer has no side effects: `on Reset { reply {status: "Accepted"} }` answers Accepted and the station does not reset. Use ordinary statements for the behaviour you want.
+- Variables in the pattern, the payload and the description are resolved when a CALL arrives. One that cannot be resolved then fails the station, and the CALL gets an `InternalError` CALLERROR.
+- Strict mode applies to the reply: a payload that violates the response schema is still sent, and reported as a violation (`on Reset { reply {status: "Maybe"} }`). The CALLERROR code must be one the station's OCPP version defines; another code fails the station when `on` runs, for example `7:5: 'Bogus' is not a CALLERROR code in ocpp1.6 (...)`.
+- An inbound CALL that fails strict validation is answered with the precise CALLERROR before any handler sees it.
+- The scripted CALLRESULT or CALLERROR is an outbound frame like any other: `expect result Reset {status: "Rejected"}` matches it.
 
 ### Timing and concurrency
 
@@ -233,7 +244,7 @@ choose {
 }
 ```
 
-Picks exactly one branch per station instance. Weights are percentages, decimals allowed (`33.3%`), and must sum to 100 (checked at parse time; `60%` alone or `70.5%` with `29%` is an error). The choice uses a seeded RNG derived from the station name and the run's `--seed`, so a fleet file produces the same split on every run.
+Picks exactly one branch per station instance. Weights are percentages, decimals allowed (`33.3%`), and must sum to 100 (checked at parse time; `60%` alone or `70.5%` with `29%` is an error). The choice is drawn like a [distribution](#distributions) sample, from the run's `--seed`, the station name, the statement and how often it has run, so a fleet file produces the same split on every run.
 
 ### Distributions
 
@@ -253,7 +264,7 @@ Anywhere a duration is taken, a distribution may stand in for it:
 | `uniform(MIN, MAX)` | Uniform between `MIN` and `MAX`; `MAX` must not be below `MIN`. |
 | `exp(MEAN)` | Exponential with mean `MEAN` (waiting time between random events). |
 
-Arguments are durations or variables. A sample is rounded to whole milliseconds and clamped at 0. Each time its statement runs, a distribution is sampled from an RNG seeded by the run's `--seed`, the station name, the statement's position in the file and how many times that statement has sampled before. A run is therefore reproducible for a given seed, every station and every loop iteration gets its own draw, and adding a statement elsewhere does not shift the samples. Configuration that is applied once (`heartbeat`, `meterInterval`, `chaos delay`, `net delay`) samples once.
+Arguments are durations or variables. A sample is rounded to whole milliseconds and clamped at 0. Each time its statement runs, a distribution is sampled from an RNG seeded by the run's `--seed`, the station name, the statement's position in the file, where it runs from and how many times it has sampled there before. "Where it runs from" is the station body, or an `at` branch (which `at`, and which time it fired), or a proc (which `call`, and which time that call ran), nested. A run is therefore reproducible for a given seed, every station and every loop iteration gets its own draw, adding a statement elsewhere does not shift the samples, and two `at` branches calling the same proc get the same draws whichever reaches it first. Configuration that is applied once (`heartbeat`, `meterInterval`, `chaos delay`, `net delay`) samples once.
 
 ### Network
 
@@ -265,15 +276,15 @@ net delay 2s for 1min
 
 `net drop DUR` hard-closes the WebSocket and reconnects after the duration. Messages generated meanwhile (MeterValues, StopTransaction) are queued and flushed in order on reconnect, following the offline behaviour of the spec version in use. The statement takes `DUR` to complete.
 
-`net delay DUR [for WINDOW]` adds `DUR` of latency to every frame in both directions, so a request and its answer take `2 x DUR` longer. It returns at once. Without `for` the delay lasts until the station finishes; with `for WINDOW` it is lifted after `WINDOW`, and the station counts as finished only after that, as with an `at` block. Under the hood it is a `chaos delay` rule for every frame, appended after the rules declared so far: a chaos rule declared before it still wins for the frames it matches, while a chaos rule declared after it never fires while the delay is in force.
+`net delay DUR [for WINDOW]` adds `DUR` of latency to every frame in both directions, so a request and its answer take `2 x DUR` longer. It returns at once. Without `for` the delay lasts until the station finishes; with `for WINDOW` it is lifted after `WINDOW`, and the station counts as finished only after that, as with an `at` block. Under the hood it is a `chaos delay` rule for every frame. A delay composes with the other chaos faults (see [`chaos`](#chaos)), so `chaos` rules declared before or after `net delay` keep firing: a frame they match is held for the delay first, then dropped, duplicated and so on.
 
 ### `chaos`
 
 ```
-chaos FAULT [<dur>] [in|out] [ACTION] [nth N | every N | probability P%] [once]
+chaos FAULT [<dur>] [in|out] [ACTION] [nth N | every N [from M]] [probability P%] [once]
 ```
 
-Adds a fault-injection rule to this station's pipeline. Rules are evaluated in declaration order on every frame; the first match wins. The statement usually sits before `boot` so BootNotification is covered too.
+Adds a fault-injection rule to this station's pipeline. Rules are evaluated in declaration order on every frame; the first match wins, with one exception: `delay` composes with the other faults. A frame gets at most one delay (from the first `delay` rule it matches) and at most one other fault (from the first other rule it matches), whichever order they were declared in. With both, the frame is held for the delay and then gets the other fault. Once a rule of a kind has matched, later rules of that kind are not evaluated for the frame, so they neither count a `once` nor draw a `probability`. The statement usually sits before `boot` so BootNotification is covered too.
 
 Faults:
 
@@ -295,10 +306,17 @@ Filters, each optional, in this order:
 | `ACTION` | OCPP action name. For responses this is the action of the CALL being answered. Omit for every action. |
 | `nth N` | Only the N-th matching frame (1-based). The counter is per direction and, when an action is given, per direction and action. |
 | `every N` | Every N-th matching frame: the 2nd, 4th, 6th for `every 2`. |
-| `probability P%` | Match with probability P, drawn from the run's seeded RNG. Decimals allowed (`0.5%`). |
+| `every N from M` | Every N-th frame starting at the M-th: the 5th, 7th, 9th for `every 2 from 5`. M may be below N (`every 3 from 1`: 1st, 4th, 7th). |
+| `probability P%` | Match with probability P, drawn from the run's seeded RNG. Decimals allowed (`0.5%`). Combined with `nth` or `every`, it is drawn only for the frames those select. |
 | `once` | Remove the rule after its first match. |
 
-Exactly one of `nth`, `every`, `probability` may be given; `nth 3 every 2` is a syntax error. Examples:
+The triggers combine: `nth` or `every`, plus `probability`, plus `once`, in any order (the formatter writes them in the order of the table). Each may appear once. Contradictions are parse errors at the offending word:
+
+- `nth 3 every 2`: `'every' cannot be combined with 'nth' at 3:14: 'nth N' picks one frame, 'every N' a repeating series`
+- `nth 3 from 2` or `from 2` alone: `'from' must follow 'every N', as in 'every 2 from 5'`
+- `once nth 1 once`: `'once' given twice in one chaos rule (first at 3:14)`
+
+`M` and `N` are whole numbers of at least 1, literal or variable. Examples:
 
 ```
 chaos drop
@@ -310,6 +328,8 @@ chaos corrupt in once
 chaos wrongId
 chaos callError in StartTransaction
 chaos noResponse out BootNotification nth 1 once
+chaos drop out MeterValues every 2 from 5
+chaos duplicate in every 3 probability 50% once
 ```
 
 The behavioural layer of fault injection (boot loops, ignoring remote commands, spontaneous Faulted, meter resets) is written with ordinary statements: `repeat`, `status evse 1 Faulted`, `net drop`, `disconnect` and `connect`.
@@ -366,7 +386,7 @@ The formatter emits payloads on one line.
 
 ## Formatting
 
-`wattsim fmt file.ws` prints the canonical form; `--write` rewrites the file. Canonical form is: two-space indent, one statement per line, a blank line after the header when `csms` or `let`s follow, a blank line before every `proc` and `station` and before comments that end the file, `at`/`repeat`/`choose`/`on` bodies on their own lines, EV property blocks and payloads on one line, durations as described under [Durations](#durations), comments as described under [Lexical rules](#lexical-rules). Formatting is idempotent: `fmt` of `fmt` output is the same text.
+`wattsim fmt file.ws` prints the canonical form. `--write` rewrites files in place (one or several), and `--check` prints the path of every file that is not canonical, one per line, and changes nothing: `wattsim fmt --check examples/*.ws` is the CI form. Canonical form is: two-space indent, one statement per line, a blank line after the header when `csms` or `let`s follow, a blank line before every `proc` and `station` and before comments that end the file, `at`/`repeat`/`choose`/`on` bodies on their own lines, EV property blocks and payloads on one line, durations as described under [Durations](#durations), comments as described under [Lexical rules](#lexical-rules). Formatting is idempotent: `fmt` of `fmt` output is the same text.
 
 ## Error messages
 
@@ -379,6 +399,7 @@ Every parse error is reported as `file:line:col: message` with a 1-based line an
 - `a sign is only allowed on a literal duration, not on 'offset'`
 - `unknown distribution 'poisson', expected normal, uniform or exp`
 - `expected '}' to close station block opened at line 5`
+- `station name "CP-1" does not use the loop variable {i}: every instance of the range would get the same name`
 
 Errors found while running (a variable of the wrong type, a negative `wait`) fail only the station concerned and carry the statement's `line:col`, for example `6:3: 'wait' must be a duration, but 'pause' is the string "soon"`.
 
@@ -387,7 +408,7 @@ Errors found while running (a variable of the wrong type, a negative `wait`) fai
 | Command | 0 | 1 | 2 |
 |---|---|---|---|
 | `wattsim check` | file parses | parse error (printed as `file:line:col: message`) | |
-| `wattsim fmt` | already canonical, or rewritten with `--write` | not canonical (CI mode, without `--write`) | |
-| `wattsim run` | every assertion passed and no station failed | at least one failed `expect`, `fail` or station error | parse error; nothing connected |
+| `wattsim fmt` | already canonical, or rewritten with `--write` | not canonical (printing or `--check`), or a parse error | `--check` with `--write`, or several files without either |
+| `wattsim run` | every assertion passed and no station failed | at least one failed `expect`, `fail` or station error | parse error, or a scenario error found as the run starts (a range bound that is not an integer, duplicate station names); nothing connected |
 
 `run --junit out.xml` additionally writes one `<testcase>` per station with a `<failure>` per failed assertion.

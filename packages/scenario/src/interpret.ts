@@ -13,9 +13,9 @@
  *   gets no reply; a 2.1 CALLRESULTERROR carries no action and matches nothing.
  * - Statement arguments that are variable references are resolved when the statement runs and type-checked; a
  *   mismatch fails the station with the statement's `line:col`. A distribution (`normal`, `uniform`, `exp`) is
- *   sampled every time its statement runs, from an LCG seeded with FNV-1a(instance name, statement loc, draw
- *   index) XOR `opts.seed`: reproducible per seed, independent of `choose` and of other statements. A sample below
- *   zero is clamped to 0 ms.
+ *   sampled every time its statement runs, from an LCG seeded with FNV-1a(instance name, draw path, statement
+ *   loc, draw index) XOR `opts.seed` (see `DrawScope`): reproducible per seed, independent of `choose`, of other
+ *   statements and of the order in which concurrent `at` branches run. A sample below zero is clamped to 0 ms.
  * - "Next frame" means: the first matching frame observed since the start of the statement that precedes the
  *   `expect` in the same block (so frames a statement emits after it has resolved still count), or any later
  *   frame. Consecutive `expect`s each match a frame after the one matched by the previous `expect`. A compound
@@ -23,8 +23,9 @@
  *   the start of the `call`, so frames the proc's last statements produced are seen; inside the body the
  *   `expect`s advance their own cursor. Each `at` branch has its own cursor, starting when the branch fires.
  *   The default timeout without `within` is `DEFAULT_EXPECT_TIMEOUT_MS` (30 s).
- * - `choose` draws from an LCG seeded with FNV-1a(instance name) XOR `opts.seed ?? 0`. The station's
- *   `ChaosEngine` (for `probability` rules) uses the same seed salted, so chaos draws never shift choices.
+ * - `choose` draws the same way as a distribution, keyed by its own statement, so its pick does not depend on how
+ *   concurrent branches interleave. The station's `ChaosEngine` (for `probability` rules) uses an LCG seeded with
+ *   FNV-1a(instance name) XOR `opts.seed` salted, so chaos draws never shift choices.
  * - `at +d { }` branches are awaited before the station counts as finished; a failure inside one fails the
  *   station and stops its other branches at their next statement or wait.
  * - `barrier B` / `wait until B` is a counting barrier over all instances that mention `barrier B` anywhere in
@@ -36,7 +37,11 @@
  *   on reconnect, as the reference says.
  * - `net delay d [for w]` appends a chaos `delay` rule for every frame in both directions; with `for` the rule is
  *   removed after `w` by a background task that the station awaits like an `at` branch.
- * - `on ...` handlers are parsed but fail the station when run: the core has no hook to answer an inbound CALL.
+ * - `on A [pattern] [always] { ... }` installs a `Station.interceptCall` handler; before the station exists it is
+ *   queued and installed when the station is created, in statement order. The pattern, the reply payload and the
+ *   error description are resolved when a CALL arrives, not when `on` runs. A one-shot handler uninstalls itself
+ *   on its first match. A CALLERROR code that the station's OCPP version does not define fails the station when
+ *   `on` runs. A variable that cannot be resolved at match time fails the station and answers InternalError.
  * - `clock skew` / `clock drift` wrap the station's clock in a `SkewedClock`; they must appear before
  *   `connect`/`boot` (and before any statement that needs the station), otherwise the station fails. The DSL's
  *   own timing (`wait`, `at`, `net drop`, `within`) always runs on the run clock, not the skewed one. `clock set`,
@@ -56,7 +61,16 @@
  * - `fail "x"` fails the station with `x`; `log` emits a `log` event. The station stays connected until every
  *   station has finished; then `run` disconnects them all and resolves.
  */
-import type { ChaosEffect, ChaosMatch, Clock, ConnectorStatus, EvConfig, StationConfig, Timer } from '@wattsim/core';
+import type {
+  CallAnswer,
+  ChaosEffect,
+  ChaosMatch,
+  Clock,
+  ConnectorStatus,
+  EvConfig,
+  StationConfig,
+  Timer,
+} from '@wattsim/core';
 import {
   CallError,
   ChaosEngine,
@@ -69,7 +83,7 @@ import {
   WallClock,
 } from '@wattsim/core';
 import type { Frame, Violation } from '@wattsim/protocol';
-import { MessageType } from '@wattsim/protocol';
+import { CALL_ERROR_CODES, MessageType } from '@wattsim/protocol';
 import type {
   ChaosStmt,
   ClockStmt,
@@ -83,6 +97,7 @@ import type {
   Loc,
   NetStmt,
   NumExpr,
+  OnStmt,
   Prop,
   Scenario,
   StationBlock,
@@ -91,6 +106,7 @@ import type {
   StringExpr,
 } from './ast';
 import { formatDuration, formatDurExpr } from './format';
+import { ParseError } from './lexer';
 
 // ---- public types ----------------------------------------------------------------------------------------------
 
@@ -182,6 +198,8 @@ export async function driveVirtual(
       throw err;
     },
   );
+  // Handled at `return done`; without this a run that rejects while the loop yields is reported as unhandled.
+  done.catch(() => {});
   const start = clock.now();
   while (!settled) {
     for (let i = 0; i < SETTLE_YIELDS && !settled; i++) await yieldToEventLoop();
@@ -346,6 +364,16 @@ type Vars = Map<string, Value>;
 
 const at = (loc: Loc) => `${loc.line}:${loc.col}`;
 
+/** Run `fn`, prefixing a `StationFailure` it throws with `loc`. */
+function located<T>(loc: Loc, fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof StationFailure) throw new StationFailure(`${at(loc)}: ${err.message}`);
+    throw err;
+  }
+}
+
 function describeValue(v: Value): string {
   if (typeof v === 'string') return `the string "${v}"`;
   if (typeof v === 'number') return `the number ${v}`;
@@ -403,8 +431,23 @@ class StationClock implements Clock {
 
 type Instance = { index: number; name: string; block: StationBlock; vars: Vars };
 
-/** Everything the `at` cursor and block timing need per sequential branch. */
-type Branch = { cursor: number };
+/**
+ * Where random draws come from. `path` names a sequential thread of statements: the station body, an `at` branch
+ * (by its statement and how often it has fired) or a proc call (by its call site and how often that site has
+ * called), nested. `counts` numbers the draws per statement within the path. A draw is a pure function of
+ * (seed, station, path, statement, count), so concurrent branches cannot shift each other's draws.
+ */
+type DrawScope = { path: string; counts: Map<string, number> };
+
+/** Returns the current count for `key` in `scope` and advances it. */
+function bump(scope: DrawScope, key: string): number {
+  const n = scope.counts.get(key) ?? 0;
+  scope.counts.set(key, n + 1);
+  return n;
+}
+
+/** Everything the `at` cursor, block timing and random draws need per sequential branch. */
+type Branch = { cursor: number; scope: DrawScope };
 
 // ---- the run ---------------------------------------------------------------------------------------------------
 
@@ -514,8 +557,11 @@ class Run {
     }
   }
 
+  /** Fill in `s`. At the top level (`depth` 0) a variable that does not resolve fails with the string's position. */
   interpolate(s: StringExpr, vars: Vars, depth = 0): string {
-    return s.parts.map((p) => (typeof p === 'string' ? p : stringify(this.lookup(p.var, vars, depth)))).join('');
+    const fill = () =>
+      s.parts.map((p) => (typeof p === 'string' ? p : stringify(this.lookup(p.var, vars, depth)))).join('');
+    return depth === 0 ? located(s.loc, fill) : fill();
   }
 
   resolveJson(v: JsonValue, vars: Vars): unknown {
@@ -528,7 +574,7 @@ class Run {
       case 'null':
         return null;
       case 'ref': {
-        const r = this.lookup(v.name, vars);
+        const r = located(v.loc, () => this.lookup(v.name, vars));
         if (typeof r !== 'object') return r;
         if ('ms' in r) return r.ms;
         throw new StationFailure(`${at(v.loc)}: '${v.name}' is a distribution and cannot be used in a payload`);
@@ -561,26 +607,51 @@ class Run {
     if (e.kind === 'number') return e.value;
     const v = this.lookup(e.name, new Map());
     if (typeof v !== 'number' || !Number.isInteger(v)) {
-      throw new Error(`${at(e.loc)}: a station range bound must be an integer, but '${e.name}' is ${describeValue(v)}`);
+      throw new ParseError(
+        `a station range bound must be an integer, but '${e.name}' is ${describeValue(v)}`,
+        e.loc.line,
+        e.loc.col,
+      );
     }
     return v;
   }
 
+  /**
+   * One instance per station block and range value. A name produced twice (two blocks with the same name, or
+   * overlapping templates) is a `ParseError` at the later block's name: two stations cannot share an identity.
+   */
   private expand(): Instance[] {
     const out: Instance[] = [];
+    const named = new Map<string, StationBlock>();
+    const add = (block: StationBlock, vars: Vars) => {
+      const name = this.interpolate(block.name, vars);
+      const first = named.get(name);
+      if (first) {
+        const { line, col } = block.name.loc;
+        throw new ParseError(
+          `duplicate station name "${name}": the station block at ${at(first.loc)} has it`,
+          line,
+          col,
+        );
+      }
+      named.set(name, block);
+      out.push({ index: out.length, name, block, vars });
+    };
     for (const block of this.scenario.stations) {
       if (!block.range) {
-        const vars: Vars = new Map();
-        out.push({ index: out.length, name: this.interpolate(block.name, vars), block, vars });
+        add(block, new Map());
         continue;
       }
       const from = this.bound(block.range.from);
       const to = this.bound(block.range.to);
-      if (to < from) throw new Error(`${at(block.loc)}: invalid range ${from}..${to}: end must not be before start`);
-      for (let i = from; i <= to; i++) {
-        const vars: Vars = new Map([[block.range.var, i]]);
-        out.push({ index: out.length, name: this.interpolate(block.name, vars), block, vars });
+      if (to < from) {
+        throw new ParseError(
+          `invalid range ${from}..${to}: end must not be before start`,
+          block.loc.line,
+          block.loc.col,
+        );
       }
+      for (let i = from; i <= to; i++) add(block, new Map([[block.range.var, i]]));
     }
     return out;
   }
@@ -647,7 +718,6 @@ class InstanceRunner {
   private readonly inst: Instance;
   private readonly csmsUrl: string;
   private readonly clock: Clock;
-  private readonly rng: () => number;
   private readonly chaos: ChaosEngine;
   private readonly log = new FrameLog();
   private readonly pendingIds = new Map<string, string>();
@@ -655,14 +725,14 @@ class InstanceRunner {
   private readonly branches: Promise<void>[] = [];
   private readonly cfg: PendingConfig = { skewMs: 0, driftPpm: 0 };
   private readonly stationClock: StationClock;
-  /** Distribution draws per statement loc, so repeated statements sample afresh but reproducibly. */
-  private readonly draws = new Map<string, number>();
   private station: Station | undefined;
   private speedOverride: number | undefined;
   private failure: Error | undefined;
   private rejectAbort: ((err: Error) => void) | undefined;
   private readonly aborted: Promise<never>;
   private callDepth = 0;
+  /** `on` handlers seen before the station existed; installed by `ensureStation`. */
+  private readonly pendingOn: OnStmt[] = [];
 
   constructor(run: Run, inst: Instance, csmsUrl: string) {
     this.run = run;
@@ -672,7 +742,6 @@ class InstanceRunner {
     this.clock = run.runClock;
     this.stationClock = new StationClock(this.clock);
     const seed = (fnv1a(inst.name) ^ run.seed) >>> 0;
-    this.rng = lcg(seed);
     this.chaos = new ChaosEngine(lcg((seed ^ CHAOS_SEED_SALT) >>> 0));
     this.aborted = new Promise<never>((_, reject) => {
       this.rejectAbort = reject;
@@ -684,7 +753,7 @@ class InstanceRunner {
     const start = this.clock.now();
     this.emit({ type: 'station', station: this.name, status: 'started', at: start });
     try {
-      await this.runBlock(this.inst.block.body, { cursor: 0 });
+      await this.runBlock(this.inst.block.body, { cursor: 0, scope: { path: '', counts: new Map() } });
       await this.awaitBranches();
     } catch (err) {
       this.abort(toError(err));
@@ -745,7 +814,13 @@ class InstanceRunner {
    * compound statement's start: for a following `expect` the compound statement is a single statement.
    */
   private nested(branch: Branch): Branch {
-    return { cursor: branch.cursor };
+    return { cursor: branch.cursor, scope: branch.scope };
+  }
+
+  /** A new draw path under `branch` for the `kind` statement at `loc` (an `at` branch or a proc call). */
+  private subScope(branch: Branch, kind: string, loc: Loc): DrawScope {
+    const key = `${kind}@${at(loc)}`;
+    return { path: `${branch.scope.path}/${key}#${bump(branch.scope, key)}`, counts: new Map() };
   }
 
   private async exec(stmt: Stmt, branch: Branch, blockStart: number): Promise<void> {
@@ -788,7 +863,7 @@ class InstanceRunner {
         return;
       case 'heartbeat':
         if (stmt.interval) {
-          const ms = this.ms(stmt.interval, stmt.loc, "'heartbeat'");
+          const ms = this.ms(stmt.interval, stmt.loc, "'heartbeat'", branch.scope);
           if (this.station) this.station.setHeartbeatMs(ms);
           else this.cfg.heartbeatMs = ms;
           return;
@@ -796,7 +871,7 @@ class InstanceRunner {
         await this.race(this.ensureStation('heartbeat').sendHeartbeat());
         return;
       case 'meterInterval': {
-        const ms = this.ms(stmt.interval, stmt.loc, "'meterInterval'");
+        const ms = this.ms(stmt.interval, stmt.loc, "'meterInterval'", branch.scope);
         if (this.station) this.station.setMeterIntervalMs(ms);
         else this.cfg.meterIntervalMs = ms;
         return;
@@ -846,17 +921,18 @@ class InstanceRunner {
         return;
       case 'wait':
         if (stmt.until !== undefined) await this.race(this.run.barrierRegistry.wait(stmt.until));
-        else await this.sleep(this.scaled(this.ms(stmt.duration, stmt.loc, "'wait'")));
+        else await this.sleep(this.scaled(this.ms(stmt.duration, stmt.loc, "'wait'", branch.scope)));
         return;
       case 'barrier':
         this.run.barrierRegistry.arrive(stmt.name, this.inst.index);
         return;
       case 'at': {
-        const due = blockStart + this.scaled(this.ms(stmt.offset, stmt.loc, "'at'"));
+        const due = blockStart + this.scaled(this.ms(stmt.offset, stmt.loc, "'at'", branch.scope));
         const body = stmt.body;
+        const scope = this.subScope(branch, 'at', stmt.loc);
         const task = (async () => {
           await this.sleep(Math.max(0, due - this.clock.now()));
-          await this.runBlock(body, { cursor: this.log.nextSeq });
+          await this.runBlock(body, { cursor: this.log.nextSeq, scope });
         })();
         task.catch((err: unknown) => this.abort(toError(err)));
         this.branches.push(task);
@@ -868,7 +944,9 @@ class InstanceRunner {
         return;
       }
       case 'choose': {
-        const draw = this.rng() * 100;
+        const key = `choose@${at(stmt.loc)}`;
+        const n = bump(branch.scope, key);
+        const draw = lcg((fnv1a(`${this.name}${branch.scope.path}@${key}#${n}`) ^ this.run.seed) >>> 0)() * 100;
         let acc = 0;
         let chosen = stmt.branches[stmt.branches.length - 1];
         for (const b of stmt.branches) {
@@ -882,18 +960,18 @@ class InstanceRunner {
         return;
       }
       case 'net':
-        if (stmt.op === 'drop') await this.netDrop(this.ms(stmt.duration, stmt.loc, "'net drop'"));
-        else this.netDelay(stmt);
+        if (stmt.op === 'drop') await this.netDrop(this.ms(stmt.duration, stmt.loc, "'net drop'", branch.scope));
+        else this.netDelay(stmt, branch.scope);
         return;
       case 'on':
-        throw new StationFailure(
-          `${at(stmt.loc)}: 'on' is not supported yet: the core has no hook to answer an inbound CALL from a scenario`,
-        );
+        if (this.station) this.intercept(this.station, stmt);
+        else this.pendingOn.push(stmt);
+        return;
       case 'chaos':
-        this.addChaos(stmt);
+        this.addChaos(stmt, branch.scope);
         return;
       case 'clock':
-        this.clockStmt(stmt);
+        this.clockStmt(stmt, branch.scope);
         return;
       case 'call': {
         const body = this.run.proc(stmt.proc);
@@ -901,7 +979,7 @@ class InstanceRunner {
         if (this.callDepth > 32) throw new StationFailure(`proc '${stmt.proc}' recurses too deeply`);
         this.callDepth++;
         try {
-          await this.runBlock(body, this.nested(branch));
+          await this.runBlock(body, { cursor: branch.cursor, scope: this.subScope(branch, 'call', stmt.loc) });
         } finally {
           this.callDepth--;
         }
@@ -962,16 +1040,16 @@ class InstanceRunner {
   }
 
   /** A duration argument in ms, sampled when it is a distribution. Negative only with `signed`. */
-  private ms(e: DurExpr, loc: Loc, what: string, signed = false): number {
+  private ms(e: DurExpr, loc: Loc, what: string, scope: DrawScope, signed = false): number {
     let v: number;
     if (e.kind === 'duration') v = e.ms;
-    else if (e.kind !== 'ref') v = this.sample(e, loc, what);
+    else if (e.kind !== 'ref') v = this.sample(e, loc, what, scope);
     else {
       const r = this.lookup(e.name, loc);
       if (typeof r !== 'object') {
         throw new StationFailure(`${at(loc)}: ${what} must be a duration, but '${e.name}' is ${describeValue(r)}`);
       }
-      v = 'ms' in r ? r.ms : this.sample(r, loc, what);
+      v = 'ms' in r ? r.ms : this.sample(r, loc, what, scope);
     }
     if (v < 0 && !signed) {
       throw new StationFailure(`${at(loc)}: ${what} must not be negative, got ${formatDuration({ ms: v })}`);
@@ -979,24 +1057,23 @@ class InstanceRunner {
     return v;
   }
 
-  /** One draw from `d`: a pure function of (seed, station name, statement loc, draw index). */
-  private sample(d: DistExpr, loc: Loc, what: string): number {
+  /** One draw from `d`: a pure function of (seed, station name, draw path, statement loc, draw index). */
+  private sample(d: DistExpr, loc: Loc, what: string, scope: DrawScope): number {
     const key = at(loc);
-    const n = this.draws.get(key) ?? 0;
-    this.draws.set(key, n + 1);
-    const rng = lcg((fnv1a(`${this.name}@${key}#${n}`) ^ this.run.seed) >>> 0);
+    const n = bump(scope, key);
+    const rng = lcg((fnv1a(`${this.name}${scope.path}@${key}#${n}`) ^ this.run.seed) >>> 0);
     let v: number;
     switch (d.kind) {
       case 'normal': {
-        const mean = this.ms(d.mean, loc, what);
-        const sd = this.ms(d.sd, loc, what);
+        const mean = this.ms(d.mean, loc, what, scope);
+        const sd = this.ms(d.sd, loc, what, scope);
         // Box-Muller; 1 - u keeps the logarithm finite.
         v = mean + sd * Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(2 * Math.PI * rng());
         break;
       }
       case 'uniform': {
-        const lo = this.ms(d.min, loc, what);
-        const hi = this.ms(d.max, loc, what);
+        const lo = this.ms(d.min, loc, what, scope);
+        const hi = this.ms(d.max, loc, what, scope);
         if (hi < lo) {
           throw new StationFailure(
             `${at(loc)}: uniform(min, max) needs max >= min, got ${formatDuration({ ms: lo })}, ${formatDuration({ ms: hi })}`,
@@ -1006,7 +1083,7 @@ class InstanceRunner {
         break;
       }
       case 'exp':
-        v = -this.ms(d.mean, loc, what) * Math.log(1 - rng());
+        v = -this.ms(d.mean, loc, what, scope) * Math.log(1 - rng());
         break;
     }
     return Math.max(0, Math.round(v));
@@ -1060,6 +1137,7 @@ class InstanceRunner {
     };
     const station = this.run.stationFactory(config);
     this.station = station;
+    for (const stmt of this.pendingOn.splice(0)) this.intercept(station, stmt);
     station.on('frame', (direction, frame) => this.onFrame(direction, frame));
     station.on('violation', (v) => {
       this.run.recordViolation(v);
@@ -1092,6 +1170,33 @@ class InstanceRunner {
     }
     this.log.push({ direction, action, payload, frame });
     this.emit({ type: 'frame', station: this.name, direction, frame, at: this.clock.now() });
+  }
+
+  /** Install an `on` handler on the station (see the module comment). */
+  private intercept(station: Station, stmt: OnStmt): void {
+    const r = stmt.response;
+    if (r.kind === 'error' && !CALL_ERROR_CODES[station.version].includes(r.code)) {
+      throw new StationFailure(
+        `${at(r.loc)}: '${r.code}' is not a CALLERROR code in ${station.version} (${CALL_ERROR_CODES[station.version].join(', ')})`,
+      );
+    }
+    const vars = this.inst.vars;
+    const off = station.interceptCall((call): CallAnswer => {
+      if (call.action !== stmt.action) return undefined;
+      try {
+        if (stmt.payload && !partialMatch(this.run.resolveJson(stmt.payload, vars), call.payload)) return undefined;
+        const answer: CallAnswer =
+          r.kind === 'reply'
+            ? { result: this.run.resolveJson(r.payload, vars) }
+            : { error: [r.code, r.description ? this.str(r.description) : ''] };
+        if (!stmt.always) off();
+        return answer;
+      } catch (err) {
+        const e = toError(err);
+        this.abort(e);
+        return { error: ['InternalError', e.message] };
+      }
+    });
   }
 
   private async ev(stmt: EvStmt): Promise<void> {
@@ -1163,7 +1268,7 @@ class InstanceRunner {
         : stmt.payload === undefined
           ? undefined
           : this.run.resolveJson(stmt.payload, this.inst.vars);
-    const withinMs = stmt.within ? this.ms(stmt.within, stmt.loc, "'within'") : DEFAULT_EXPECT_TIMEOUT_MS;
+    const withinMs = stmt.within ? this.ms(stmt.within, stmt.loc, "'within'", branch.scope) : DEFAULT_EXPECT_TIMEOUT_MS;
     const label = [
       `expect ${stmt.frame ? `${stmt.frame} ` : ''}${stmt.action}`,
       stmt.code !== undefined ? ` ${stmt.code}` : expected === undefined ? '' : ` ${JSON.stringify(expected)}`,
@@ -1175,7 +1280,9 @@ class InstanceRunner {
     const frameType = stmt.frame && FRAME_TYPES[stmt.frame];
     const matches = (e: FrameEntry) =>
       e.action === stmt.action &&
-      (frameType === undefined || e.frame.type === frameType) &&
+      (frameType === undefined ||
+        e.frame.type === frameType ||
+        (frameType === MessageType.Call && e.frame.type === MessageType.Send)) &&
       (expected === undefined || partialMatch(expected, e.payload));
 
     let seq = this.log.find(branch.cursor, matches);
@@ -1217,11 +1324,11 @@ class InstanceRunner {
     await this.race(station.connect());
   }
 
-  private netDelay(stmt: Extract<NetStmt, { op: 'delay' }>): void {
-    const ms = this.ms(stmt.delay, stmt.loc, "'net delay'");
+  private netDelay(stmt: Extract<NetStmt, { op: 'delay' }>, scope: DrawScope): void {
+    const ms = this.ms(stmt.delay, stmt.loc, "'net delay'", scope);
     const id = this.chaos.add({ match: {}, effect: { kind: 'delay', ms } });
     if (!stmt.for) return;
-    const forMs = this.scaled(this.ms(stmt.for, stmt.loc, "'net delay ... for'"));
+    const forMs = this.scaled(this.ms(stmt.for, stmt.loc, "'net delay ... for'", scope));
     const task = (async () => {
       await this.sleep(forMs);
       this.chaos.remove(id);
@@ -1230,20 +1337,23 @@ class InstanceRunner {
     this.branches.push(task);
   }
 
-  private addChaos(stmt: ChaosStmt): void {
+  private addChaos(stmt: ChaosStmt, scope: DrawScope): void {
     const match: ChaosMatch = { direction: stmt.direction, action: stmt.action };
     const t = stmt.trigger;
     if (t?.kind === 'nth') match.nth = this.num(t.n, stmt.loc, "'nth'", 1);
-    else if (t?.kind === 'every') match.every = this.num(t.n, stmt.loc, "'every'", 1);
-    else if (t?.kind === 'probability') match.probability = this.num(t.percent, stmt.loc, "'probability'") / 100;
+    if (t?.kind === 'every') {
+      match.every = this.num(t.n, stmt.loc, "'every'", 1);
+      if (t.from) match.from = this.num(t.from, stmt.loc, "'from'", 1);
+    }
+    if (stmt.probability) match.probability = this.num(stmt.probability, stmt.loc, "'probability'") / 100;
     const effect: ChaosEffect =
       stmt.fault === 'delay'
-        ? { kind: 'delay', ms: stmt.delay ? this.ms(stmt.delay, stmt.loc, "'chaos delay'") : 0 }
+        ? { kind: 'delay', ms: stmt.delay ? this.ms(stmt.delay, stmt.loc, "'chaos delay'", scope) : 0 }
         : { kind: stmt.fault };
     this.chaos.add({ match, effect, once: stmt.once });
   }
 
-  private clockStmt(stmt: ClockStmt): void {
+  private clockStmt(stmt: ClockStmt, scope: DrawScope): void {
     switch (stmt.mode) {
       case 'speed': {
         const speed = this.num(stmt.speed, stmt.loc, "'clock speed'");
@@ -1252,7 +1362,7 @@ class InstanceRunner {
       }
       case 'skew':
         this.configure('clock skew', () => {
-          this.cfg.skewMs += this.ms(stmt.skew, stmt.loc, "'clock skew'", true);
+          this.cfg.skewMs += this.ms(stmt.skew, stmt.loc, "'clock skew'", scope, true);
         });
         return;
       case 'drift':

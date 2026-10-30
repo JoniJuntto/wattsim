@@ -2,9 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { StationConfig } from '@wattsim/core';
 import { Station, VirtualClock, WallClock } from '@wattsim/core';
 import type { v16 } from '@wattsim/protocol';
-import { CsmsCallError, FakeCsms } from '../../core/test/fake-csms';
+import { CsmsCallError, FakeCsms, until } from '../../core/test/fake-csms';
 import type { RunEvent, RunOptions, RunResult, Scenario } from '../src/index';
-import { driveVirtual, isIdle, parse, run } from '../src/index';
+import { driveVirtual, isIdle, ParseError, parse, run } from '../src/index';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MINUTE = 60_000;
@@ -654,13 +654,6 @@ station "CP-1" {
     ]);
   });
 
-  test('on handlers fail the station as not supported yet, with their line:col', async () => {
-    const { result } = await runVirtual(
-      station('CP-1', '  version 1.6\n  on Reset {\n    reply {status: "Accepted"}\n  }'),
-    );
-    expect(result.stations[0]?.error).toMatch(/^5:3: 'on' is not supported yet/);
-  });
-
   test('send without a payload sends {}', async () => {
     const { result } = await runVirtual(station('CP-1', '  version 1.6\n  boot\n  send Heartbeat'));
     expect(result.ok).toBe(true);
@@ -766,5 +759,219 @@ station "CP-{i}" for i in 1..3 {
     // `boot` is two round trips (BootNotification, then StatusNotification), each 2 s out and 2 s back.
     expect((booted?.at ?? 0) - T0).toBe(8000);
     expect((hb?.at ?? 0) - (booted?.at ?? 0)).toBe(20_000);
+  });
+});
+
+describe('run: on handlers', () => {
+  const DONE = { vendorId: 'test', messageId: 'done' };
+
+  /**
+   * Run `body` (after `version 1.6`) on CP-1, which then waits for a DataTransfer `done`. Once the station is
+   * connected, the CSMS sends `calls` in order and finally `done`. Returns each answer, or the error it rejected with.
+   */
+  async function withCalls(body: string, calls: Array<[string, unknown]>, extra = '') {
+    const src = station(
+      'CP-1',
+      `  version 1.6\n${body}\n  boot\n  expect call DataTransfer {messageId: "done"} within 1h`,
+      extra,
+    );
+    const running = runVirtual(src);
+    await until(() => csms.isConnected('CP-1'), 2000, 'CP-1 connected');
+    const answers: unknown[] = [];
+    for (const [action, payload] of calls) {
+      await new Promise((resolve) => setImmediate(resolve));
+      answers.push(await csms.call('CP-1', action, payload).catch((e: unknown) => e));
+    }
+    // Not awaited: a station that failed meanwhile has already been disconnected and never answers.
+    csms.call('CP-1', 'DataTransfer', DONE).catch(() => {});
+    return { ...(await running), answers };
+  }
+
+  test('a reply reaches the CSMS, once; a non-matching pattern falls through to the built-in handler', async () => {
+    const { result, answers } = await withCalls(
+      '  on ChangeAvailability {connectorId: 1} {\n    reply {status: "Rejected"}\n  }',
+      [
+        ['ChangeAvailability', { connectorId: 0, type: 'Operative' }],
+        ['ChangeAvailability', { connectorId: 1, type: 'Operative' }],
+        ['ChangeAvailability', { connectorId: 1, type: 'Operative' }],
+      ],
+    );
+    expect(answers).toEqual([{ status: 'Accepted' }, { status: 'Rejected' }, { status: 'Accepted' }]);
+    expect(result.ok).toBe(true);
+    expect(result.violations).toEqual([]);
+  });
+
+  test('always keeps answering; variables in the pattern and reply resolve at match time', async () => {
+    const { result, answers } = await withCalls(
+      '  on DataTransfer {vendorId: vendor} always {\n    reply {status: "Accepted", data: "{tag}-{vendor}"}\n  }',
+      [
+        ['DataTransfer', { vendorId: 'acme', messageId: 'a' }],
+        ['DataTransfer', { vendorId: 'other' }],
+        ['DataTransfer', { vendorId: 'acme', messageId: 'b' }],
+      ],
+      'let vendor = "acme"\nlet tag = "T"\n',
+    );
+    expect(answers).toEqual([
+      { status: 'Accepted', data: 'T-acme' },
+      { status: 'UnknownVendorId' },
+      { status: 'Accepted', data: 'T-acme' },
+    ]);
+    expect(result.ok).toBe(true);
+  });
+
+  test('error answers with a CALLERROR, and the scripted reply is visible to expect', async () => {
+    const { result, answers } = await withCalls(
+      '  on Reset {\n    error NotSupported "no resets on {name}"\n  }\n  at +0s {\n    expect error Reset NotSupported within 1h\n  }',
+      [['Reset', { type: 'Hard' }]],
+      'let name = "CP-1"\n',
+    );
+    expect(String(answers[0])).toContain('CALLERROR NotSupported: no resets on CP-1');
+    expect(result.ok).toBe(true);
+    expect(result.stations[0]?.asserts.map((a) => a.ok)).toEqual([true, true]);
+    // The built-in Reset would have rebooted the station.
+    expect(csms.callsFrom('CP-1', 'BootNotification')).toHaveLength(1);
+  });
+
+  test('strict mode reports an invalid scripted reply as a violation', async () => {
+    const { result, answers } = await withCalls('  on Reset {\n    reply {status: "Maybe"}\n  }', [
+      ['Reset', { type: 'Soft' }],
+    ]);
+    expect(answers).toEqual([{ status: 'Maybe' }]);
+    expect(result.violations.length).toBeGreaterThan(0);
+    expect(result.violations[0]).toMatchObject({ action: 'Reset', direction: 'response' });
+  });
+
+  test('a variable that does not resolve fails the station when the CALL arrives and answers InternalError', async () => {
+    const { result, answers } = await withCalls('  on Reset {\n    reply {status: nope}\n  }', [
+      ['Reset', { type: 'Soft' }],
+    ]);
+    expect(String(answers[0])).toContain('CALLERROR InternalError');
+    expect(result.stations[0]?.error).toBe("6:20: unknown variable 'nope'");
+  });
+
+  test('an error code the version does not define fails the station with its line:col', async () => {
+    const { result } = await runVirtual(station('CP-1', '  version 1.6\n  boot\n  on Reset {\n    error Bogus\n  }'));
+    expect(result.stations[0]?.error).toMatch(/^7:5: 'Bogus' is not a CALLERROR code in ocpp1.6 \(/);
+  });
+});
+
+describe('run: chaos composition and station names', () => {
+  test('a chaos rule declared after net delay still fires, on top of the delay', async () => {
+    const src = station(
+      'CP-1',
+      `  version 1.6
+  net delay 1s
+  chaos drop out Heartbeat
+  boot
+  heartbeat
+  log "after"`,
+    );
+    const { result, events } = await runVirtual(src);
+    expect(csms.callsFrom('CP-1', 'BootNotification')).toHaveLength(1);
+    expect(csms.callsFrom('CP-1', 'Heartbeat')).toHaveLength(0);
+    // The dropped Heartbeat times out (fail-soft) and the block continues.
+    expect(events.some((e) => e.type === 'log' && e.message === 'after')).toBe(true);
+    expect(result.stations[0]?.error).toBeUndefined();
+  });
+
+  test('chaos drop out MeterValues every 2 from 3 drops the 3rd, 5th, 7th...', async () => {
+    const src = station(
+      'CP-1',
+      `  version 1.6
+  meterInterval 1min
+  chaos drop out MeterValues every 2 from 3
+  boot
+  ev plug evse 1
+  start evse 1
+  wait 450s
+  stop evse 1`,
+    );
+    const { result } = await runVirtual(src);
+    expect(result.stations[0]?.error).toBeUndefined();
+    const minutes = csms
+      .callsFrom('CP-1', 'MeterValues')
+      .map((c) => (Date.parse((c.payload as v16.MeterValuesRequest).meterValue[0]?.timestamp ?? '') - T0) / MINUTE);
+    // Periodic samples at minutes 1..7; the 3rd, 5th and 7th never reach the CSMS.
+    expect(minutes.map(Math.round)).toEqual([1, 2, 4, 6]);
+  });
+
+  test('two station blocks producing the same name reject the run with a ParseError at the later name', async () => {
+    const src = `${header}\nstation "CP-{i}" for i in 1..3 {\n  version 1.6\n}\n\nstation "CP-{n}" for n in 3..4 {\n  version 1.6\n}\n`;
+    const err = await run(parse(src), { clock, csmsUrl: csms.url }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ParseError);
+    expect(String(err)).toBe('7:9: duplicate station name "CP-3": the station block at 3:1 has it');
+    expect(csms.clients()).toEqual([]);
+  });
+});
+
+describe('run: review regressions', () => {
+  test('a variable that does not resolve inside a string or a payload reports its position', async () => {
+    const a = await runVirtual(station('CP-1', '  version 1.6\n  log "x {nope}"'));
+    expect(a.result.stations[0]?.error).toBe("5:7: unknown variable 'nope'");
+    const b = await runVirtual(station('CP-2', '  version 1.6\n  boot\n  send DataTransfer {vendorId: nope}'));
+    expect(b.result.stations[0]?.error).toBe("6:32: unknown variable 'nope'");
+  });
+
+  test('expect call matches an inbound 2.1 SEND', async () => {
+    const src = station('CS-1', '  version 2.1\n  boot\n  expect call NotifyPeriodicEventStream {id: 7} within 1h');
+    const running = runVirtual(src);
+    await until(() => csms.callsFrom('CS-1', 'BootNotification').length === 1, 2000, 'boot');
+    const payload = { id: 7, pending: 0, basetime: '2026-01-01T00:00:00Z', data: [{ t: 0, v: '42' }] };
+    csms.send('CS-1', { type: 6, id: 's1', action: 'NotifyPeriodicEventStream', payload });
+    const { result } = await running;
+    expect(result.stations[0]?.asserts).toEqual([
+      { ok: true, expect: 'expect call NotifyPeriodicEventStream {"id":7} within 1h' },
+    ]);
+  });
+
+  test('distribution and choose draws do not depend on the order concurrent branches reach them', async () => {
+    const src = (d1: string, d2: string) => `${header}let d1 = ${d1}
+let d2 = ${d2}
+
+proc p {
+  wait uniform(1s, 10min)
+  choose {
+    25%: {
+      log "pick 1"
+    }
+    25%: {
+      log "pick 2"
+    }
+    25%: {
+      log "pick 3"
+    }
+    25%: {
+      log "pick 4"
+    }
+  }
+}
+
+station "CP-1" {
+  version 1.6
+  at +d1 {
+    call p
+    log "A"
+  }
+  at +d2 {
+    call p
+    log "B"
+  }
+}
+`;
+    /** For each branch: how long its `call p` waited and which choose branch it took. */
+    const outcome = async (d1: string, d2: string) => {
+      clock = new VirtualClock(T0);
+      const { events } = await runVirtual(src(d1, d2), { seed: 7 });
+      const logs = events.flatMap((e) => (e.type === 'log' ? [{ at: e.at - T0, message: e.message }] : []));
+      const branch = (label: string, startMs: number) => {
+        const i = logs.findIndex((l) => l.message === label);
+        return { waited: (logs[i]?.at ?? 0) - startMs, pick: logs[i - 1]?.message };
+      };
+      return { a: branch('A', d1 === '0s' ? 0 : 1000), b: branch('B', d2 === '0s' ? 0 : 1000) };
+    };
+    const first = await outcome('0s', '1s');
+    const swapped = await outcome('1s', '0s');
+    expect(swapped).toEqual(first);
+    expect(first.a.waited).not.toBe(first.b.waited);
   });
 });

@@ -98,10 +98,14 @@ function isCap(cls: PurposeClass): boolean {
   return cls === 'max' || cls === 'external';
 }
 
-function minDefined(a: number | undefined, b: number | undefined): number | undefined {
+/** A limit in kW and the `numberPhases` of the schedule period that set it (undefined: the station's phases). */
+type Limit = { kw: number; phases?: number };
+
+/** The lower of two limits, keeping its phases. */
+function minLimit(a: Limit | undefined, b: Limit | undefined): Limit | undefined {
   if (a === undefined) return b;
   if (b === undefined) return a;
-  return Math.min(a, b);
+  return b.kw < a.kw ? b : a;
 }
 
 /** kW of a schedule limit. A uses the period's `numberPhases`, else the station's phases, at the station voltage. */
@@ -134,6 +138,11 @@ function floorTenth(v: number): number {
   return Math.floor(v * 10 + 1e-6) / 10;
 }
 
+/** Same EVSE, stack level and purpose class: one of the two replaces the other (1.6 §5.16). */
+function sameSlot(p: ChargingProfile, q: ChargingProfile): boolean {
+  return q.evseId === p.evseId && q.stackLevel === p.stackLevel && classOf(q.purpose) === classOf(p.purpose);
+}
+
 export class ProfileStore {
   /** Sorted by stackLevel, highest first, so the first profile with a limit at `t` wins its purpose. */
   private profiles: ChargingProfile[] = [];
@@ -153,9 +162,7 @@ export class ProfileStore {
    * stackLevel + purpose + EVSE is replaced (`replace`, 1.6 §5.16) or makes the install fail (`reject`, 2.0.1).
    */
   set(p: ChargingProfile, conflict: StackConflict = 'replace'): boolean {
-    const cls = classOf(p.purpose);
-    const clash = (q: ChargingProfile) =>
-      q.id !== p.id && q.evseId === p.evseId && q.stackLevel === p.stackLevel && classOf(q.purpose) === cls;
+    const clash = (q: ChargingProfile) => q.id !== p.id && sameSlot(p, q);
     if (conflict === 'reject' && this.profiles.some(clash)) return false;
     const entry: ChargingProfile = {
       ...p,
@@ -167,6 +174,13 @@ export class ProfileStore {
     kept.splice(at < 0 ? kept.length : at, 0, entry);
     this.profiles = kept;
     return true;
+  }
+
+  /** How many profiles would be installed after `set(p, 'replace')`: `p` plus every profile it does not replace. */
+  sizeAfterSet(p: ChargingProfile): number {
+    let kept = 0;
+    for (const q of this.profiles) if (q.id !== p.id && !sameSlot(p, q)) kept++;
+    return kept + 1;
   }
 
   /** Remove every profile matching all given criteria (`id` alone when given). Returns how many were removed. */
@@ -203,13 +217,7 @@ export class ProfileStore {
    * schedule starts on an EVSE without a transaction (default `t`: the schedule as if charging started now).
    */
   limitAt(evseId: number, t: number, anchor: number = t): number | undefined {
-    if (this.profiles.length === 0) return undefined;
-    const own = this.ownKw(evseId, t, anchor);
-    const cap = this.stationCapKw(t);
-    if (cap === undefined) return own;
-    let sharing = this.env.txStartedAt(evseId) === undefined ? 1 : 0;
-    for (let id = 1; id <= this.env.evses; id++) if (this.env.txStartedAt(id) !== undefined) sharing++;
-    return minDefined(own, cap / sharing);
+    return this.limit(evseId, t, anchor)?.kw;
   }
 
   /**
@@ -254,14 +262,19 @@ export class ProfileStore {
     const out: CompositePeriod[] = [];
     let t = from;
     for (;;) {
-      const kw =
-        evseId === 0 ? this.gridKw(t, from) : Math.min(this.env.ratedKw, this.limitAt(evseId, t, from) ?? Infinity);
-      const limit = floorTenth(unit === 'W' ? kw * 1000 : (kw * 1000) / (this.env.voltageV * this.env.phases));
-      const startPeriod = Math.floor((t - from) / 1000);
+      const rated: Limit = { kw: this.env.ratedKw };
+      const lim = (evseId === 0 ? this.gridLimit(t, from) : minLimit(rated, this.limit(evseId, t, from))) ?? rated;
+      const phases = lim.phases ?? this.env.phases;
+      const limit = floorTenth(unit === 'W' ? lim.kw * 1000 : (lim.kw * 1000) / (this.env.voltageV * phases));
+      // Whole seconds from `from`: a rise is reported at or after the instant it takes effect, a drop at or
+      // before it, so the reported schedule never allows more than the real one.
+      const prev = out.at(-1);
+      const sec = (t - from) / 1000;
+      const startPeriod = prev && limit > prev.limit ? Math.ceil(sec - 1e-9) : Math.floor(sec + 1e-9);
+      if (prev?.startPeriod === startPeriod) out.pop();
       const last = out.at(-1);
-      if (last?.startPeriod === startPeriod) out.pop();
-      if (out.at(-1)?.limit !== limit) {
-        out.push(unit === 'A' ? { startPeriod, limit, numberPhases: this.env.phases } : { startPeriod, limit });
+      if (last?.limit !== limit || (unit === 'A' && last.numberPhases !== phases)) {
+        out.push(unit === 'A' ? { startPeriod, limit, numberPhases: phases } : { startPeriod, limit });
       }
       const next = this.nextChange(t, from);
       if (next === undefined || next >= end) break;
@@ -297,8 +310,14 @@ export class ProfileStore {
     if (p.duration !== undefined) consider(start + p.duration * 1000);
   }
 
-  /** kW `p` allows at `t` for `evseId`, undefined when it sets no limit then. */
-  private kwAt(p: ChargingProfile, cls: PurposeClass, evseId: number, t: number, fallback: number): number | undefined {
+  /** The limit `p` sets at `t` for `evseId`, undefined when it sets none then. */
+  private limitOf(
+    p: ChargingProfile,
+    cls: PurposeClass,
+    evseId: number,
+    t: number,
+    fallback: number,
+  ): Limit | undefined {
     if (p.validFrom !== undefined && t < p.validFrom) return undefined;
     if (p.validTo !== undefined && t >= p.validTo) return undefined;
     let start = this.anchorOf(p, cls, evseId, fallback);
@@ -316,41 +335,53 @@ export class ProfileStore {
       found = q;
     }
     if (found?.limit === undefined) return undefined;
-    return periodKw(p.unit, found.limit, found.numberPhases, this.env);
+    return { kw: periodKw(p.unit, found.limit, found.numberPhases, this.env), phases: found.numberPhases };
   }
 
   /** Highest-stack limit among the profiles of class `cls` installed on `onEvse`, evaluated for `forEvse`. */
-  private best(cls: PurposeClass, onEvse: number, forEvse: number, t: number, fallback: number): number | undefined {
+  private best(cls: PurposeClass, onEvse: number, forEvse: number, t: number, fallback: number): Limit | undefined {
     for (const p of this.profiles) {
       if (p.evseId !== onEvse || classOf(p.purpose) !== cls) continue;
-      const kw = this.kwAt(p, cls, forEvse, t, fallback);
-      if (kw !== undefined) return kw;
+      const lim = this.limitOf(p, cls, forEvse, t, fallback);
+      if (lim !== undefined) return lim;
     }
     return undefined;
   }
 
+  /** `limitAt` with the phases of the binding limit. */
+  private limit(evseId: number, t: number, anchor: number): Limit | undefined {
+    if (this.profiles.length === 0) return undefined;
+    const own = this.ownLimit(evseId, t, anchor);
+    const cap = this.stationCap(t);
+    if (cap === undefined) return own;
+    let sharing = this.env.txStartedAt(evseId) === undefined ? 1 : 0;
+    for (let id = 1; id <= this.env.evses; id++) if (this.env.txStartedAt(id) !== undefined) sharing++;
+    return minLimit(own, { kw: cap.kw / sharing, phases: cap.phases });
+  }
+
   /** The EVSE's own limit: transaction limit capped by caps installed on the EVSE itself. */
-  private ownKw(evseId: number, t: number, fallback: number): number | undefined {
+  private ownLimit(evseId: number, t: number, fallback: number): Limit | undefined {
     const tx = this.env.txStartedAt(evseId) !== undefined ? this.best('tx', evseId, evseId, t, fallback) : undefined;
     const txLimit =
       tx ?? this.best('txDefault', evseId, evseId, t, fallback) ?? this.best('txDefault', 0, evseId, t, fallback);
-    const caps = minDefined(
+    const caps = minLimit(
       this.best('max', evseId, evseId, t, fallback),
       this.best('external', evseId, evseId, t, fallback),
     );
-    return minDefined(txLimit, caps);
+    return minLimit(txLimit, caps);
   }
 
-  /** The station-level cap in kW (Max and ExternalConstraints on evseId 0), before it is shared. */
-  private stationCapKw(t: number): number | undefined {
-    return minDefined(this.best('max', 0, 0, t, t), this.best('external', 0, 0, t, t));
+  /** The station-level cap (Max and ExternalConstraints on evseId 0), before it is shared. */
+  private stationCap(t: number): Limit | undefined {
+    return minLimit(this.best('max', 0, 0, t, t), this.best('external', 0, 0, t, t));
   }
 
-  private gridKw(t: number, fallback: number): number {
+  /** The grid connection: the sum of the EVSE limits (station phases), capped by the station-level profiles. */
+  private gridLimit(t: number, fallback: number): Limit {
     let sum = 0;
     for (let e = 1; e <= this.env.evses; e++) {
-      sum += Math.min(this.env.ratedKw, this.ownKw(e, t, fallback) ?? Number.POSITIVE_INFINITY);
+      sum += Math.min(this.env.ratedKw, this.ownLimit(e, t, fallback)?.kw ?? Number.POSITIVE_INFINITY);
     }
-    return Math.min(sum, this.stationCapKw(t) ?? Number.POSITIVE_INFINITY);
+    return minLimit({ kw: sum }, this.stationCap(t)) ?? { kw: sum };
   }
 }

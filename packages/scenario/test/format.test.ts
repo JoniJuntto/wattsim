@@ -128,6 +128,18 @@ describe('format', () => {
     expect(format(parse(src))).toBe(src);
   });
 
+  test('chaos triggers print in canonical order: nth/every [from], probability, once', () => {
+    const src =
+      'wattsim 1\n\nstation "x" {\n  chaos drop once probability 50% every 2 from 5\n  chaos delay 1s in once nth 3\n}\n';
+    const out = format(parse(src));
+    expect(out).toBe(
+      'wattsim 1\n\nstation "x" {\n  chaos drop every 2 from 5 probability 50% once\n  chaos delay 1s in nth 3 once\n}\n',
+    );
+    expect(format(parse(out))).toBe(out);
+    const strip = (x: unknown) => JSON.parse(JSON.stringify(x, (k, v) => (k === 'loc' ? undefined : v)));
+    expect(strip(parse(out))).toEqual(strip(parse(src)));
+  });
+
   test('no csms or lets means a single blank line after the header', () => {
     expect(format(parse('wattsim 1\nstation "x" {\n}\n'))).toBe('wattsim 1\n\nstation "x" {\n}\n');
   });

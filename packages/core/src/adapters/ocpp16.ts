@@ -109,6 +109,19 @@ function parseSeconds(value: string): number | undefined {
   return Number.isInteger(n) && n >= 0 && value.trim() !== '' ? n : undefined;
 }
 
+/**
+ * SmartCharging limits advertised through the read-only 1.6 configuration keys and enforced on SetChargingProfile.
+ * The spec sets no defaults; these are typical of AC wallboxes (see DECISIONS.md).
+ */
+export const SMART_CHARGING_16 = {
+  /** ChargeProfileMaxStackLevel: the highest stackLevel accepted. */
+  maxStackLevel: 8,
+  /** ChargingScheduleMaxPeriods: periods per schedule. */
+  maxPeriods: 24,
+  /** MaxChargingProfilesInstalled: profiles installed at once, all connectors and purposes together. */
+  maxInstalled: 10,
+} as const;
+
 type ConfigEntry = {
   readonly: boolean;
   get: (st: StationContext) => string;
@@ -138,6 +151,10 @@ const CONFIG: Record<string, ConfigEntry> = {
   },
   NumberOfConnectors: { readonly: true, get: (st) => String(st.evses.length) },
   SupportedFeatureProfiles: { readonly: true, get: () => 'Core,SmartCharging,RemoteTrigger' },
+  ChargeProfileMaxStackLevel: { readonly: true, get: () => String(SMART_CHARGING_16.maxStackLevel) },
+  ChargingScheduleAllowedChargingRateUnit: { readonly: true, get: () => 'Current,Power' },
+  ChargingScheduleMaxPeriods: { readonly: true, get: () => String(SMART_CHARGING_16.maxPeriods) },
+  MaxChargingProfilesInstalled: { readonly: true, get: () => String(SMART_CHARGING_16.maxInstalled) },
 };
 
 function handleCall(st: StationContext, call: CallFrame): CallOutcome {
@@ -237,7 +254,13 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       const p = call.payload as v16.SetChargingProfileRequest;
       const profile = toProfile16(p.csChargingProfiles, p.connectorId);
       // §5.16: the same id, or the same stackLevel + purpose on the connector, is replaced.
-      if (rejectSet16(st, p.connectorId, p.csChargingProfiles) || profileProblem(profile)) {
+      if (
+        rejectSet16(st, p.connectorId, p.csChargingProfiles) ||
+        profileProblem(profile) ||
+        profile.stackLevel > SMART_CHARGING_16.maxStackLevel ||
+        profile.periods.length > SMART_CHARGING_16.maxPeriods ||
+        st.charging.sizeAfterSet(profile) > SMART_CHARGING_16.maxInstalled
+      ) {
         return { result: { status: 'Rejected' } satisfies v16.SetChargingProfileResponse };
       }
       st.charging.set(profile, 'replace');

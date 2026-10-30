@@ -4,6 +4,10 @@
  *
  * Triggers are deterministic by default ("the 3rd MeterValues"); `probability` draws from a seedable RNG so
  * fleet runs are still reproducible.
+ *
+ * Rules are evaluated in order and the first match wins, with one exception: a `delay` composes with the other
+ * effects. A frame can match one delay rule (the first delay that matches) and one other rule (the first non-delay
+ * that matches), whatever their order; it is held for the delay and then gets the other effect.
  */
 import type { Frame } from '@wattsim/protocol';
 
@@ -18,6 +22,8 @@ export type ChaosMatch = {
   nth?: number;
   /** Match every n-th frame: the 2nd, 4th, 6th... for `every: 2`. */
   every?: number;
+  /** With `every`: the first frame that matches (1-based); later ones follow `every` apart. Default `every`. */
+  from?: number;
   /** Match with this probability (0..1) using the engine's RNG. */
   probability?: number;
 };
@@ -36,7 +42,11 @@ export type ChaosEffect =
 
 export type ChaosRule = { id?: string; match: ChaosMatch; effect: ChaosEffect; once?: boolean };
 
-export type ChaosDecision = { effect: ChaosEffect | null; rule?: ChaosRule };
+/**
+ * `effect` is what happens to the frame (null: nothing). `delayed` is set when a delay rule matched as well as the
+ * rule behind `effect`: the frame is held `delayed.ms` first. A delay alone comes back as `effect` itself.
+ */
+export type ChaosDecision = { effect: ChaosEffect | null; rule?: ChaosRule; delayed?: { ms: number; rule: ChaosRule } };
 
 /** Linear congruential generator (Numerical Recipes constants) yielding floats in [0, 1). */
 export function lcg(seed = 1): () => number {
@@ -82,25 +92,39 @@ export class ChaosEngine {
    * Decide what happens to `frame` travelling in `direction`. `action` is a hint for frames that carry no
    * action themselves (CALLRESULT/CALLERROR): the action of the CALL they answer. Counters for `nth`/`every`
    * are kept per direction and per (direction, action), and advance once per call regardless of rules.
-   * The first matching rule wins; a `once` rule is removed after it matches.
+   * The first matching delay rule and the first matching other rule both apply (see the module comment); once
+   * one of each kind has matched, later rules of that kind are not evaluated. A `once` rule is removed after it
+   * matches.
    */
   decide(direction: ChaosDirection, frame: Frame, action?: string): ChaosDecision {
     const frameAction = frame.type === 2 || frame.type === 6 ? frame.action : action;
     const total = this.bump(direction);
     const perAction = frameAction === undefined ? 0 : this.bump(`${direction}:${frameAction}`);
 
+    let delay: ChaosRule | undefined;
+    let other: ChaosRule | undefined;
     for (const rule of this.rules) {
+      const isDelay = rule.effect.kind === 'delay';
+      if (isDelay ? delay : other) continue;
       const m = rule.match;
       if (m.direction !== undefined && m.direction !== direction) continue;
       if (m.action !== undefined && m.action !== frameAction) continue;
       const count = m.action !== undefined ? perAction : total;
       if (m.nth !== undefined && count !== m.nth) continue;
-      if (m.every !== undefined && (m.every < 1 || count % m.every !== 0)) continue;
+      if (m.every !== undefined) {
+        const from = m.from ?? m.every;
+        if (m.every < 1 || count < from || (count - from) % m.every !== 0) continue;
+      }
       if (m.probability !== undefined && !(this.rng() < m.probability)) continue;
-      if (rule.once) this.remove(rule.id as string);
-      return { effect: rule.effect, rule };
+      if (isDelay) delay = rule;
+      else other = rule;
+      if (delay && other) break;
     }
-    return { effect: null };
+    if (delay?.once) this.remove(delay.id as string);
+    if (other?.once) this.remove(other.id as string);
+    if (!other) return delay ? { effect: delay.effect, rule: delay } : { effect: null };
+    if (delay?.effect.kind !== 'delay') return { effect: other.effect, rule: other };
+    return { effect: other.effect, rule: other, delayed: { ms: delay.effect.ms, rule: delay } };
   }
 
   private bump(key: string): number {

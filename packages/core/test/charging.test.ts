@@ -328,6 +328,52 @@ describe('ProfileStore: install, clear, query', () => {
     // No profile at all: the physical limit for the whole duration.
     expect(new ProfileStore(e).composite(1, T0, 60_000, 'W')).toEqual([{ startPeriod: 0, limit: 22_080 }]);
   });
+
+  test('composite from an instant off the whole second reports a rise late and a drop early, never early-high', () => {
+    const e = env(1);
+    const from = T0 + 500; // GetCompositeSchedule arrives at 00:00:00.500
+    e.t = from;
+    const store = new ProfileStore(e);
+    store.set(
+      prof({
+        id: 1,
+        purpose: 'TxDefaultProfile',
+        startSchedule: T0 - 60_000,
+        periods: [
+          { startPeriod: 0, limit: 6_000 },
+          { startPeriod: 61, limit: 20_000 }, // 00:00:01.000, 0.5 s after `from`
+          { startPeriod: 70, limit: 4_000 }, // 00:00:10.000, 9.5 s after `from`
+        ],
+      }),
+    );
+    expect(store.limitAt(1, from)).toBeCloseTo(6, 9);
+    expect(store.composite(1, from, 60_000, 'W')).toEqual([
+      { startPeriod: 0, limit: 6_000 },
+      { startPeriod: 1, limit: 20_000 },
+      { startPeriod: 9, limit: 4_000 },
+    ]);
+  });
+
+  test('composite in A keeps the numberPhases of the period that sets the limit', () => {
+    const e = env(1);
+    const store = new ProfileStore(e);
+    store.set(
+      prof({
+        id: 1,
+        purpose: 'TxDefaultProfile',
+        unit: 'A',
+        startSchedule: T0,
+        periods: [
+          { startPeriod: 0, limit: 16, numberPhases: 1 },
+          { startPeriod: 60, limit: 16 },
+        ],
+      }),
+    );
+    expect(store.composite(1, T0, 120_000, 'A')).toEqual([
+      { startPeriod: 0, limit: 16, numberPhases: 1 },
+      { startPeriod: 60, limit: 16, numberPhases: 3 },
+    ]);
+  });
 });
 
 // ---- Station over FakeCsms ----------------------------------------------------------------------------------

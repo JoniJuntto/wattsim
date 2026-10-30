@@ -4,8 +4,8 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { CallFrame, OcppVersion, v16, v201 } from '@wattsim/protocol';
-import type { StationConfig } from '../src/index';
-import { RequestTimeoutError, Station, VirtualClock } from '../src/index';
+import type { Clock, StationConfig, Timer } from '../src/index';
+import { RequestTimeoutError, Station, VirtualClock, WallClock } from '../src/index';
 import { FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
@@ -420,5 +420,40 @@ describe('Fix 11: BootNotification Pending', () => {
     expect(actions.indexOf('StartTransaction')).toBeGreaterThan(2);
     expect(actions.lastIndexOf('BootNotification')).toBeLessThan(actions.indexOf('StatusNotification'));
     expect(station.heartbeatMs).toBe(10_000);
+  });
+});
+
+describe('Fix 12: a schedule boundary beyond the timer range', () => {
+  test('under the wall clock the limit timer does not spin when the next boundary is a month away', async () => {
+    const wall = new WallClock();
+    let arms = 0;
+    const counting: Clock = {
+      now: () => wall.now(),
+      date: () => wall.date(),
+      setTimeout(fn: () => void, ms: number): Timer {
+        arms++;
+        return wall.setTimeout(fn, ms);
+      },
+      setInterval: (fn, ms) => wall.setInterval(fn, ms),
+      sleep: (ms) => wall.sleep(ms),
+    };
+    const station = new Station({ id: 'CP1', version: 'ocpp2.0.1', csmsUrl: 'ws://127.0.0.1:1', clock: counting });
+    station.charging.set({
+      id: 1,
+      evseId: 0,
+      stackLevel: 0,
+      purpose: 'TxDefaultProfile',
+      kind: 'Absolute',
+      unit: 'W',
+      startSchedule: wall.now() - 1000,
+      validTo: wall.now() + 30 * 86_400_000, // a month ahead: beyond setTimeout's 2^31-1 ms
+      periods: [{ startPeriod: 0, limit: 11_000 }],
+    });
+    station.chargingProfilesChanged();
+    await Bun.sleep(100);
+    const armed = arms;
+    station.charging.clear({});
+    station.chargingProfilesChanged();
+    expect(armed).toBe(1);
   });
 });

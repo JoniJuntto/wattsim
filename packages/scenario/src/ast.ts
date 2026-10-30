@@ -66,10 +66,8 @@ export type EvAction = 'plug' | 'unplug' | 'ready' | 'suspend' | 'resume';
 
 export type ChaosFault = 'drop' | 'delay' | 'duplicate' | 'corrupt' | 'wrongId' | 'callError' | 'noResponse';
 export type ChaosDirection = 'in' | 'out';
-export type ChaosTrigger =
-  | { kind: 'nth'; n: NumExpr }
-  | { kind: 'every'; n: NumExpr }
-  | { kind: 'probability'; percent: NumExpr };
+/** Which frames a chaos rule counts: `nth N`, or `every N [from M]` (the M-th frame, then every N-th after it). */
+export type ChaosTrigger = { kind: 'nth'; n: NumExpr } | { kind: 'every'; n: NumExpr; from?: NumExpr };
 
 /** `percent` may be a decimal; the branches of one `choose` sum to 100. */
 export type ChooseBranch = { percent: number; body: Stmt[]; loc: Loc; comments?: Comments; endComments?: string[] };
@@ -144,6 +142,8 @@ export type ChaosStmt = {
   /** OCPP action name filter. */
   action?: string;
   trigger?: ChaosTrigger;
+  /** `probability P%`: drawn for each frame the other filters select. `percent` is P, not P/100. */
+  probability?: NumExpr;
   once: boolean;
   loc: Loc;
 };

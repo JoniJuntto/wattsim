@@ -15,7 +15,7 @@ import {
   validatePayload,
   violationErrorCode,
 } from '@wattsim/protocol';
-import type { ChaosDirection, ChaosEngine, ChaosRule } from './chaos';
+import type { ChaosDirection, ChaosEffect, ChaosEngine, ChaosRule } from './chaos';
 import type { Clock, Timer } from './clock';
 import { TypedEmitter } from './events';
 
@@ -348,8 +348,15 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       this.transmit(frame, encodeFrame(frame));
       return;
     }
+    const { effect, delayed } = decision;
+    if (delayed) this.emit('chaos', delayed.rule, frame);
     this.emit('chaos', decision.rule, frame);
-    const effect = decision.effect;
+    if (delayed) this.clock.setTimeout(() => this.applyOut(frame, effect), delayed.ms);
+    else this.applyOut(frame, effect);
+  }
+
+  /** Apply one outbound chaos effect. */
+  private applyOut(frame: Frame, effect: ChaosEffect): void {
     switch (effect.kind) {
       case 'drop':
       case 'noResponse':
@@ -412,8 +419,15 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       this.dispatch(frame);
       return;
     }
+    const { effect, delayed } = decision;
+    if (delayed) this.emit('chaos', delayed.rule, frame);
     this.emit('chaos', decision.rule, frame);
-    const effect = decision.effect;
+    if (delayed) this.clock.setTimeout(() => this.applyIn(frame, raw, effect), delayed.ms);
+    else this.applyIn(frame, raw, effect);
+  }
+
+  /** Apply one inbound chaos effect. */
+  private applyIn(frame: Frame, raw: string, effect: ChaosEffect): void {
     switch (effect.kind) {
       case 'drop':
       case 'noResponse':

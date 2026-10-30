@@ -29,7 +29,7 @@ bun packages/cli/src/index.ts run examples/basic.ws --csms ws://localhost:9000/o
 | `--seed <n>` | Seed for `choose` and probabilistic chaos, so fleet runs are reproducible |
 | `--quiet` | Summary only, no per-frame lines |
 
-`wattsim fmt <file> [--write]` prints the canonical formatting or rewrites the file in place; without `--write` it exits 1 when the file is not already canonical, which makes it usable as a CI check.
+`wattsim fmt <file>` prints the canonical formatting and exits 1 when the file is not already canonical. `wattsim fmt --write <files...>` rewrites files in place; `wattsim fmt --check <files...>` lists the files that are not canonical and exits 1 if there are any, which makes it the CI check.
 
 ## A scenario
 
@@ -80,7 +80,7 @@ The complete reference is in [docs/dsl.md](docs/dsl.md). More examples:
 |---|---|---|
 | Transport | drop, delay, jitter, reorder, duplicate, corrupt bytes, half-open socket, slow read, reconnect storms | `chaos drop`, `chaos delay 2s`, `chaos duplicate`, `chaos corrupt`, `net drop 10s` |
 | Protocol | wrong CALLRESULT id, CALLERROR, never respond, invalid enum, missing field, future/past timestamps, oversized payload | `chaos wrongId`, `chaos callError`, `chaos noResponse`, `clock skew -2s` |
-| Behavioural | boot loop, ignore remote commands, spontaneous Faulted, meter backwards/reset, reset mid-transaction, offline queue replay with duplicates | `repeat`, `status evse 1 Faulted`, `disconnect` / `connect`, `net drop` inside `at +d { }` |
+| Behavioural | boot loop, ignore remote commands, spontaneous Faulted, meter backwards/reset, reset mid-transaction, offline queue replay with duplicates | `repeat`, `status evse 1 Faulted`, `disconnect` / `connect`, `net drop` inside `at +d { }`, `on RemoteStartTransaction always { reply {status: "Rejected"} }` |
 
 Milestone 1 ships the faults named in the third column; the rest of each row is roadmap.
 

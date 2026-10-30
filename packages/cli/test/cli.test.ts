@@ -105,6 +105,35 @@ describe('wattsim fmt', () => {
     expect(code).toBe(1);
     expect(stderr).toMatch(/:\d+:\d+: /);
   });
+
+  test('--check lists the files that would change and exits 1; exits 0 silently when all are canonical', async () => {
+    const a = await tmpFile('check-a.ws', messy);
+    const b = await tmpFile('check-b.ws', messy);
+    const dirty = await cli('fmt', '--check', basicFixture, a, b);
+    expect(dirty.code).toBe(1);
+    expect(dirty.stdout).toBe(`${a}\n${b}\n`);
+    expect(await Bun.file(a).text()).toBe(messy);
+    const clean = await cli('fmt', '--check', basicFixture);
+    expect(clean).toEqual({ stdout: '', stderr: '', code: 0 });
+  });
+
+  test('--check reports a syntax error and exits 1; --write takes several files', async () => {
+    const bad = await tmpFile('check-bad.ws', 'wattsim 1\nstation "CP-1" {\n');
+    const checked = await cli('fmt', '--check', bad, basicFixture);
+    expect(checked.code).toBe(1);
+    expect(checked.stderr).toContain(`${bad}:3:1: `);
+    const a = await tmpFile('write-a.ws', messy);
+    const b = await tmpFile('write-b.ws', messy);
+    expect((await cli('fmt', '--write', a, b)).code).toBe(0);
+    expect((await cli('fmt', '--check', a, b)).code).toBe(0);
+  });
+
+  test('--check with --write, or several files without either, is a usage error', async () => {
+    expect((await cli('fmt', '--check', '--write', basicFixture)).code).toBe(2);
+    const several = await cli('fmt', basicFixture, basicFixture);
+    expect(several.code).toBe(2);
+    expect(several.stderr).toContain('--check or --write');
+  });
 });
 
 describe('wattsim run', () => {
@@ -160,6 +189,16 @@ describe('wattsim run', () => {
     const { stderr, code } = await cli('run', file, '--csms', csmsUrl);
     expect(code).toBe(2);
     expect(stderr).toMatch(/:\d+:\d+: /);
+  });
+
+  test('duplicate station names across blocks → exit 2 with file:line:col, nothing connected', async () => {
+    const src =
+      'wattsim 1\n\nstation "CP-{i}" for i in 1..2 {\n  version 1.6\n}\n\nstation "CP-{i}" for i in 2..3 {\n  version 1.6\n}\n';
+    const file = await tmpFile('dup.ws', src);
+    const { stdout, stderr, code } = await cli('run', file, '--csms', csmsUrl, '--virtual');
+    expect(code).toBe(2);
+    expect(stderr).toBe(`${file}:7:9: duplicate station name "CP-2": the station block at 3:1 has it\n`);
+    expect(stdout).toBe('');
   });
 
   test('bad --speed → exit 2', async () => {

@@ -460,6 +460,25 @@ describe('Connection: chaos', () => {
     await expect(p).resolves.toHaveProperty('currentTime');
   });
 
+  test('a delay and a later duplicate rule both apply: the frame arrives twice, after the delay', async () => {
+    const chaos = new ChaosEngine();
+    chaos.add({ id: 'net', match: {}, effect: { kind: 'delay', ms: 500 } });
+    chaos.add({ id: 'dup', match: { direction: 'out', action: 'Heartbeat' }, effect: { kind: 'duplicate' } });
+    const conn = await connected({ chaos });
+    conn.on('error', () => {}); // the second CALLRESULT has no matching CALL
+    const applied: Array<string | undefined> = [];
+    conn.on('chaos', (rule) => applied.push(rule.id));
+    const p = conn.request('Heartbeat', {});
+    await Bun.sleep(30);
+    expect(csms.receivedFrom('CP1').length).toBe(0);
+    expect(applied).toEqual(['net', 'dup']);
+    await clock.advance(500);
+    await until(() => csms.receivedFrom('CP1').length === 2);
+    // The CALLRESULT is delayed on the way in as well.
+    await clock.advance(500);
+    await expect(p).resolves.toHaveProperty('currentTime');
+  });
+
   test('corrupt on out: CSMS receives invalid JSON', async () => {
     const chaos = new ChaosEngine();
     chaos.add({ match: { direction: 'out' }, effect: { kind: 'corrupt' }, once: true });

@@ -4,7 +4,7 @@ import { attachMetrics, Station, serveMetrics, VirtualClock, WallClock } from '@
 import type { Frame } from '@wattsim/protocol';
 import { MessageType } from '@wattsim/protocol';
 import type { RunEvent, RunOptions, RunResult } from '@wattsim/scenario';
-import { driveVirtual, isIdle, run as runScenario, toJUnit } from '@wattsim/scenario';
+import { driveVirtual, isIdle, ParseError, run as runScenario, toJUnit } from '@wattsim/scenario';
 import { defineCommand } from 'citty';
 import { err, loadScenario, out } from '../load';
 
@@ -192,6 +192,7 @@ export const run = defineCommand({
         try {
           result = await driveVirtual(clock, running, { idle: () => stations.every(isIdle), maxMs: MAX_VIRTUAL_MS });
         } catch (e) {
+          if (e instanceof ParseError) throw e;
           printer.write(`${e instanceof Error ? e.message : String(e)}\n`);
           controller.abort();
           result = await running;
@@ -201,6 +202,12 @@ export const run = defineCommand({
       }
     } catch (e) {
       await printer.flush();
+      if (e instanceof ParseError) {
+        // A scenario error found once the lets are resolved (range bounds, duplicate station names): nothing connected.
+        e.file = args.file;
+        await err(`${String(e)}\n`);
+        process.exit(2);
+      }
       await err(`run failed: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`);
       process.exit(1);
     } finally {

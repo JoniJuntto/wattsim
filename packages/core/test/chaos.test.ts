@@ -108,9 +108,56 @@ describe('ChaosEngine', () => {
 
   test('first matching rule wins', () => {
     const engine = new ChaosEngine();
-    engine.add({ match: { action: 'Heartbeat' }, effect: { kind: 'delay', ms: 100 } });
+    engine.add({ match: { action: 'Heartbeat' }, effect: { kind: 'duplicate' } });
     engine.add({ match: { action: 'Heartbeat' }, effect: { kind: 'drop' } });
-    expect(engine.decide('out', call('Heartbeat')).effect).toEqual({ kind: 'delay', ms: 100 });
+    expect(engine.decide('out', call('Heartbeat')).effect).toEqual({ kind: 'duplicate' });
+  });
+
+  test('a delay composes with the first matching other rule, in either order', () => {
+    for (const delayFirst of [true, false]) {
+      const engine = new ChaosEngine();
+      const delay = { id: 'd', match: {}, effect: { kind: 'delay', ms: 100 } } as const;
+      const drop = { id: 'x', match: { action: 'Heartbeat', nth: 2 }, effect: { kind: 'drop' } } as const;
+      if (delayFirst) engine.add(delay);
+      engine.add(drop);
+      if (!delayFirst) engine.add(delay);
+      // A later delay rule never adds to the first one.
+      engine.add({ match: {}, effect: { kind: 'delay', ms: 999 } });
+      const first = engine.decide('out', call('Heartbeat'));
+      expect(first).toEqual({ effect: { kind: 'delay', ms: 100 }, rule: { ...delay } });
+      const second = engine.decide('out', call('Heartbeat'));
+      expect(second.effect).toEqual({ kind: 'drop' });
+      expect(second.rule?.id).toBe('x');
+      expect(second.delayed).toEqual({ ms: 100, rule: { ...delay } });
+    }
+  });
+
+  test('once rules are removed when they match in a composed decision', () => {
+    const engine = new ChaosEngine();
+    engine.add({ match: {}, effect: { kind: 'delay', ms: 50 }, once: true });
+    engine.add({ match: {}, effect: { kind: 'duplicate' }, once: true });
+    engine.add({ match: {}, effect: { kind: 'corrupt' } });
+    const d = engine.decide('out', call('Heartbeat'));
+    expect(d.effect).toEqual({ kind: 'duplicate' });
+    expect(d.delayed?.ms).toBe(50);
+    expect(engine.size).toBe(1);
+    expect(engine.decide('out', call('Heartbeat'))).toMatchObject({ effect: { kind: 'corrupt' } });
+  });
+
+  test('every N from M starts at the M-th frame', () => {
+    const engine = new ChaosEngine();
+    engine.add({ match: { action: 'MeterValues', every: 2, from: 5 }, effect: { kind: 'drop' } });
+    const hits: number[] = [];
+    for (let i = 1; i <= 12; i++) if (engine.decide('out', call('MeterValues')).effect) hits.push(i);
+    expect(hits).toEqual([5, 7, 9, 11]);
+  });
+
+  test('every N with probability draws only on the frames every N selects', () => {
+    const engine = new ChaosEngine(() => 0);
+    engine.add({ match: { every: 3, probability: 0.5 }, effect: { kind: 'drop' } });
+    const hits: number[] = [];
+    for (let i = 1; i <= 9; i++) if (engine.decide('out', call('Heartbeat')).effect) hits.push(i);
+    expect(hits).toEqual([3, 6, 9]);
   });
 
   test('result frames match an action rule only through the action hint', () => {

@@ -61,7 +61,7 @@ const CHAOS_FAULTS: ReadonlySet<string> = new Set([
   'callError',
   'noResponse',
 ]);
-const CHAOS_TAIL_WORDS: ReadonlySet<string> = new Set(['nth', 'every', 'probability', 'once']);
+const CHAOS_TAIL_WORDS: ReadonlySet<string> = new Set(['nth', 'every', 'from', 'probability', 'once']);
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Parse a scenario source into its AST. Throws `ParseError` with a 1-based location. */
@@ -251,6 +251,11 @@ class Parser {
     return this.stringExpr(t);
   }
 
+  /** The text of a string without interpolation, else undefined. */
+  private static literal(s: StringExpr): string | undefined {
+    return s.parts.every((p) => typeof p === 'string') ? s.parts.join('') : undefined;
+  }
+
   private static loc(t: Token): Loc {
     return { line: t.line, col: t.col };
   }
@@ -393,9 +398,18 @@ class Parser {
         case 'proc':
           scenario.procs.push(this.parseProc(leading));
           break;
-        case 'station':
-          scenario.stations.push(this.parseStation(leading));
+        case 'station': {
+          const block = this.parseStation(leading);
+          const name = Parser.literal(block.name);
+          if (!block.range && name !== undefined) {
+            const first = scenario.stations.find((b) => !b.range && Parser.literal(b.name) === name);
+            if (first) {
+              this.fail(`duplicate station name "${name}" (first declared at line ${first.loc.line})`, block.name.loc);
+            }
+          }
+          scenario.stations.push(block);
           break;
+        }
         default:
           if (KEYWORDS.has(t.value)) {
             this.fail(`'${t.value}' is a statement and must appear inside a station or proc block`);
@@ -466,6 +480,12 @@ class Parser {
         this.fail(`invalid range ${from.value}..${to.value}: end must not be before start`, fromTok);
       }
       range = { var: v, from, to };
+      if (!name.parts.some((p) => typeof p !== 'string' && p.var === v)) {
+        this.fail(
+          `station name "${name.raw}" does not use the loop variable {${v}}: every instance of the range would get the same name`,
+          name.loc,
+        );
+      }
     }
     this.expectPunct('{', 'to open station block');
     const [body, end] = this.parseBlockBody('station', kw);
@@ -863,31 +883,54 @@ class Parser {
     if (this.atWord('in') || this.atWord('out')) node.direction = this.advance().value as ChaosDirection;
     const t = this.peek();
     if (Parser.isWord(t) && !CHAOS_TAIL_WORDS.has(t.value)) node.action = this.advance().value;
-    const trigger = this.parseChaosTrigger();
-    if (trigger) node.trigger = trigger;
-    if (this.atWord('once')) {
-      this.advance();
-      node.once = true;
-    }
+    this.parseChaosTail(node);
     return node;
   }
 
-  private parseChaosTrigger(): ChaosTrigger | undefined {
-    if (this.atWord('nth')) {
+  /**
+   * `nth N` | `every N [from M]`, `probability P%` and `once`, each at most once and in any order (the formatter
+   * puts them in that order). `nth` and `every` exclude each other; `from` belongs to `every`.
+   */
+  private parseChaosTail(node: ChaosStmt): void {
+    const seen = new Map<string, Loc>();
+    for (;;) {
+      const t = this.peek();
+      if (!Parser.isWord(t) || !CHAOS_TAIL_WORDS.has(t.value)) return;
+      const loc = Parser.loc(t);
+      const word = t.value;
+      if (word === 'from') {
+        this.fail("'from' must follow 'every N', as in 'every 2 from 5'");
+      }
+      const first = seen.get(word);
+      if (first) this.fail(`'${word}' given twice in one chaos rule (first at ${first.line}:${first.col})`);
+      const other = word === 'nth' ? 'every' : word === 'every' ? 'nth' : undefined;
+      const clash = other && seen.get(other);
+      if (clash) {
+        this.fail(
+          `'${word}' cannot be combined with '${other}' at ${clash.line}:${clash.col}: 'nth N' picks one frame, 'every N' a repeating series`,
+        );
+      }
+      seen.set(word, loc);
       this.advance();
-      return { kind: 'nth', n: this.parseNum("after 'nth'", { int: true }) };
+      if (word === 'nth') {
+        node.trigger = { kind: 'nth', n: this.parseNum("after 'nth'", { int: true }) };
+      } else if (word === 'every') {
+        const trigger: Extract<ChaosTrigger, { kind: 'every' }> = {
+          kind: 'every',
+          n: this.parseNum("after 'every'", { int: true }),
+        };
+        if (this.atWord('from')) {
+          this.advance();
+          trigger.from = this.parseNum("after 'from'", { int: true });
+        }
+        node.trigger = trigger;
+      } else if (word === 'probability') {
+        node.probability = this.parseNum("percentage after 'probability'");
+        this.expectPunct('%', 'after probability');
+      } else {
+        node.once = true;
+      }
     }
-    if (this.atWord('every')) {
-      this.advance();
-      return { kind: 'every', n: this.parseNum("after 'every'", { int: true }) };
-    }
-    if (this.atWord('probability')) {
-      this.advance();
-      const percent = this.parseNum("percentage after 'probability'");
-      this.expectPunct('%', 'after probability');
-      return { kind: 'probability', percent };
-    }
-    return undefined;
   }
 
   private parseClock(loc: Loc): ClockStmt {

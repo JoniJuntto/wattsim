@@ -459,6 +459,55 @@ describe('Station 1.6: inbound CALLs', () => {
     expect(station.evse(1)?.offeredKw).toBeCloseTo(22.08, 6);
   });
 
+  test('SmartCharging configuration keys are advertised read-only and enforced on SetChargingProfile', async () => {
+    await booted();
+    const keys = [
+      'ChargeProfileMaxStackLevel',
+      'ChargingScheduleAllowedChargingRateUnit',
+      'ChargingScheduleMaxPeriods',
+      'MaxChargingProfilesInstalled',
+    ];
+    const cfg = (await call('GetConfiguration', { key: keys })) as v16.GetConfigurationResponse;
+    expect(cfg).toEqual({
+      configurationKey: [
+        { key: 'ChargeProfileMaxStackLevel', readonly: true, value: '8' },
+        { key: 'ChargingScheduleAllowedChargingRateUnit', readonly: true, value: 'Current,Power' },
+        { key: 'ChargingScheduleMaxPeriods', readonly: true, value: '24' },
+        { key: 'MaxChargingProfilesInstalled', readonly: true, value: '10' },
+      ],
+    });
+    const all = (await call('GetConfiguration', {})) as v16.GetConfigurationResponse;
+    expect(all.configurationKey?.map((k) => k.key)).toEqual(expect.arrayContaining(keys));
+    expect(await call('ChangeConfiguration', { key: 'MaxChargingProfilesInstalled', value: '99' })).toEqual({
+      status: 'Rejected',
+    });
+
+    const set = (id: number, stackLevel: number, periods = 1, connectorId = 0) =>
+      call('SetChargingProfile', {
+        connectorId,
+        csChargingProfiles: {
+          chargingProfileId: id,
+          stackLevel,
+          chargingProfilePurpose: 'TxDefaultProfile',
+          chargingProfileKind: 'Absolute',
+          chargingSchedule: {
+            chargingRateUnit: 'A',
+            chargingSchedulePeriod: Array.from({ length: periods }, (_, i) => ({ startPeriod: i * 60, limit: 16 })),
+          },
+        },
+      });
+    expect(await set(1, 9)).toEqual({ status: 'Rejected' });
+    expect(await set(1, 8, 25)).toEqual({ status: 'Rejected' });
+    expect(await set(1, 8, 24)).toEqual({ status: 'Accepted' });
+    // Ten profiles fit: stack levels 0..8 on connector 0, one more on connector 1.
+    for (let level = 0; level < 8; level++) expect(await set(10 + level, level)).toEqual({ status: 'Accepted' });
+    expect(await set(30, 0, 1, 1)).toEqual({ status: 'Accepted' });
+    expect(await set(31, 1, 1, 1)).toEqual({ status: 'Rejected' });
+    // Replacing an installed profile (same id, or same stack level and purpose) does not add one.
+    expect(await set(30, 2, 1, 1)).toEqual({ status: 'Accepted' });
+    expect(await set(40, 5)).toEqual({ status: 'Accepted' });
+  });
+
   test('TriggerMessage sends Heartbeat, StatusNotification and MeterValues on demand', async () => {
     const station = await booted();
     expect(await call('TriggerMessage', { requestedMessage: 'Heartbeat' })).toEqual({

@@ -199,12 +199,12 @@ describe('parse kitchen-sink.ws', () => {
         { key: 'nested', value: { kind: 'object', entries: [] } },
       ],
     });
-    const trigger = (t: ChaosStmt['trigger']) => {
-      if (!t) return undefined;
-      const n = t.kind === 'probability' ? t.percent : t.n;
-      return `${t.kind} ${n.kind === 'number' ? n.value : n.name}`;
+    const trigger = (c: ChaosStmt) => {
+      const n = c.trigger?.n ?? c.probability;
+      if (!n) return undefined;
+      return `${c.trigger?.kind ?? 'probability'} ${n.kind === 'number' ? n.value : n.name}`;
     };
-    expect(byKind('chaos').map((c) => [c.fault, c.direction, c.action, trigger(c.trigger), c.once])).toEqual([
+    expect(byKind('chaos').map((c) => [c.fault, c.direction, c.action, trigger(c), c.once])).toEqual([
       ['drop', undefined, undefined, undefined, false],
       ['drop', 'out', 'MeterValues', 'nth 3', false],
       ['delay', 'in', undefined, 'every 2', false],
@@ -289,6 +289,45 @@ describe('parse errors', () => {
       'expected number for clock speed after \'clock speed\', got "fast"',
     );
     expect(err('wattsim 1\nstation "x" {\n  choose {\n  }\n}').message).toContain('at least one');
+  });
+
+  test('chaos triggers: every N from M, any order, precise errors for contradictions', () => {
+    const [a, b] = body('  chaos drop out MeterValues every 2 from 5\n  chaos corrupt once nth n probability 10%');
+    expect(a).toMatchObject({ trigger: { kind: 'every', n: { value: 2 }, from: { value: 5 } }, once: false });
+    expect(b).toMatchObject({
+      trigger: { kind: 'nth', n: { kind: 'ref', name: 'n' } },
+      probability: { value: 10 },
+      once: true,
+    });
+    const e1 = bodyErr('  chaos drop nth 3 every 2');
+    expect(String(e1)).toBe(
+      "test.ws:3:20: 'every' cannot be combined with 'nth' at 3:14: 'nth N' picks one frame, 'every N' a repeating series",
+    );
+    expect(String(bodyErr('  chaos drop every 2 nth 3'))).toContain(
+      "3:22: 'nth' cannot be combined with 'every' at 3:14",
+    );
+    expect(String(bodyErr('  chaos drop nth 3 from 2'))).toBe(
+      "test.ws:3:20: 'from' must follow 'every N', as in 'every 2 from 5'",
+    );
+    expect(bodyErr('  chaos drop from 2').message).toBe("'from' must follow 'every N', as in 'every 2 from 5'");
+    expect(String(bodyErr('  chaos drop once nth 1 once'))).toBe(
+      "test.ws:3:25: 'once' given twice in one chaos rule (first at 3:14)",
+    );
+    expect(bodyErr('  chaos drop probability 5% probability 6%').message).toBe(
+      "'probability' given twice in one chaos rule (first at 3:14)",
+    );
+    expect(bodyErr('  chaos drop every 2 every 3').message).toContain("'every' given twice");
+  });
+
+  test('station names: a template must use its loop variable; literal names must be unique', () => {
+    const e1 = err('wattsim 1\nstation "CP-1" for i in 1..3 {\n}\n');
+    expect(String(e1)).toBe(
+      'test.ws:2:9: station name "CP-1" does not use the loop variable {i}: every instance of the range would get the same name',
+    );
+    expect(err('wattsim 1\nlet j = 1\nstation "CP-{j}" for i in 1..3 {\n}\n').message).toContain('{i}');
+    const e2 = err('wattsim 1\nstation "CP-1" {\n}\n\nstation "CP-1" {\n}\n');
+    expect(String(e2)).toBe('test.ws:5:9: duplicate station name "CP-1" (first declared at line 2)');
+    expect(parse('wattsim 1\nstation "CP-{i}" for i in 1..2 {\n}\nstation "CP-9" {\n}\n').stations).toHaveLength(2);
   });
 
   test('ev prop units may be attached or separated by a space', () => {
@@ -433,7 +472,7 @@ describe('parse m2.ws (milestone 2 syntax)', () => {
     expect(find('choose')?.branches.map((x) => x.percent)).toEqual([33.3, 66.7]);
     expect(find('chaos', 0)?.trigger).toMatchObject({ kind: 'nth', n: { kind: 'ref', name: 'n' } });
     expect(find('chaos', 1)?.delay).toMatchObject({ kind: 'ref', name: 'pause' });
-    expect(find('chaos', 2)?.trigger).toMatchObject({ kind: 'probability', percent: { value: 0.5 } });
+    expect(find('chaos', 2)?.probability).toMatchObject({ kind: 'number', value: 0.5 });
   });
 
   test('comments attach to the header, declarations, statements, branches and block ends', async () => {

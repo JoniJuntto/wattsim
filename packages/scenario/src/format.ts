@@ -205,10 +205,9 @@ function formatStmtLines(s: Stmt, depth: number, pad: string): string[] {
       if (s.delay) parts.push(formatDurExpr(s.delay));
       if (s.direction) parts.push(s.direction);
       if (s.action) parts.push(s.action);
-      if (s.trigger) {
-        if (s.trigger.kind === 'probability') parts.push('probability', `${numExpr(s.trigger.percent)}%`);
-        else parts.push(s.trigger.kind, numExpr(s.trigger.n));
-      }
+      if (s.trigger) parts.push(s.trigger.kind, numExpr(s.trigger.n));
+      if (s.trigger?.kind === 'every' && s.trigger.from) parts.push('from', numExpr(s.trigger.from));
+      if (s.probability) parts.push('probability', `${numExpr(s.probability)}%`);
       if (s.once) parts.push('once');
       return line(parts.join(' '));
     }
