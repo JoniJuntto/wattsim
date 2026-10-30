@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "paths": {
+      "@wattsim/csms": ["../packages/csms/src/index.ts"],
+      "@wattsim/pki": ["../packages/pki/src/index.ts"],
+      "@wattsim/protocol": ["../packages/protocol/src/index.ts"]
+    }
+  },
+  "include": ["scripts/**/*.ts"]
+}

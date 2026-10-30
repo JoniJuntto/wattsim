@@ -1,7 +1,9 @@
 # Interop harness
 
 Two real open-source CSMSs in `docker compose`, so the wattsim station simulator can be run against
-something other than its own fake CSMS. Nightly job: `.github/workflows/interop.yml`.
+something other than its own fake CSMS, and (compose profile `everest`) a real charge point, EVerest, so wattsim's
+CSMS and its conformance checker are run against something other than wattsim's own station. Nightly job:
+`.github/workflows/interop.yml`. The EVerest half is described in [EVerest](#everest-charge-point-vs-wattsims-csms).
 
 | CSMS | OCPP | Station id | idTag / idToken | URL to pass to `wattsim run --csms` |
 |---|---|---|---|---|
@@ -158,3 +160,128 @@ Verified locally with the CLI, real time (no `--virtual`), warm volumes (`up -d 
 
 Not verified: the GitHub Actions workflow itself has not been run; with the token fix above both scenario steps pass
 locally with the exact commands it uses.
+
+## EVerest: charge point vs wattsim's CSMS
+
+The reverse direction (DESIGN.md §5): EVerest, the LF Energy charge-point stack, runs in software-in-the-loop (SIL)
+mode with a simulated EV, power board and meter and connects to **wattsim's CSMS** (`@wattsim/csms`), which grades
+every frame with the conformance checker.
+
+```sh
+bun interop/scripts/everest.ts                 # 1.6, 2.0.1 and 2.1 in turn; ~6 min warm, exit 0 = all green
+bun interop/scripts/everest.ts --ocpp 2.0.1    # one version; also --port, --results, --keep, --csms-from-container
+```
+
+Per version the script starts the CSMS in-process on `0.0.0.0:19210` (accepting only that version's subprotocol),
+recreates the `everest` service pointed at it, and then:
+
+1. waits for `BootNotification` and `StatusNotification` Available on EVSE/connector 1 (EVerest boots in ~3 s);
+2. `GetConfiguration` (all keys, then `HeartbeatInterval` + an unknown key) / `GetVariables` (`OCPPCommCtrlr.HeartbeatInterval`,
+   `SecurityCtrlr.Identity`, and an unknown component that must come back `UnknownComponent`);
+3. local session: EV plugs in, RFID token `WATTSIM01` presented, `Authorize`, charge 70 s, EV unplugs;
+4. remote session: EV plugs in, `RemoteStartTransaction` / `RequestStartTransaction` (`remoteStartId` 4711, checked in
+   `TransactionEvent` Started), charge 20 s, EV unplugs;
+5. removes the EVerest container **before** stopping the CSMS (otherwise EVerest reconnects to the next version's CSMS;
+   see finding 2), then writes, under `interop/results/`:
+   `everest-<16|201|21>.json` (ConformanceReport + `internalErrors` + `stations`), `.xml` (JUnit, one case per
+   station, each error a failure), `.frames.jsonl` (every frame, both directions), `.steps.json`, `.compose.log`.
+
+Exit code 1 when a step fails or the checker raised any error-severity finding.
+
+### Services and switches
+
+| Service | Image (pinned by digest) | What |
+|---|---|---|
+| `everest-mqtt` | `ghcr.io/everest/everest-demo/mqtt-server:2025.10.0-single-phase` | Mosquitto, anonymous; host port `${EVEREST_MQTT_PORT:-11883}` |
+| `everest` | `ghcr.io/everest/everest-demo/manager:2025.10.0-single-phase` (EVerest 2025.10.0, amd64 + arm64, 4.3 GB compressed / ~20 GB unpacked) | EVerest manager; entrypoint `interop/everest/start.sh` |
+
+`interop/everest/start.sh` patches the image's own config files at container start (a recreated container starts
+clean) and runs `manager` on EVerest's stock SIL config:
+
+| `EVEREST_OCPP_VERSION` | EVerest module / config | CSMS URL switch |
+|---|---|---|
+| `1.6` (default) | `OCPP` / `config-sil-ocpp.yaml` | `share/everest/modules/OCPP/config-docker.json`: `Internal.CentralSystemURI` = `host:port/` (no scheme), `Internal.ChargePointId`, `Security.SecurityProfile` = 0. libocpp connects to `ws://<CentralSystemURI><ChargePointId>`. |
+| `2.0.1`, `2.1` | `OCPP201` / `config-sil-ocpp201.yaml` | device model `component_config/standardized/InternalCtrlr.json`: `NetworkConnectionProfiles[0].connectionData.ocppCsmsUrl` (a JSON string inside the JSON), `securityProfile` 1, `ChargePointId`, `SupportedOcppVersions` (narrowed to the one asked for; the stock value `ocpp2.1,ocpp2.0.1` negotiates 2.1); `SecurityCtrlr.json`: `SecurityCtrlrIdentity`. `device_model_storage.db` is deleted so the JSON is re-read. libocpp connects to `<ocppCsmsUrl>/<Identity>`. |
+
+Other variables: `WATTSIM_CSMS` (host:port as the container sees it, default `host.docker.internal:19210`; compose maps
+`host.docker.internal` to the host gateway so this works on Linux too), `EVEREST_STATION_ID` (default
+`EVEREST-16` / `EVEREST-201` / `EVEREST-21`), `EVEREST_SIL_RESET_METER` (default `false`, see finding 1).
+
+How a session is driven headless (no Node-RED): EVerest's simulated EV (`EvManager`) takes a command string on MQTT
+topic `everest_external/nodered/<connector>/carsim/cmd/execute_charging_session`, e.g.
+`sleep 1;iec_wait_pwr_ready;sleep 1;draw_power_regulated 16,3;sleep 70;unplug`, and the stock configs' token provider
+(`DummyTokenProviderManual`) takes `{"id_token":{"value":"WATTSIM01","type":"ISO14443"},"authorization_type":"RFID"}` on
+`everest_api/dummy_token_provider/cmd/provide`. The script publishes both with `mosquitto_pub` inside `everest-mqtt`, so
+the host needs no MQTT client.
+
+### Manual recipe
+
+```sh
+bun interop/scripts/csms.ts --name everest-manual           # CSMS on :19210, control API on 127.0.0.1:19211
+EVEREST_OCPP_VERSION=2.0.1 docker compose -f interop/docker-compose.yml --profile everest up -d --wait everest
+pub() { docker compose -f interop/docker-compose.yml --profile everest exec -T everest-mqtt mosquitto_pub -h 127.0.0.1 -t "$1" -m "$2"; }
+pub everest_external/nodered/1/carsim/cmd/execute_charging_session 'sleep 1;iec_wait_pwr_ready;sleep 1;draw_power_regulated 16,3;sleep 30;unplug'
+pub everest_api/dummy_token_provider/cmd/provide '{"id_token":{"value":"WATTSIM01","type":"ISO14443"},"authorization_type":"RFID"}'
+curl -s localhost:19211/call -d '{"identity":"EVEREST-201","action":"GetVariables","payload":{"getVariableData":[{"component":{"name":"OCPPCommCtrlr"},"variable":{"name":"HeartbeatInterval"}}]}}'
+docker compose -f interop/docker-compose.yml --profile everest rm -sf everest   # EVerest first, then:
+curl -s -X POST localhost:19211/stop     # or Ctrl-C: writes interop/results/everest-manual.{json,xml}, exit 1 on errors
+```
+
+`csms.ts` also runs standalone for any other charge point: it signs CSRs (`SignCertificate` -> `CertificateSigned`)
+with a throwaway test CA from `@wattsim/pki`, keeps sessions for the whole run, appends every frame to
+`<name>.frames.jsonl`, exits 1 on any error-severity finding and 3 when `--expect <identity>` never connected.
+Control API: `GET /sessions`, `GET /report`, `POST /call {identity, action, payload, timeoutMs?}`, `POST /stop`.
+`interop/tsconfig.json` maps `@wattsim/*` to the package sources, which is how Bun resolves them from `interop/`.
+
+### What is upstream and why this image
+
+- everest-demo (<https://github.com/EVerest/everest-demo>) publishes the prebuilt images; its `.env` on `main` pins
+  `TAG=2025.10.0-single-phase` (the newest tag; `latest`/`main` are old 0.0.x builds). Its OCPP demo
+  (`demo-iso15118-2-ocpp-201.sh`) only targets MaEVe or CitrineOS with 2.0.1 and patches `InternalCtrlr.json` with
+  `sed` through `manager/ocpp201-sp-config.sh`; the switches above are the same files, done with `jq` at start-up.
+- The image is a full build tree (`/ext/build` alone is 6.7 GB) of everest-core 2025.10.0 with the demo patches and
+  ships every SIL config and run script (`/ext/build/run-scripts/run-sil-ocpp.sh`, `run-sil-ocpp201.sh`, ...). A
+  slimmer image would mean building everest-core ourselves (`docker-compose.build.yml` in everest-demo, an hour+).
+- Node-RED (the demo's UI, which drives the car simulator) is left out; MQTT does the same.
+
+### Findings against real EVerest (2026-10-30)
+
+Default switches, three full runs of all versions on this machine: **0 findings**; every step passes for 1.6, 2.0.1
+and 2.1. Observed EVerest behaviour worth knowing: it sends `SecurityEventNotification StartupOfTheDevice` right after
+boot, a 1.6 `DataTransfer` (`org.openchargealliance.iso15118pnc`, `Get15118EVCertificate`/CSR) ~60 s after boot (the
+CSMS answers `UnknownVendorId`, which EVerest accepts), and in 2.x the `TransactionEvent` Ended carries the full
+`TxEnded` sample history from `Transaction.Begin` on.
+
+What the checker raised in the other runs:
+
+1. `meter.backwards` (2.0.1, with `EVEREST_SIL_RESET_METER=true`, i.e. EVerest's stock SIL config): remote session,
+   `Transaction.Begin` 211 Wh (the previous session's reading) then `Sample.Clock` 14 Wh and `Transaction.End` 59 Wh.
+   **True positive on the wire**: Energy.Active.Import.Register is a cumulative register and must not go down within
+   a transaction. The cause is the simulated hardware, not libocpp: `YetiSimulator` zeroes its energy counter on every
+   plug-in (`reset_powermeter_on_session_start`, default true), and when `RequestStartTransaction` arrives right after
+   plug-in the transaction starts on the last pre-reset reading. Racy (1 of 2 runs at 2.0.1, 0 of 2 at 2.1). The
+   harness defaults to `false` (a monotonic register, like real meters) so the nightly grades EVerest's OCPP stack.
+2. `boot.not-accepted` x3 (1.6, harness-made): when the CSMS process restarts under a running EVerest, EVerest 1.6
+   reconnects and re-sends `StatusNotification` for connectors 0-2 without a new `BootNotification`. OCPP 1.6 §4.2 ties
+   BootNotification to start-up, not to each connection, so EVerest is right; the new CSMS process simply never saw
+   the boot. **Checker false positive** (a fresh CSMS cannot tell this from a station that skipped its boot). EVerest
+   2.0.1 sends nothing on such a reconnect. The script avoids it by stopping EVerest before the CSMS.
+3. `meter.backwards` (2.0.1, once): "went from 23 Wh to 0 Wh" on `TransactionEvent` Ended, where the Ended event's
+   `meterValue` was `Transaction.Begin` 0 @t0, `Sample.Clock` 23 @t0+11 s, `Sample.Periodic` 170, `Transaction.End` 211:
+   monotonic in time. An `Updated` (`MeterValueClock`, 23 Wh @t0+11 s) had been sent before it. **Checker false
+   positive**: OCPP 2.0.1 `SampledDataCtrlr.TxEndedMeasurands` / `AlignedDataCtrlr.TxEndedMeasurands` are, per their
+   definitions (Part 2, referenced components and variables, used by use case J02), "to be included in the meterValues
+   element of TransactionEventRequest (eventType = Ended), every SampledDataTxEndedInterval seconds from the start of
+   the transaction", so the Ended event legitimately repeats samples older than ones already sent.
+   `backwards()` in `packages/csms/src/conformance.ts` compares in message order against the last stored reading and
+   ignores `meterValue[].timestamp`. Intermittent: it needs EVerest to send a clock-aligned `Updated` during the
+   session, which happened in 1 of the 10 2.x version runs here (that run had `EVEREST_SIL_RESET_METER=true`, but the
+   readings involved are all from one monotonic session, so the default switches can hit it too). Not fixed here (packages/csms is out of scope); this is why the `everest` CI job is `continue-on-error`.
+
+### Caveats
+
+- **Image size.** ~20 GB unpacked; the CI job frees disk first. The first pull took under 10 min here.
+- **Port 19210/19211.** Fixed defaults (`--port`, `--control-port`); 9000 is avoided because it is commonly taken.
+- **One EVerest at a time.** Both versions share the broker topics, so the script runs versions sequentially.
+- **Not verified in GitHub Actions.** Runs locally (OrbStack, arm64). On Linux runners `host.docker.internal` relies on
+  the `host-gateway` mapping in compose and the runner not firewalling the docker bridge to the host.

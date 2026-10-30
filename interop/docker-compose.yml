@@ -187,6 +187,50 @@ services:
       timeout: 2s
       retries: 15
 
+  # ─────────────────── EVerest charge point (profile `everest`) ───────────────────
+  # The other direction: real EVerest charge-point software (SIL: simulated EV, power board and meter) connecting
+  # to wattsim's CSMS, which runs on the host (`bun interop/scripts/everest.ts` or `bun interop/scripts/csms.ts`).
+  # Not started by a plain `up`; see interop/README.md "EVerest".
+  everest-mqtt:
+    profiles: [everest]
+    # Mosquitto with anonymous access on 1883; EVerest's modules talk to each other over it, and the car simulator
+    # and dummy token provider take their commands from it (everest.ts publishes with `mosquitto_pub` in here).
+    image: ghcr.io/everest/everest-demo/mqtt-server:2025.10.0-single-phase@sha256:1aa72f12ef8556c38d630723c524036fa2f2f8e8115ea2abf4769b3eb7600096
+    ports:
+      - '${EVEREST_MQTT_PORT:-11883}:1883'
+    healthcheck:
+      test: ['CMD', 'mosquitto_sub', '-h', '127.0.0.1', '-t', '$$SYS/broker/version', '-C', '1', '-W', '3']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  everest:
+    profiles: [everest]
+    # everest-demo's manager image: EVerest 2025.10.0 (everest-core, libocpp) built with the demo's patches;
+    # multi-arch amd64/arm64, ~20 GB unpacked. The tag is the one everest-demo's .env pins at its main branch.
+    image: ghcr.io/everest/everest-demo/manager:2025.10.0-single-phase@sha256:9165d0937323ae61ee2e496f68f3c4a465ed9099740e489df1f0161265492756
+    depends_on:
+      everest-mqtt:
+        condition: service_healthy
+    environment:
+      MQTT_SERVER_ADDRESS: everest-mqtt
+      # 1.6 or 2.0.1; see interop/everest/start.sh.
+      EVEREST_OCPP_VERSION: '${EVEREST_OCPP_VERSION:-1.6}'
+      # wattsim's CSMS as seen from the container (host:port, no scheme).
+      WATTSIM_CSMS: '${WATTSIM_CSMS:-host.docker.internal:19210}'
+      EVEREST_STATION_ID: '${EVEREST_STATION_ID:-}'
+      # false: monotonic simulated energy register (see start.sh and README "Findings").
+      EVEREST_SIL_RESET_METER: '${EVEREST_SIL_RESET_METER:-false}'
+    entrypoint: ['bash', '/interop/start.sh']
+    volumes:
+      - ./everest/start.sh:/interop/start.sh:ro
+    extra_hosts:
+      # Native on Docker Desktop / OrbStack; needed on Linux (CI).
+      - 'host.docker.internal:host-gateway'
+    sysctls:
+      # The SIL EV and charger talk ISO 15118 over IPv6 link-local even when HLC is off.
+      - net.ipv6.conf.all.disable_ipv6=0
+
 volumes:
   steve-db-data:
   steve-m2:
