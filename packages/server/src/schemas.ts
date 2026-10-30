@@ -53,6 +53,9 @@ export const CONNECTOR_STATUSES = [
   'Faulted',
 ] as const;
 
+/** Most reboots one `bootLoop` action takes. */
+export const MAX_BOOT_LOOPS = 20;
+
 const withEvse = { evse };
 export const ACTION_SCHEMAS = {
   connect: z.object({}),
@@ -79,30 +82,151 @@ export const ACTION_SCHEMAS = {
   stop: z.object({ ...withEvse, reason: z.string().min(1).optional() }),
   status: z.object({ ...withEvse, status: z.enum(CONNECTOR_STATUSES) }),
   send: z.object({ action: z.string().min(1), payload: z.record(z.string(), z.unknown()) }),
+  // Behavioural faults (core `faults.ts`).
+  /** Boot, then reboot right after each Accepted boot `count` times. */
+  bootLoop: z.object({ count: z.number().int().min(0).max(MAX_BOOT_LOOPS) }),
+  /** A spontaneous Faulted: 1.6 ChargePointErrorCode, 2.x NotifyEvent techCode (default OtherError). */
+  fault: z.object({
+    ...withEvse,
+    code: z
+      .string()
+      .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'must be one word of letters, digits and _ (the DSL writes it bare)')
+      .max(50)
+      .optional(),
+  }),
+  /** Turn the import register back by `wh`, or reset it to 0; without `evse`, on every EVSE. */
+  meter: z
+    .object({
+      op: z.enum(['backwards', 'reset']),
+      evse: evse.optional(),
+      wh: z.number().min(0).max(1e9).optional(),
+    })
+    .refine((b) => (b.op === 'backwards') === (b.wh !== undefined), {
+      message: "wh is required for op 'backwards' and only allowed with it",
+      path: ['wh'],
+    }),
+  /** The station resets itself: hard (power loss) or soft (transactions end first). */
+  reset: z.object({ mode: z.enum(['hard', 'soft']) }),
 } as const;
 
 export type ActionType = keyof typeof ACTION_SCHEMAS;
 export type ActionBody = { [K in ActionType]: { type: K } & z.infer<(typeof ACTION_SCHEMAS)[K]> }[ActionType];
 
+/** The original transport faults: core `ChaosEffect`. */
 export const CHAOS_FAULTS = ['drop', 'delay', 'duplicate', 'corrupt', 'wrongId', 'callError', 'noResponse'] as const;
+/** Milestone-4 transport faults: core `ChaosFaultEffect`. */
+export const TRANSPORT_FAULTS = ['jitter', 'reorder', 'halfOpen', 'slowRead', 'reconnectStorm'] as const;
+/** Milestone-4 protocol faults: deliberate schema breaks in what the station sends. */
+export const PROTOCOL_FAULTS = ['invalidEnum', 'missingField', 'timestamp', 'oversized'] as const;
+export const ALL_CHAOS_FAULTS = [...CHAOS_FAULTS, ...TRANSPORT_FAULTS, ...PROTOCOL_FAULTS] as const;
+export type ChaosFaultName = (typeof ALL_CHAOS_FAULTS)[number];
+
+/** Largest `oversized` payload the API takes, in kB (1 kB = 1024 bytes). */
+export const MAX_OVERSIZED_KB = 1024;
+/** Longest delay-like parameter: a day. */
+const MAX_MS = 86_400_000;
+
+const ms = z.number().int().min(0).max(MAX_MS);
+const positiveMs = z.number().int().min(1).max(MAX_MS);
+
+/** The parameters each fault takes: `true` required, `false` optional. Any other parameter is a 400. */
+const FAULT_PARAMS: Record<ChaosFaultName, Record<string, boolean>> = {
+  drop: {},
+  delay: { delayMs: true },
+  duplicate: {},
+  corrupt: {},
+  wrongId: {},
+  callError: {},
+  noResponse: {},
+  jitter: { minMs: true, maxMs: true },
+  reorder: { after: false },
+  halfOpen: { forMs: false },
+  slowRead: { stepMs: true },
+  reconnectStorm: { count: true, withinMs: true },
+  invalidEnum: { path: false },
+  missingField: { path: false },
+  timestamp: { shiftMs: true },
+  oversized: { kb: true },
+};
+const PARAM_NAMES = [...new Set(Object.values(FAULT_PARAMS).flatMap((p) => Object.keys(p)))];
+const OUT_ONLY_FAULTS: ReadonlySet<string> = new Set(PROTOCOL_FAULTS);
 
 export const chaosRule = z
   .object({
-    fault: z.enum(CHAOS_FAULTS),
+    fault: z.enum(ALL_CHAOS_FAULTS),
     direction: z.enum(['in', 'out']).optional(),
     action: z.string().min(1).optional(),
     nth: z.number().int().min(1).optional(),
     every: z.number().int().min(1).optional(),
     probability: z.number().min(0).max(1).optional(),
     once: z.boolean().optional(),
-    delayMs: z.number().int().min(0).optional(),
+    /** `delay`: hold every matching frame this long. */
+    delayMs: ms.optional(),
+    /** `jitter`: a delay drawn uniformly from `minMs..maxMs` per frame. */
+    minMs: ms.optional(),
+    maxMs: ms.optional(),
+    /** `reorder`: hold the frame until this many later frames have passed it (default 1). */
+    after: z.number().int().min(1).max(100).optional(),
+    /** `halfOpen`: drop the socket after this long; without it the link stays half-open. */
+    forMs: positiveMs.optional(),
+    /** `slowRead`: the n-th received frame waits n x stepMs. */
+    stepMs: positiveMs.optional(),
+    /** `reconnectStorm`: drop and reconnect `count` times within `withinMs`. */
+    count: z.number().int().min(1).max(100).optional(),
+    withinMs: positiveMs.optional(),
+    /** `invalidEnum` / `missingField`: payload path, dot-joined, array positions as numbers. Default: the first fit. */
+    path: z
+      .string()
+      .regex(
+        /^[a-z][A-Za-z0-9_]*(\.([A-Za-z_][A-Za-z0-9_]*|\d+))*$/,
+        'must be a payload path such as idTagInfo.status or meterValue.0.timestamp',
+      )
+      .max(200)
+      .optional(),
+    /** `timestamp`: shift every date-time field by this much (negative: into the past). */
+    shiftMs: z
+      .number()
+      .int()
+      .min(-MAX_MS * 365)
+      .max(MAX_MS * 365)
+      .refine((n) => n !== 0, 'must not be 0')
+      .optional(),
+    /** `oversized`: pad the payload to this many kB. */
+    kb: z.number().positive().max(MAX_OVERSIZED_KB).optional(),
   })
-  .refine((r) => [r.nth, r.every, r.probability].filter((x) => x !== undefined).length <= 1, {
-    message: 'give at most one of nth, every, probability',
-  })
-  .refine((r) => (r.fault === 'delay') === (r.delayMs !== undefined), {
-    message: "delayMs is required for fault 'delay' and only allowed with it",
-    path: ['delayMs'],
+  .superRefine((r, ctx) => {
+    if ([r.nth, r.every, r.probability].filter((x) => x !== undefined).length > 1) {
+      ctx.addIssue({ code: 'custom', message: 'give at most one of nth, every, probability' });
+    }
+    const allowed = FAULT_PARAMS[r.fault];
+    for (const name of PARAM_NAMES) {
+      const given = (r as Record<string, unknown>)[name] !== undefined;
+      if (allowed[name] === true && !given) {
+        ctx.addIssue({ code: 'custom', path: [name], message: `${name} is required for fault '${r.fault}'` });
+      } else if (allowed[name] === undefined && given) {
+        const owners = Object.entries(FAULT_PARAMS)
+          .filter(([, p]) => name in p)
+          .map(([f]) => `'${f}'`);
+        ctx.addIssue({ code: 'custom', path: [name], message: `${name} is only allowed with ${owners.join(', ')}` });
+      }
+    }
+    if (r.fault === 'jitter' && r.minMs !== undefined && r.maxMs !== undefined && r.maxMs < r.minMs) {
+      ctx.addIssue({ code: 'custom', path: ['maxMs'], message: 'must be >= minMs' });
+    }
+    if (OUT_ONLY_FAULTS.has(r.fault) && r.direction === 'in') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['direction'],
+        message: `'${r.fault}' changes payloads the station sends: use 'out' or no direction`,
+      });
+    }
+    if (r.fault === 'slowRead' && r.direction === 'out') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['direction'],
+        message: "'slowRead' delays frames the station receives: use 'in' or no direction",
+      });
+    }
   });
 
 export type ChaosBody = z.infer<typeof chaosRule>;

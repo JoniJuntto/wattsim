@@ -61,6 +61,7 @@ export function runSummary(r: RunRow): RunSummary {
   if (r.durationMs !== null) s.durationMs = r.durationMs;
   if (r.error !== null) s.error = r.error;
   if (r.recordingId !== null) s.recordingId = r.recordingId;
+  if (r.csms !== null) s.csms = r.csms;
   return s;
 }
 
@@ -177,6 +178,7 @@ export class Store {
     const row = this.run(id);
     if (!row) return false;
     if (row.recordingId) this.deleteRecording(row.recordingId);
+    if (row.csms) this.deleteReport(row.csms.reportId);
     this.db.delete(schema.runs).where(eq(schema.runs.id, id)).run();
     return true;
   }

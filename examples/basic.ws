@@ -5,7 +5,6 @@ csms "ws://localhost:9000/ocpp"
 
 station "CP-1" {
   version 1.6
-  heartbeat 1min
   meterInterval 30s
   boot
   expect result BootNotification {status: "Accepted"} within 10s

@@ -32,7 +32,7 @@ import {
 } from './schemas';
 import { serveUi } from './static';
 import { StreamHub } from './stream';
-import { TestCsms } from './test-csms';
+import { startTestCsmsOn, TestCsms } from './test-csms';
 import type { ScenarioDiagnostic, StationView } from './types';
 
 export { DB_FILE } from './db/store';
@@ -130,7 +130,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
   const reg: Registry = new Registry(hub);
   const store = new Store(opts.dataDir);
   const baseDir = resolve(opts.dataDir ?? process.cwd());
-  const runs = new Runs(store, hub);
+  const runs = new Runs(store, hub, (clock) => startTestCsmsOn({ host, clock }));
   const testCsms = new TestCsms(
     host,
     opts.csmsPort ?? 0,
@@ -229,15 +229,20 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       const p = await prepare(b.source, baseDir);
       if (!p.ok) throw new InvalidScenario(p.diagnostics);
       const own = p.scenario.csms;
-      const override = b.target === 'loopback' ? await testCsms.start() : b.csmsUrl;
-      if (override === undefined && !own) {
-        throw new BadRequest('csmsUrl: the scenario has no csms line; give a URL or use the test CSMS');
-      }
-      // Shown in the history; the interpreter resolves the scenario's own line (it may use variables).
-      const csmsUrl = override ?? (own?.kind === 'string' ? own.raw : `{${own?.name}}`);
       const saved = b.scenarioId === undefined ? undefined : store.scenario(b.scenarioId);
       if (b.scenarioId !== undefined && !saved) throw new NotFound(`no scenario ${b.scenarioId}`);
-      const run = runs.start({
+      // A virtual run against the test CSMS gets a CSMS of its own on the run's clock (see `StartRun.dedicatedCsms`);
+      // a real-time one shares the built-in test CSMS.
+      const dedicatedCsms = b.target === 'loopback' && b.virtual;
+      const override = b.target === 'url' ? b.csmsUrl : dedicatedCsms ? undefined : await testCsms.start();
+      if (override === undefined && !own && !dedicatedCsms) {
+        throw new BadRequest('csmsUrl: the scenario has no csms line; give a URL or use the test CSMS');
+      }
+      // Shown in the history (a dedicated CSMS's URL replaces it); the interpreter resolves the scenario's own line
+      // (it may use variables).
+      const csmsUrl = override ?? (own?.kind === 'string' ? own.raw : own ? `{${own.name}}` : '');
+      const run = await runs.start({
+        dedicatedCsms,
         source: b.source,
         scenario: p.scenario,
         file: p.file,

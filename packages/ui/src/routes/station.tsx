@@ -13,6 +13,7 @@ import { useDeleteStation, useFrameHistory, useStationAction } from '@/api/queri
 import type { StationAction, StationView } from '@/api/types';
 import { ChaosPanel } from '@/components/app/chaos-panel';
 import { EvseCard } from '@/components/app/evse-card';
+import { StationFaultsMenu } from '@/components/app/fault-actions';
 import { MessageLog } from '@/components/app/message-log';
 import { SendMessagePanel } from '@/components/app/send-message';
 import { ConnectionPill, VersionBadge } from '@/components/app/status';
@@ -79,6 +80,7 @@ function Header({ station }: { station: StationView }) {
         {linkUp ? btn('disconnect', 'Disconnect', PowerOffIcon, false) : btn('connect', 'Connect', PowerIcon, false)}
         {btn('boot', 'Boot', PlugIcon, !online)}
         {btn('heartbeat', 'Heartbeat', HeartPulseIcon, !online || !station.booted)}
+        <StationFaultsMenu run={(a) => action.mutate(a)} pending={pending === 'bootLoop' || pending === 'reset'} />
         <Tooltip>
           <TooltipTrigger asChild>
             <Button asChild variant="ghost" size="icon-sm">
@@ -163,6 +165,7 @@ function StationBody({ station, focusFrameId }: { station: StationView; focusFra
           <EvseCard
             key={evse.id}
             stationId={station.id}
+            version={station.version}
             evse={evse}
             run={run}
             pendingType={pendingEvse === evse.id ? action.variables?.type : undefined}

@@ -6,27 +6,29 @@ import { ActionPicker } from '@/components/app/action-picker';
 import { Button } from '@/components/ui/button';
 import { Field, FieldDescription, FieldError, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectSeparator,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
-
-const FAULTS: { value: string; label: string; help: string }[] = [
-  { value: 'drop', label: 'Drop', help: 'The frame is lost: never sent, or never processed when received.' },
-  { value: 'delay', label: 'Delay', help: 'Hold the frame for a while before it goes out or is processed.' },
-  { value: 'duplicate', label: 'Duplicate', help: 'The frame goes over the wire twice.' },
-  { value: 'corrupt', label: 'Corrupt', help: 'The frame is turned into invalid JSON.' },
-  { value: 'wrongId', label: 'Wrong message id', help: 'The response carries a message id that matches no CALL.' },
-  { value: 'callError', label: 'CALLERROR', help: 'Answer the CALL with a CALLERROR instead of a result.' },
-  { value: 'noResponse', label: 'No response', help: 'Swallow an inbound CALL so the CSMS never gets an answer.' },
-];
+import { FAULT_GROUPS, FAULTS, type FaultField, faultParams, faultSpec } from '@/lib/faults';
 
 type Trigger = 'always' | 'nth' | 'every' | 'probability';
 
 function RuleRow({ rule, onRemove, removing }: { rule: ChaosRuleView; onRemove: () => void; removing: boolean }) {
-  const fault = FAULTS.find((f) => f.value === rule.fault)?.label ?? rule.fault;
+  const spec = faultSpec(rule.fault);
+  const fault = spec?.label ?? rule.fault;
+  const direction = rule.direction ?? spec?.onlyDirection;
   const parts = [
-    rule.direction === 'in' ? 'received' : rule.direction === 'out' ? 'sent' : 'both directions',
+    direction === 'in' ? 'received' : direction === 'out' ? 'sent' : 'both directions',
     rule.action ?? 'any action',
     rule.trigger ?? 'every frame',
   ];
@@ -36,6 +38,7 @@ function RuleRow({ rule, onRemove, removing }: { rule: ChaosRuleView; onRemove: 
         <span className="font-medium text-sm">
           {fault}
           {rule.delayMs !== undefined && <span className="font-normal"> {rule.delayMs} ms</span>}
+          {rule.detail !== undefined && <span className="font-mono font-normal text-xs"> {rule.detail}</span>}
           {rule.once && <span className="font-normal text-muted-foreground"> (once)</span>}
         </span>
         <span className="truncate text-muted-foreground text-xs">{parts.join(', ')}</span>
@@ -64,17 +67,26 @@ export function ChaosPanel({ station }: { station: StationView }) {
   const [action, setAction] = useState('');
   const [trigger, setTrigger] = useState<Trigger>('always');
   const [n, setN] = useState('3');
-  const [delayMs, setDelayMs] = useState('2000');
+  /** Typed parameter values by `fault.key`, so switching faults keeps what was typed. */
+  const [values, setValues] = useState<Record<string, string>>({});
   const [once, setOnce] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const acts = meta.data?.actions[station.version];
-  const help = FAULTS.find((f) => f.value === fault)?.help;
+  const spec = faultSpec(fault);
+  const only = spec?.onlyDirection;
+  const paramValue = (f: FaultField) => values[`${fault}.${f.key}`] ?? f.default;
+  const setValue = (f: FaultField, v: string) => setValues((prev) => ({ ...prev, [`${fault}.${f.key}`]: v }));
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    const body: ChaosRuleBody = { fault, once };
-    if (direction !== 'both') body.direction = direction;
+    const params = faultParams(fault, Object.fromEntries((spec?.fields ?? []).map((f) => [f.key, paramValue(f)])));
+    if (!params.ok) {
+      setError(params.error);
+      return;
+    }
+    const body: ChaosRuleBody = { fault, once, ...params.params };
+    if (!only && direction !== 'both') body.direction = direction;
     if (action) body.action = action;
     if (trigger !== 'always') {
       const v = Number(n);
@@ -89,14 +101,6 @@ export function ChaosPanel({ station }: { station: StationView }) {
         }
         body.probability = v / 100;
       } else body[trigger] = v;
-    }
-    if (fault === 'delay') {
-      const d = Number(delayMs);
-      if (!Number.isInteger(d) || d < 0) {
-        setError('Delay is a whole number of milliseconds.');
-        return;
-      }
-      body.delayMs = d;
     }
     setError(null);
     add.mutate(body);
@@ -117,8 +121,8 @@ export function ChaosPanel({ station }: { station: StationView }) {
         </ul>
       ) : (
         <p className="text-muted-foreground text-sm">
-          No chaos rules. Every frame passes untouched. Rules apply in order and the first match wins; a delay combines
-          with one other rule.
+          No chaos rules. Every frame passes untouched. Rules apply in order and the first match wins; a delay (also
+          jitter and slow reader) combines with one other rule.
         </p>
       )}
 
@@ -131,16 +135,20 @@ export function ChaosPanel({ station }: { station: StationView }) {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectGroup>
-                  {FAULTS.map((f) => (
-                    <SelectItem key={f.value} value={f.value}>
-                      {f.label}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
+                {FAULT_GROUPS.map((group, i) => (
+                  <SelectGroup key={group}>
+                    {i > 0 && <SelectSeparator />}
+                    <SelectLabel>{group === 'Protocol' ? 'Protocol (what the station sends)' : group}</SelectLabel>
+                    {FAULTS.filter((f) => f.group === group).map((f) => (
+                      <SelectItem key={f.value} value={f.value}>
+                        {f.label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                ))}
               </SelectContent>
             </Select>
-            <FieldDescription>{help}</FieldDescription>
+            <FieldDescription>{spec?.help}</FieldDescription>
           </Field>
           <Field>
             <FieldLabel htmlFor={`${uid}-action`}>Action</FieldLabel>
@@ -158,21 +166,50 @@ export function ChaosPanel({ station }: { station: StationView }) {
             <FieldDescription>Responses match the action of the CALL they answer.</FieldDescription>
           </Field>
         </div>
+        {spec && spec.fields.length > 0 && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            {spec.fields.map((f) => (
+              <Field key={`${fault}.${f.key}`}>
+                <FieldLabel htmlFor={`${uid}-${f.key}`}>
+                  {f.label}
+                  {!f.required && <span className="font-normal text-muted-foreground">optional</span>}
+                </FieldLabel>
+                <Input
+                  id={`${uid}-${f.key}`}
+                  inputMode={f.kind === 'path' ? 'text' : f.kind === 'int' ? 'numeric' : 'decimal'}
+                  value={paramValue(f)}
+                  placeholder={f.placeholder}
+                  onChange={(e) => setValue(f, e.target.value)}
+                  className={f.kind === 'path' ? 'h-7 font-mono' : 'h-7'}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <FieldDescription>{f.help}</FieldDescription>
+              </Field>
+            ))}
+          </div>
+        )}
         <div className="flex flex-wrap items-end gap-3">
           <Field className="w-auto">
             <FieldLabel id={`${uid}-dir`}>Direction</FieldLabel>
-            <ToggleGroup
-              type="single"
-              variant="outline"
-              size="sm"
-              value={direction}
-              onValueChange={(v) => v && setDirection(v as 'both' | 'in' | 'out')}
-              aria-labelledby={`${uid}-dir`}
-            >
-              <ToggleGroupItem value="both">Both</ToggleGroupItem>
-              <ToggleGroupItem value="out">Sent</ToggleGroupItem>
-              <ToggleGroupItem value="in">Received</ToggleGroupItem>
-            </ToggleGroup>
+            {only ? (
+              <p className="flex h-7 items-center text-muted-foreground text-sm">
+                {only === 'out' ? 'Only frames the station sends' : 'Only frames the station receives'}
+              </p>
+            ) : (
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                size="sm"
+                value={direction}
+                onValueChange={(v) => v && setDirection(v as 'both' | 'in' | 'out')}
+                aria-labelledby={`${uid}-dir`}
+              >
+                <ToggleGroupItem value="both">Both</ToggleGroupItem>
+                <ToggleGroupItem value="out">Sent</ToggleGroupItem>
+                <ToggleGroupItem value="in">Received</ToggleGroupItem>
+              </ToggleGroup>
+            )}
           </Field>
           <Field className="w-44">
             <FieldLabel htmlFor={`${uid}-trigger`}>When</FieldLabel>
@@ -198,18 +235,6 @@ export function ChaosPanel({ station }: { station: StationView }) {
                 inputMode="decimal"
                 value={n}
                 onChange={(e) => setN(e.target.value)}
-                className="h-7"
-              />
-            </Field>
-          )}
-          {fault === 'delay' && (
-            <Field className="w-28">
-              <FieldLabel htmlFor={`${uid}-delay`}>Delay (ms)</FieldLabel>
-              <Input
-                id={`${uid}-delay`}
-                inputMode="numeric"
-                value={delayMs}
-                onChange={(e) => setDelayMs(e.target.value)}
                 className="h-7"
               />
             </Field>

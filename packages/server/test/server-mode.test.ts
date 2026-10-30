@@ -161,6 +161,40 @@ describe('runs', () => {
     expect(recordings.find((r) => r.id === run.recordingId)).toMatchObject({ kind: 'run', runId: run.id });
   });
 
+  test('a virtual run gets a test CSMS on its own clock: examples/basic.ws has no findings', async () => {
+    const source = await Bun.file(join(import.meta.dir, '../../../examples/basic.ws')).text();
+    const started = await json<RunSummary>(api.post('/api/runs', { source, name: 'basic' }));
+    // Not the shared test CSMS: a CSMS of the run's own.
+    const shared = await json<CsmsView>(api.get('/api/csms'));
+    expect(started.csmsUrl).not.toBe(shared.summary.url ?? '');
+    const run = await waitRun(started.id, 20_000);
+    expect(run.status).toBe('passed');
+    // Half an hour of virtual time: on the wall clock every later timestamp would be time.skew.
+    expect(run.durationMs).toBeGreaterThanOrEqual(30 * 60_000);
+    expect(run.csms).toEqual({ reportId: expect.any(String), total: 0, errors: 0, warnings: 0 });
+    const reportId = run.csms?.reportId as string;
+    const reports = await json<CsmsReportSummary[]>(api.get('/api/csms/reports'));
+    expect(reports.find((r) => r.id === reportId)).toMatchObject({ stations: 1, total: 0, csmsUrl: started.csmsUrl });
+    const report = await json<{ total: number; byIdentity: Record<string, unknown> }>(
+      api.get(`/api/csms/reports/${reportId}`),
+    );
+    expect(report.total).toBe(0);
+    expect(Object.keys(report.byIdentity)).toEqual(['CP-1']);
+    // The run's CSMS is gone once the run ends, and its report goes with the run.
+    expect(await fetch(started.csmsUrl.replace(/^ws/, 'http')).catch(() => 'closed')).toBe('closed');
+    expect((await api.del(`/api/runs/${run.id}`)).status).toBe(204);
+    expect((await api.get(`/api/csms/reports/${reportId}`)).status).toBe(404);
+  });
+
+  test('a run CSMS reports what it finds', async () => {
+    // A station whose clock is set two hours ahead of the run clock: every timestamp is time.skew.
+    const source = GOOD.replace('version 1.6', 'version 1.6\n  clock skew 2h');
+    const run = await waitRun((await json<RunSummary>(api.post('/api/runs', { source }))).id);
+    expect(run.csms?.total ?? 0).toBeGreaterThan(0);
+    const report = await json<{ byRule: Record<string, unknown> }>(api.get(`/api/csms/reports/${run.csms?.reportId}`));
+    expect(Object.keys(report.byRule)).toContain('time.skew');
+  });
+
   test('a failing assertion fails the run', async () => {
     const source = GOOD.replace('status: "Accepted"', 'status: "Rejected"').replace('within 10s', 'within 2s');
     const started = await json<RunSummary>(api.post('/api/runs', { source }));
@@ -287,7 +321,8 @@ describe('persistence', () => {
         10_000,
         'run',
       );
-      // The test CSMS saw a station: stopping the server saves its report.
+      // The shared test CSMS saw the real-time run's station: stopping the server saves its report. The virtual run
+      // saved the report of its own CSMS when it ended.
       await first.server.stop();
 
       const second = await boot({ dataDir: dir });
@@ -300,8 +335,10 @@ describe('persistence', () => {
         expect(runs.find((r) => r.id === slow.id)?.status).toBe('cancelled');
         expect((await second.get(`/api/runs/${started.id}/trace`)).status).toBe(200);
         const reports = await json<CsmsReportSummary[]>(second.get('/api/csms/reports'));
-        expect(reports.length).toBe(1);
-        expect(reports[0]?.stations).toBeGreaterThanOrEqual(1);
+        expect(reports.length).toBe(2);
+        expect(reports.every((r) => r.stations >= 1)).toBe(true);
+        const own = runs.find((r) => r.id === started.id)?.csms?.reportId;
+        expect(reports.find((r) => r.id === own)?.name).toStartWith('run kept ');
       } finally {
         await second.server.stop();
       }

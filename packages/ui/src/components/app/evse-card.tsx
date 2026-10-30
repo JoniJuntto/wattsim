@@ -1,6 +1,7 @@
 import { ChevronDownIcon, PlugIcon, PlugZapIcon, UnplugIcon } from 'lucide-react';
 import { type FormEvent, useId, useState } from 'react';
-import type { EvseView, StationAction } from '@/api/types';
+import type { EvseView, OcppVersion, StationAction } from '@/api/types';
+import { EvseFaultsMenu } from '@/components/app/fault-actions';
 import { Sparkline } from '@/components/app/sparkline';
 import { StatusLabel } from '@/components/app/status';
 import { Button } from '@/components/ui/button';
@@ -130,11 +131,13 @@ function PlugForm({ evse, run, pending }: { evse: number; run: RunAction; pendin
 
 export function EvseCard({
   stationId,
+  version,
   evse,
   run,
   pendingType,
 }: {
   stationId: string;
+  version: OcppVersion;
   evse: EvseView;
   run: RunAction;
   /** `type` of the station action in flight for this EVSE, if any. */
@@ -164,29 +167,32 @@ export function EvseCard({
             tx {String(evse.transactionId)}
           </span>
         )}
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="xs" className="ml-auto">
-              Set status
-              <ChevronDownIcon data-icon="inline-end" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuGroup>
-              <DropdownMenuLabel>Send StatusNotification</DropdownMenuLabel>
-              <DropdownMenuRadioGroup
-                value={evse.status}
-                onValueChange={(status) => run({ type: 'status', evse: evse.id, status })}
-              >
-                {MANUAL_STATUSES.map((s) => (
-                  <DropdownMenuRadioItem key={s} value={s}>
-                    {STATUS_LABEL[s]}
-                  </DropdownMenuRadioItem>
-                ))}
-              </DropdownMenuRadioGroup>
-            </DropdownMenuGroup>
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <div className="ml-auto flex items-center gap-0.5">
+          <EvseFaultsMenu version={version} evse={evse.id} run={run} />
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="xs">
+                Set status
+                <ChevronDownIcon data-icon="inline-end" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>Send StatusNotification</DropdownMenuLabel>
+                <DropdownMenuRadioGroup
+                  value={evse.status}
+                  onValueChange={(status) => run({ type: 'status', evse: evse.id, status })}
+                >
+                  {MANUAL_STATUSES.map((s) => (
+                    <DropdownMenuRadioItem key={s} value={s}>
+                      {STATUS_LABEL[s]}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       </header>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">

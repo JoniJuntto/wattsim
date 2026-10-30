@@ -17,6 +17,7 @@ import type {
   ValidateBody,
   Violation,
 } from '../api/types';
+import { type MockContext, MockHttpError, seedServerMode, serverModeRoute, serverModeTick } from './mock-server-mode';
 
 const FRAME_CAP = 2000;
 
@@ -377,6 +378,30 @@ function runAction(sim: Sim, a: StationAction): unknown {
       stationUpdate(sim);
       return result;
     }
+    case 'fault': {
+      const e = evse as EvseView;
+      statusNotification(sim, e.id, 'Faulted');
+      record(`fault evse ${e.id}${a.code ? ` ${a.code}` : ''}`);
+      break;
+    }
+    case 'meter': {
+      const targets = evse ? [evse] : sim.view.evses;
+      for (const e of targets)
+        setEvse(sim, e.id, { energyWh: a.op === 'reset' ? 0 : Math.max(0, e.energyWh - a.wh), txEnergyWh: undefined });
+      record(
+        a.op === 'reset'
+          ? `meter reset${evse ? ` evse ${evse.id}` : ''}`
+          : `meter backwards ${a.wh}Wh${evse ? ` evse ${evse.id}` : ''}`,
+      );
+      break;
+    }
+    case 'reset':
+    case 'bootLoop': {
+      const times = a.type === 'reset' ? 1 : a.count + 1;
+      for (let i = 0; i < times; i++) setTimeout(() => stations.has(id) && boot(sim), i * 700);
+      record(a.type === 'reset' ? `reset ${a.mode}` : `bootLoop ${a.count}`);
+      break;
+    }
   }
   stationUpdate(sim);
   return undefined;
@@ -436,7 +461,34 @@ function chaosView(body: ChaosRuleBody): ChaosRuleView {
     trigger,
     once: body.once ?? false,
     delayMs: body.delayMs,
+    detail: chaosDetail(body),
   };
+}
+
+/** Roughly what the server puts in `ChaosRuleView.detail`. */
+function chaosDetail(b: ChaosRuleBody): string | undefined {
+  const ms = (n: number) => (n % 60_000 === 0 ? `${n / 60_000}min` : n % 1000 === 0 ? `${n / 1000}s` : `${n}ms`);
+  switch (b.fault) {
+    case 'jitter':
+      return `${ms(b.minMs ?? 0)}..${ms(b.maxMs ?? 0)}`;
+    case 'reorder':
+      return b.after === undefined ? undefined : `after ${b.after}`;
+    case 'halfOpen':
+      return b.forMs === undefined ? undefined : `for ${ms(b.forMs)}`;
+    case 'slowRead':
+      return ms(b.stepMs ?? 0);
+    case 'reconnectStorm':
+      return `${b.count} within ${ms(b.withinMs ?? 0)}`;
+    case 'invalidEnum':
+    case 'missingField':
+      return b.path;
+    case 'timestamp':
+      return `${(b.shiftMs ?? 0) < 0 ? '-' : ''}${ms(Math.abs(b.shiftMs ?? 0))}`;
+    case 'oversized':
+      return `${b.kb}kB`;
+    default:
+      return undefined;
+  }
 }
 
 const json = (body: unknown, status = 200) =>
@@ -449,13 +501,12 @@ async function route(method: string, url: URL, body: unknown): Promise<Response>
   const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent); // ['api', ...]
   const [, a, b, c, d] = parts;
   try {
-    if (a === 'health') return json({ ok: true, version: '0.0.1-mock' });
+    if (a === 'health') return json({ ok: true, version: '0.0.1-mock', persistent: true });
     if (a === 'meta') return json(META);
     if (a === 'validate') {
       const violations = validate(body as ValidateBody);
       return json({ ok: violations.length === 0, violations });
     }
-    if (a === 'loopback') return method === 'DELETE' ? json(undefined, 204) : json({ url: 'ws://127.0.0.1:7701/ocpp' });
     if (a === 'session') {
       let text = 'wattsim 1\n\n';
       let prev: number | undefined;
@@ -514,9 +565,11 @@ async function route(method: string, url: URL, body: unknown): Promise<Response>
         return json(undefined, 204);
       }
     }
+    const served = serverModeRoute(mockContext, method, url, parts, body);
+    if (served) return served;
     throw new HttpError(404, `Mock has no route ${method} ${url.pathname}`);
   } catch (e) {
-    if (e instanceof HttpError) return json({ error: e.message }, e.status);
+    if (e instanceof HttpError || e instanceof MockHttpError) return json({ error: e.message }, e.status);
     throw e;
   }
 }
@@ -567,6 +620,26 @@ class FakeSocket {
 }
 
 const mockState = { streamDown: false };
+
+const mockContext: MockContext = {
+  emit,
+  stationFrames: (id) => (stations.has(id) ? (frames.get(id) ?? []) : undefined),
+  stationIds: () => [...stations.keys()],
+  stationVersion: (id) => stations.get(id)?.view.version,
+  stationState: (id) => {
+    const view = stations.get(id)?.view;
+    const v16 = view?.version === 'ocpp1.6';
+    // 2.x has no Charging / Preparing connector status: those are Occupied.
+    const wire = (status: string) =>
+      v16 || ['Available', 'Unavailable', 'Faulted', 'Reserved'].includes(status) ? status : 'Occupied';
+    return {
+      statuses: Object.fromEntries((view?.evses ?? []).map((e) => [v16 ? String(e.id) : `${e.id}/1`, wire(e.status)])),
+      activeTransactions: (view?.evses ?? []).flatMap((e) =>
+        e.transactionId === undefined ? [] : [String(e.transactionId)],
+      ),
+    };
+  },
+};
 
 function tick() {
   for (const sim of stations.values()) {
@@ -774,6 +847,7 @@ function seed() {
 export function installMock() {
   const empty = new URLSearchParams(window.location.search).get('mock') === 'empty';
   if (!empty) seed();
+  seedServerMode(mockContext, empty);
   const realFetch = window.fetch.bind(window);
   window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input), window.location.origin);
@@ -788,7 +862,10 @@ export function installMock() {
     if (String(url).endsWith('/api/stream')) return new FakeSocket(String(url));
     return new RealWebSocket(url, protocols);
   } as unknown as typeof WebSocket;
-  setInterval(tick, 1000);
+  setInterval(() => {
+    tick();
+    serverModeTick(mockContext);
+  }, 1000);
   // Console hooks for checking reconnect behaviour by hand.
   Object.assign(window, {
     wattsimMock: {

@@ -37,6 +37,10 @@ export function useFrameHistory(stationId: string) {
 const ACTION_DONE: Partial<Record<StationAction['type'], string>> = {
   heartbeat: 'Heartbeat answered',
   boot: 'BootNotification answered',
+  bootLoop: 'Boot loop finished',
+  reset: 'Reset done: the station booted again',
+  fault: 'EVSE faulted',
+  meter: 'Meter register changed',
 };
 
 export function useStationAction(stationId: string) {

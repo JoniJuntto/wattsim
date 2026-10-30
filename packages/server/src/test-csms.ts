@@ -4,7 +4,7 @@
  * finding totals, and a CSMS-side frame ring per station, so findings of stations that are not UI stations (scenario
  * runs, external chargers) still link to the frame they are about.
  */
-import type { ConformanceReport, ConformanceViolation, Csms, Session } from '@wattsim/csms';
+import type { Clock, ConformanceReport, ConformanceViolation, Csms, Session } from '@wattsim/csms';
 import { addToReport, emptyReport, RULES, startCsms } from '@wattsim/csms';
 import { createTestCa, signCsr } from '@wattsim/pki';
 import { MessageType } from '@wattsim/protocol';
@@ -27,6 +27,27 @@ type Running = {
   rings: Map<string, Ring>;
   off: Array<() => void>;
 };
+
+/** One test CA per process: CSMS instances started for runs share it (signing CSRs is all it does). */
+let testCa: ReturnType<typeof createTestCa> | undefined;
+
+/**
+ * Start a test CSMS like the built-in one, on `clock`. Virtual runs against the test CSMS get one of these on the run's
+ * virtual clock, so the timestamps stations send are checked against the time they live in, not the wall clock.
+ */
+export async function startTestCsmsOn(opts: { host: string; clock?: Clock; port?: number }): Promise<Csms> {
+  testCa ??= createTestCa({ name: 'wattsim test CA' }).catch((err: unknown) => {
+    testCa = undefined;
+    throw err;
+  });
+  const ca = await testCa;
+  return startCsms({
+    host: opts.host,
+    port: opts.port ?? 0,
+    clock: opts.clock,
+    signer: ({ csr, identity }) => signCsr(ca, csr, { identity }),
+  });
+}
 
 export class TestCsms {
   private starting: Promise<Running> | undefined;
@@ -71,13 +92,8 @@ export class TestCsms {
   }
 
   private async boot(): Promise<Running> {
-    const ca = await createTestCa({ name: 'wattsim test CA' });
     // Same interface as the UI server, so `wattsim ui --host 0.0.0.0` makes the test CSMS reachable remotely too.
-    const csms = await startCsms({
-      host: this.host,
-      port: this.port,
-      signer: ({ csr, identity }) => signCsr(ca, csr, { identity }),
-    });
+    const csms = await startTestCsmsOn({ host: this.host, port: this.port });
     const r: Running = { csms, startedAt: Date.now(), totals: emptyReport(), rings: new Map(), off: [] };
     const changed = (s: Session) => this.sessionChanged(s.identity);
     r.off.push(

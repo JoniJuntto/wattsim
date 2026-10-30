@@ -2,10 +2,21 @@
  * Station registry: owns every `Station`, its chaos engine, its frame ring buffer and its timers. Turns HTTP
  * commands into core calls, records them for the session export and reports changes to a `Sink` (the stream hub).
  */
-import type { ChaosEffect, ChaosMatch, ChaosRule, EvConfig, EvseState, Station } from '@wattsim/core';
-import { ChaosEngine, Station as CoreStation } from '@wattsim/core';
+import type { ChaosMatch, ChaosRule, EvConfig, EvseState, Station } from '@wattsim/core';
+import {
+  bootLoop,
+  ChaosEngine,
+  Station as CoreStation,
+  DEFAULT_FAULT_CODE,
+  ERROR_CODES_16,
+  faultEvse,
+  meterBackwards,
+  meterReset,
+  resetStation,
+} from '@wattsim/core';
 import type { Frame, Violation } from '@wattsim/protocol';
 import { isKnownAction, MessageType, validatePayload } from '@wattsim/protocol';
+import { buildChaos } from './chaos';
 import { TrackedClock } from './clock';
 import type { ActionBody, ChaosBody, CreateStation } from './schemas';
 import { BadRequest } from './schemas';
@@ -256,7 +267,7 @@ export class Registry {
   /** Validate an action against the station and return the call plus its scenario line. */
   private plan(e: Entry, body: ActionBody): { run: () => Promise<unknown>; line?: string } {
     const s = e.station;
-    if ('evse' in body && s.evse(body.evse) === undefined) {
+    if ('evse' in body && body.evse !== undefined && s.evse(body.evse) === undefined) {
       throw new BadRequest(`evse: no EVSE ${body.evse} on ${e.id} (have 1..${s.evses.length})`);
     }
     switch (body.type) {
@@ -326,6 +337,42 @@ export class Registry {
           line: `send ${body.action} ${dslJson(body.payload)}`,
         };
       }
+      case 'bootLoop':
+        e.wantConnected = true;
+        return { run: () => bootLoop(s, body.count), line: `bootLoop ${body.count}` };
+      case 'fault': {
+        if (e.version === 'ocpp1.6' && body.code !== undefined && !ERROR_CODES_16.includes(body.code)) {
+          throw new BadRequest(
+            `code: '${body.code}' is not an OCPP 1.6 ChargePointErrorCode (${ERROR_CODES_16.join(', ')}); default ${DEFAULT_FAULT_CODE}`,
+          );
+        }
+        return {
+          run: () => faultEvse(s, body.evse, body.code),
+          line: `fault evse ${body.evse}${body.code === undefined ? '' : ` ${body.code}`}`,
+        };
+      }
+      case 'meter': {
+        const targets = body.evse === undefined ? s.evses : [s.evse(body.evse) as EvseState];
+        const where = body.evse === undefined ? '' : ` evse ${body.evse}`;
+        if (body.op === 'reset') {
+          return {
+            run: async () => {
+              for (const evse of targets) meterReset(evse);
+            },
+            line: `meter reset${where}`,
+          };
+        }
+        const wh = body.wh as number;
+        return {
+          run: async () => {
+            for (const evse of targets) meterBackwards(evse, wh);
+          },
+          line: `meter backwards ${dslNumber(wh)}Wh${where}`,
+        };
+      }
+      case 'reset':
+        e.wantConnected = true;
+        return { run: () => resetStation(s, body.mode), line: `reset ${body.mode}` };
     }
   }
 
@@ -366,8 +413,7 @@ export class Registry {
     if (body.nth !== undefined) match.nth = body.nth;
     if (body.every !== undefined) match.every = body.every;
     if (body.probability !== undefined) match.probability = body.probability;
-    const effect: ChaosEffect =
-      body.fault === 'delay' ? { kind: 'delay', ms: body.delayMs ?? 0 } : { kind: body.fault };
+    const { effect, args } = buildChaos(body);
     const rule: ChaosRule = { match, effect, once: body.once ?? false };
     const ruleId = e.chaos.add(rule);
     const trigger =
@@ -383,10 +429,10 @@ export class Registry {
     if (body.action) view.action = body.action;
     if (trigger) view.trigger = trigger;
     if (body.fault === 'delay') view.delayMs = body.delayMs;
+    else if (args.length > 0) view.detail = args.join(' ');
     e.chaosViews.set(ruleId, view);
 
-    const parts = ['chaos', body.fault];
-    if (body.fault === 'delay') parts.push(`${dslNumber(body.delayMs ?? 0)}ms`);
+    const parts = ['chaos', body.fault, ...args];
     if (body.direction) parts.push(body.direction);
     if (body.action) parts.push(body.action);
     if (trigger) parts.push(trigger.endsWith('%') ? `probability ${trigger}` : trigger);

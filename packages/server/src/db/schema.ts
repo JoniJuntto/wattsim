@@ -5,7 +5,7 @@
  */
 import type { ConformanceReport } from '@wattsim/csms';
 import { index, integer, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
-import type { RunEventView, RunResultView } from '../types';
+import type { RunCsmsView, RunEventView, RunResultView } from '../types';
 
 export const scenarios = sqliteTable('scenarios', {
   id: text('id').primaryKey(),
@@ -37,6 +37,8 @@ export const runs = sqliteTable(
     events: text('events', { mode: 'json' }).$type<RunEventView[]>().notNull(),
     eventsDropped: integer('events_dropped').notNull().default(0),
     recordingId: text('recording_id'),
+    /** The dedicated test CSMS of a virtual loopback run: its saved report and finding totals. */
+    csms: text('csms', { mode: 'json' }).$type<RunCsmsView>(),
   },
   (t) => [index('runs_started_at').on(t.startedAt)],
 );

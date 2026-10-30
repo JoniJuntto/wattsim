@@ -6,6 +6,7 @@
  */
 import type { Clock, Station as CoreStationType, StationConfig } from '@wattsim/core';
 import { Station, VirtualClock, WallClock } from '@wattsim/core';
+import type { Csms } from '@wattsim/csms';
 import type { RunEvent, RunResult, Scenario } from '@wattsim/scenario';
 import { driveVirtual, isIdle, run as runScenario } from '@wattsim/scenario';
 import { formatTrace, Recorder } from '@wattsim/trace';
@@ -13,7 +14,7 @@ import type { RunRow, Store } from './db/store';
 import { runDetail, runSummary } from './db/store';
 import type { StreamHub } from './stream';
 import { STATE_INTERVAL_MS } from './stream';
-import type { RunDetail, RunEventView, RunResultView, RunStatus, RunSummary } from './types';
+import type { RunCsmsView, RunDetail, RunEventView, RunResultView, RunStatus, RunSummary } from './types';
 
 /** Events kept with a run (oldest first); later ones are counted in `eventsDropped`. */
 export const RUN_EVENTS_KEPT = 2000;
@@ -36,7 +37,16 @@ export type StartRun = {
   virtual: boolean;
   speed?: number;
   seed?: number;
+  /**
+   * Start a test CSMS for this run alone, on the run's clock, and connect to it (`csmsUrl` is then ignored). The
+   * server does this for virtual runs against the test CSMS: the shared one reads the wall clock, so every timestamp
+   * from a station whose virtual clock ran ahead would be a `time.skew` finding.
+   */
+  dedicatedCsms?: boolean;
 };
+
+/** Starts a test CSMS on the given clock (see `startTestCsmsOn`). */
+export type CsmsFactory = (clock: Clock) => Promise<Csms>;
 
 type Live = {
   row: RunRow;
@@ -50,6 +60,9 @@ type Live = {
   violations: number;
   streamed: number;
   recorder: Recorder;
+  clock: Clock;
+  /** The run's own test CSMS (`StartRun.dedicatedCsms`). */
+  csms?: Csms;
 };
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -100,9 +113,16 @@ export class Runs {
   constructor(
     private readonly store: Store,
     private readonly hub: StreamHub,
+    private readonly startCsms: CsmsFactory,
   ) {}
 
-  start(spec: StartRun): RunSummary {
+  async start(spec: StartRun): Promise<RunSummary> {
+    const clock: Clock = spec.virtual ? new VirtualClock(Date.now()) : new WallClock();
+    let csms: Csms | undefined;
+    if (spec.dedicatedCsms) {
+      csms = await this.startCsms(clock);
+      spec = { ...spec, csmsUrl: csms.url, overrideCsms: true };
+    }
     const now = Date.now();
     const row: RunRow = {
       id: crypto.randomUUID(),
@@ -124,6 +144,7 @@ export class Runs {
       events: [],
       eventsDropped: 0,
       recordingId: null,
+      csms: null,
     };
     this.store.insertRun(row);
     const live: Live = {
@@ -138,6 +159,8 @@ export class Runs {
       violations: 0,
       streamed: 0,
       recorder: new Recorder(),
+      clock,
+      csms,
     };
     this.live.set(row.id, live);
     live.done = this.execute(live, spec);
@@ -224,7 +247,7 @@ export class Runs {
 
   private async execute(l: Live, spec: StartRun): Promise<void> {
     const stations: CoreStationType[] = [];
-    const clock: Clock = spec.virtual ? new VirtualClock(Date.now()) : new WallClock();
+    const clock = l.clock;
     const stationFactory = (cfg: StationConfig) => {
       const station = new Station(cfg);
       stations.push(station);
@@ -262,11 +285,27 @@ export class Runs {
     await this.finish(l, result, error);
   }
 
+  /** Stop the run's own CSMS, saving its report when it saw a station. */
+  private async stopCsms(l: Live): Promise<RunCsmsView | null> {
+    const csms = l.csms;
+    if (!csms) return null;
+    // Stations disconnect when they finish; let the CSMS take in their last frames and see the sockets close.
+    const deadline = Date.now() + 1000;
+    while (csms.sessions().some((s) => s.connected) && Date.now() < deadline) await Bun.sleep(10);
+    const report = csms.report();
+    const seen = csms.sessions().length > 0;
+    await csms.stop().catch(() => {});
+    if (!seen) return null;
+    const saved = this.store.saveReport(`run ${l.row.name} ${iso(l.row.startedAt)}`, csms.url, report);
+    return { reportId: saved.id, total: report.total, errors: report.errors, warnings: report.warnings };
+  }
+
   private async finish(l: Live, result: RunResult | undefined, error: string | undefined): Promise<void> {
     const cancelled = l.controller.signal.aborted && error === undefined;
     const status: RunStatus =
       error !== undefined ? 'error' : cancelled ? 'cancelled' : result?.ok ? 'passed' : 'failed';
     const finishedAt = Date.now();
+    const csms = await this.stopCsms(l);
     const entries = l.recorder.entries;
     let recordingId: string | null = null;
     if (entries.length > 0) {
@@ -290,6 +329,7 @@ export class Runs {
       events: l.row.events,
       eventsDropped: l.row.eventsDropped,
       recordingId,
+      csms,
     };
     this.store.updateRun(l.row.id, set);
     Object.assign(l.row, set);

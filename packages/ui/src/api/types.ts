@@ -40,6 +40,8 @@ export type ChaosRuleView = {
   trigger?: string /* human text, e.g. "nth 3", "every 2", "30%" */;
   once: boolean;
   delayMs?: number;
+  /** The fault's arguments as the DSL writes them, e.g. "100ms..2s", "after 2", "64kB"; absent when it has none. */
+  detail?: string;
 };
 export type FrameEvent = {
   seq: number;
@@ -105,7 +107,13 @@ export type StationAction =
   | { type: 'start'; evse: number; idTag?: string }
   | { type: 'stop'; evse: number; reason?: string }
   | { type: 'status'; evse: number; status: string }
-  | { type: 'send'; action: string; payload: unknown };
+  | { type: 'send'; action: string; payload: unknown }
+  // Behavioural faults (core faults.ts).
+  | { type: 'bootLoop'; count: number }
+  | { type: 'fault'; evse: number; code?: string }
+  | { type: 'meter'; op: 'backwards'; evse?: number; wh: number }
+  | { type: 'meter'; op: 'reset'; evse?: number }
+  | { type: 'reset'; mode: 'hard' | 'soft' };
 export type ActionResult = { ok: true; result?: unknown };
 
 export type ChaosRuleBody = {
@@ -116,7 +124,26 @@ export type ChaosRuleBody = {
   every?: number;
   probability?: number;
   once?: boolean;
+  /** delay */
   delayMs?: number;
+  /** jitter */
+  minMs?: number;
+  maxMs?: number;
+  /** reorder */
+  after?: number;
+  /** halfOpen */
+  forMs?: number;
+  /** slowRead */
+  stepMs?: number;
+  /** reconnectStorm */
+  count?: number;
+  withinMs?: number;
+  /** invalidEnum, missingField */
+  path?: string;
+  /** timestamp (signed) */
+  shiftMs?: number;
+  /** oversized */
+  kb?: number;
 };
 
 export type ValidateBody = {
@@ -177,7 +204,10 @@ export type RunSummary = {
   frames: number;
   error?: string;
   recordingId?: string;
+  /** Virtual runs against the test CSMS: the run's own CSMS, its saved report and finding totals. */
+  csms?: RunCsmsView;
 };
+export type RunCsmsView = { reportId: string } & Tally;
 export type RunEventView =
   | { type: 'log'; at: string; station?: string; message: string }
   | { type: 'assert'; at: string; station: string; ok: boolean; expect: string; message?: string }

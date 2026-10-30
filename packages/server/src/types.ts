@@ -50,6 +50,8 @@ export type ChaosRuleView = {
   trigger?: string;
   once: boolean;
   delayMs?: number;
+  /** The fault's arguments as the DSL writes them, e.g. "100ms..2s", "after 2", "64kB"; absent when it has none. */
+  detail?: string;
 };
 
 export type FrameEvent = {
@@ -120,7 +122,14 @@ export type RunSummary = {
   /** Why the run could not complete (not an assertion failure). */
   error?: string;
   recordingId?: string;
+  /**
+   * A virtual run against the test CSMS gets a CSMS of its own on the run's virtual clock. Its conformance report is
+   * saved (`GET /api/csms/reports/:reportId`) when the run ends; these are its totals.
+   */
+  csms?: RunCsmsView;
 };
+
+export type RunCsmsView = { reportId: string } & Tally;
 
 /** A scenario `RunEvent` without frames (those go to the run's recording). */
 export type RunEventView =

@@ -227,7 +227,7 @@ export function RunPanel({
             )}
           </div>
         </div>
-        <div className="grid grid-cols-3 gap-1.5 @md:grid-cols-5">
+        <div className={cn('grid grid-cols-3 gap-1.5', run.csms ? '@md:grid-cols-6' : '@md:grid-cols-5')}>
           <Stat
             label="Stations"
             value={
@@ -243,6 +243,13 @@ export function RunPanel({
             tone={run.asserts.failed > 0 ? 'bad' : undefined}
           />
           <Stat label="Violations" value={run.violations} tone={run.violations > 0 ? 'bad' : undefined} />
+          {run.csms && (
+            <Stat
+              label="CSMS findings"
+              value={run.csms.total}
+              tone={run.csms.errors > 0 ? 'bad' : run.csms.total === 0 ? 'good' : undefined}
+            />
+          )}
           <Stat label="Frames" value={run.frames} />
           <Stat label="Duration" value={run.durationMs !== undefined ? duration(run.durationMs) : '…'} />
         </div>
@@ -272,6 +279,18 @@ export function RunPanel({
               <a href={downloads.runJUnit(run.id)} download>
                 <FileDownIcon data-icon="inline-start" />
                 JUnit XML
+              </a>
+            </Button>
+          )}
+          {run.csms && (
+            <Button asChild variant="outline" size="xs">
+              <a
+                href={downloads.savedCsmsReport(run.csms.reportId, 'json')}
+                download
+                title="Conformance report of the test CSMS this run had to itself, on the run's clock"
+              >
+                <FileDownIcon data-icon="inline-start" />
+                CSMS report ({run.csms.errors} errors, {run.csms.warnings} warnings)
               </a>
             </Button>
           )}
