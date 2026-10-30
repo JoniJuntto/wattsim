@@ -13,10 +13,21 @@ export type TraceDirection = 'out' | 'in';
 
 /**
  * What a proxy chaos rule did to a frame. The frame itself is recorded as its sender sent it; what reached the other
- * side is `delivered` when the rule changed the text (corrupt, wrongId, callError on a CALLRESULT, mutate), sent
- * `copies` times when not once (duplicate). A dropped frame (drop, noResponse, callError on a CALL) reached nothing.
+ * side is `delivered` when the rule changed the text (corrupt, wrongId, callError on a CALLRESULT, mutate, and the
+ * protocol faults invalidEnum, missingField, timestamp and oversized), sent `copies` times when not once (duplicate),
+ * `delayMs` later than it arrived (delay, jitter, slowRead, or a delay rule that matched with another one), and after
+ * `after` later frames in the same direction (reorder). A dropped frame (drop, noResponse, callError on a CALL) reached
+ * nothing, and neither did one noted `halfOpen`: the frame that made the connection half-open and every frame that
+ * arrived while it was.
  */
-export type ChaosNote = { rule?: string; effect: string; delayMs?: number; copies?: number; delivered?: string };
+export type ChaosNote = {
+  rule?: string;
+  effect: string;
+  delayMs?: number;
+  copies?: number;
+  delivered?: string;
+  after?: number;
+};
 
 export type TraceEntry = {
   /** Epoch milliseconds when the message was observed. */

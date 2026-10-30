@@ -1,9 +1,12 @@
 /**
  * DSL chaos statements as text (`drop out MeterValues nth 3`), for the proxy's `--chaos` flag. The text is parsed
  * by the scenario parser inside a synthetic station block, so the grammar and its error messages are the DSL's.
+ * Both kinds of chaos statement are accepted: the original faults (`ChaosStmt`) and the milestone-4 ones
+ * (`ChaosFaultStmt`: jitter, reorder, halfOpen, slowRead, reconnectStorm, invalidEnum, missingField, timestamp,
+ * oversized), each built into the core rule the scenario interpreter would build.
  */
-import type { ChaosEffect, ChaosMatch, ChaosRule } from '@wattsim/core';
-import type { ChaosStmt, DurExpr, NumExpr } from '@wattsim/scenario';
+import type { ChaosEffect, ChaosFaultEffect, ChaosMatch, ChaosRule } from '@wattsim/core';
+import type { ChaosFaultStmt, ChaosFilters, ChaosStmt, DurExpr, NumExpr } from '@wattsim/scenario';
 import { ParseError, parse } from '@wattsim/scenario';
 
 /** Lines before the first chaos statement in the synthetic source. */
@@ -50,25 +53,83 @@ export function parseChaosRules(text: string): ChaosRule[] {
     throw err;
   }
   return body.map((stmt, i) => {
-    if (stmt.kind !== 'chaos') throw new ChaosTextError(`'${statements[i]}' is not a chaos rule`);
-    return toRule(stmt, statements[i] as string);
+    if (stmt.kind === 'chaos') return toRule(stmt, statements[i] as string);
+    if (stmt.kind === 'chaosFault') return toFaultRule(stmt, statements[i] as string);
+    throw new ChaosTextError(`'${statements[i]}' is not a chaos rule`);
   });
 }
 
-function num(e: NumExpr, what: string, stmt: string): number {
+/** A number argument; with `min`, an integer >= `min` (as the interpreter checks counts). */
+function num(e: NumExpr, what: string, stmt: string, min?: number): number {
   if (e.kind === 'ref') throw new ChaosTextError(`'${stmt}': ${what} must be a number, not the variable '${e.name}'`);
+  if (min !== undefined && !(Number.isInteger(e.value) && e.value >= min)) {
+    throw new ChaosTextError(`'${stmt}': ${what} must be an integer >= ${min}, got ${e.value}`);
+  }
   return e.value;
 }
 
-function ms(e: DurExpr, stmt: string): number {
-  if (e.kind === 'duration') return e.ms;
-  if (e.kind === 'ref')
-    throw new ChaosTextError(`'${stmt}': the delay must be a duration, not the variable '${e.name}'`);
-  throw new ChaosTextError(`'${stmt}': the delay must be a fixed duration, not a distribution`);
+/** A fixed duration in ms. Negative only with `signed` (`timestamp -2h`). */
+function ms(e: DurExpr, stmt: string, what = 'the delay', signed = false): number {
+  if (e.kind === 'ref') throw new ChaosTextError(`'${stmt}': ${what} must be a duration, not the variable '${e.name}'`);
+  if (e.kind !== 'duration')
+    throw new ChaosTextError(`'${stmt}': ${what} must be a fixed duration, not a distribution`);
+  if (e.ms < 0 && !signed) throw new ChaosTextError(`'${stmt}': ${what} must not be negative, got ${e.ms}ms`);
+  return e.ms;
 }
 
 /** The ChaosRule the scenario interpreter would build from this statement. */
 function toRule(stmt: ChaosStmt, text: string): ChaosRule {
+  const effect: ChaosEffect =
+    stmt.fault === 'delay' ? { kind: 'delay', ms: stmt.delay ? ms(stmt.delay, text) : 0 } : { kind: stmt.fault };
+  return { match: toMatch(stmt, text), effect, once: stmt.once };
+}
+
+/** The ChaosRule the scenario interpreter (`addChaosFault`) would build from a milestone-4 fault statement. */
+function toFaultRule(stmt: ChaosFaultStmt, text: string): ChaosRule {
+  const f = stmt.fault;
+  let effect: ChaosFaultEffect;
+  switch (f.kind) {
+    case 'jitter': {
+      const minMs = ms(f.min, text, "the 'jitter' minimum");
+      const maxMs = ms(f.max, text, "the 'jitter' maximum");
+      if (maxMs < minMs) throw new ChaosTextError(`'${text}': jitter MIN..MAX needs MAX >= MIN`);
+      effect = { kind: 'jitter', minMs, maxMs };
+      break;
+    }
+    case 'reorder':
+      effect = { kind: 'reorder', after: f.after ? num(f.after, "'reorder after'", text, 1) : 1 };
+      break;
+    case 'halfOpen':
+      effect = f.for ? { kind: 'halfOpen', ms: ms(f.for, text, "'halfOpen for'") } : { kind: 'halfOpen' };
+      break;
+    case 'slowRead':
+      effect = { kind: 'slowRead', stepMs: ms(f.step, text, "the 'slowRead' step") };
+      break;
+    case 'reconnectStorm':
+      effect = {
+        kind: 'reconnectStorm',
+        count: num(f.count, "the 'reconnectStorm' count", text, 1),
+        windowMs: ms(f.within, text, "'reconnectStorm ... within'"),
+      };
+      break;
+    case 'invalidEnum':
+    case 'missingField':
+      effect = f.path === undefined ? { kind: f.kind } : { kind: f.kind, path: f.path };
+      break;
+    case 'timestamp':
+      effect = { kind: 'timestamp', shiftMs: ms(f.shift, text, "the 'timestamp' shift", true) };
+      break;
+    case 'oversized': {
+      const kb = num(f.kb, "the 'oversized' size", text);
+      if (!(kb > 0)) throw new ChaosTextError(`'${text}': the 'oversized' size must be > 0 kB, got ${kb}`);
+      effect = { kind: 'oversized', bytes: Math.round(kb * 1024) };
+      break;
+    }
+  }
+  return { match: toMatch(stmt, text), effect, once: stmt.once };
+}
+
+function toMatch(stmt: ChaosFilters, text: string): ChaosMatch {
   const match: ChaosMatch = {};
   if (stmt.direction) match.direction = stmt.direction;
   if (stmt.action) match.action = stmt.action;
@@ -79,7 +140,5 @@ function toRule(stmt: ChaosStmt, text: string): ChaosRule {
     if (t.from) match.from = num(t.from, "'from'", text);
   }
   if (stmt.probability) match.probability = num(stmt.probability, "'probability'", text) / 100;
-  const effect: ChaosEffect =
-    stmt.fault === 'delay' ? { kind: 'delay', ms: stmt.delay ? ms(stmt.delay, text) : 0 } : { kind: stmt.fault };
-  return { match, effect, once: stmt.once };
+  return match;
 }

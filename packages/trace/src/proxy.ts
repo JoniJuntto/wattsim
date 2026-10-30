@@ -7,16 +7,35 @@
  * Frames go both ways unchanged, text as text and binary as binary, unless a chaos rule matches them. Every frame is
  * recorded as its sender sent it; a chaos rule that matched is noted on the entry (`chaos`, with what it passed on),
  * and a frame the proxy makes up itself (the CALLERROR of `callError` on a CALL) is recorded with `injected`.
- * Frames that do not decode are forwarded and recorded with their decode error, and chaos does not see them. The
- * proxy never queues or reorders: keeping one CALL in flight is the endpoints' job.
+ * Frames that do not decode are forwarded and recorded with their decode error, and chaos does not see them. Apart
+ * from a `reorder` rule the proxy never queues or reorders: keeping one CALL in flight is the endpoints' job.
  *
- * Chaos directions are station-relative, as in the DSL: `out` is charger to CSMS, `in` CSMS to charger.
+ * Chaos directions are station-relative, as in the DSL: `out` is charger to CSMS, `in` CSMS to charger. Each
+ * connection applies core's `ChaosEngine` decisions the way core's `Connection` does, with the proxy in the
+ * station's place:
+ *
+ * - `delay`, `jitter` and `slowRead` hold the frame (the engine draws the delay); the note has `delayMs`.
+ * - `reorder` holds the frame until `after` later frames have been passed on in the same direction; the note has
+ *   `after`.
+ * - `halfOpen` swallows the frame and from then on passes nothing either way; frames that still arrive are recorded
+ *   with a `halfOpen` note. Frames the charger sends still go through the chaos rules, as a station's writes do; frames
+ *   from the CSMS are not looked at, as a station stops reading. With `for d`, the proxy drops the connection after
+ *   `d`: it closes the charger's socket and the upstream one (1001), and the charger reconnects on its own schedule.
+ * - `reconnectStorm K within T` passes the frame on, then drops the charger's connection every `T/K`, the first one
+ *   interval later. The storm belongs to the identity, so it continues on the connections the charger opens again; a
+ *   storm in progress for that identity ignores new triggers. The proxy cannot make a charger reconnect at once, so
+ *   the charger's own backoff decides when the next connection comes.
+ * - `invalidEnum`, `missingField`, `timestamp` and `oversized` mutate the payload of charger frames with core's
+ *   `mutatePayload`; the note has the mutated text in `delivered`.
+ *
+ * What a connection holds (delayed and reordered frames, a half-open state and its timer) is discarded when either
+ * side closes, as a real connection loses what was in flight.
  */
-import type { ChaosEffect, ChaosEngine, ChaosRule, Clock } from '@wattsim/core';
-import { TypedEmitter, WallClock } from '@wattsim/core';
+import type { ChaosEffect, ChaosFaultEffect, ChaosRule, Clock, Timer } from '@wattsim/core';
+import { ChaosEngine, mutatePayload, TypedEmitter, WallClock } from '@wattsim/core';
 import type { CallErrorFrame, Frame, OcppVersion } from '@wattsim/protocol';
 import { encodeFrame, isOcppVersion, MessageType, newMessageId } from '@wattsim/protocol';
-import type { TraceDirection, TraceEntry } from './entry';
+import type { ChaosNote, TraceDirection, TraceEntry } from './entry';
 import { Correlator, makeEntry, opposite } from './entry';
 import { Recorder } from './recorder';
 import type { TraceFileFormat } from './write';
@@ -46,8 +65,11 @@ export type ProxyOptions = {
 export type ProxyEvents = {
   /** A charger is connected through. `protocol` is the negotiated subprotocol ('' when none). */
   open: [identity: string, protocol: string];
-  /** One side closed; the proxy closes the other with the same code where the code can be sent. */
-  close: [identity: string, side: 'charger' | 'csms', code: number, reason: string];
+  /**
+   * One side closed; the proxy closes the other with the same code where the code can be sent. `proxy`: a chaos rule
+   * (`halfOpen for`, `reconnectStorm`) dropped the connection, and both sides were closed with 1001.
+   */
+  close: [identity: string, side: 'charger' | 'csms' | 'proxy', code: number, reason: string];
   /** Upstream refused a charger's connection. */
   refused: [identity: string, status: number, message: string];
   /** Every recorded entry, as it is recorded. */
@@ -62,6 +84,8 @@ type SocketData = { session: Session };
 type ServerSocket = Bun.ServerWebSocket<SocketData>;
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+/** Close code for connections chaos drops (`halfOpen` giving up, `reconnectStorm`), as core's `Connection` uses. */
+const CHAOS_CLOSE = 1001;
 
 /** Close codes an endpoint may put on the wire (RFC 6455 7.4; 1005, 1006 and 1015 are reserved for reporting). */
 function sendable(code: number): boolean {
@@ -84,8 +108,22 @@ function chaosCallError(id: string, code: string | undefined): CallErrorFrame {
   };
 }
 
-/** What a chaos effect puts on the wire: the frames passed on, in order, and a CALLERROR for the sender, if any. */
-type ChaosOutcome = { forward: Data[]; back?: string };
+/**
+ * What a chaos decision puts on the wire: the frames passed on, in order, and a CALLERROR for the sender, if any, plus
+ * how they are passed on and what the connection does afterwards.
+ */
+type ChaosOutcome = {
+  forward: Data[];
+  back?: string;
+  /** Pass `forward` on this much later (`delay`, `jitter`, `slowRead`). */
+  delayMs?: number;
+  /** `reorder`: hold `forward` until this many later frames have been passed on in the same direction. */
+  hold?: number;
+  /** `halfOpen`: stop passing frames on; with `ms`, drop the connection after that long. */
+  halfOpen?: { ms?: number };
+  /** `reconnectStorm`: after passing the frame on, drop the identity's connection `count` times in `windowMs`. */
+  storm?: { count: number; windowMs: number };
+};
 
 /**
  * Decided when the frame arrives, so the trace entry can say what actually reached the other side (`copies`,
@@ -97,7 +135,7 @@ function chaosOutcome(frame: Frame, data: Data, effect: ChaosEffect): ChaosOutco
     case 'noResponse':
       return { forward: [] };
     case 'delay':
-      return { forward: [data] };
+      return { forward: [data], delayMs: effect.ms };
     case 'duplicate':
       return { forward: Array.from({ length: (effect.count ?? 1) + 1 }, () => data) };
     case 'corrupt':
@@ -116,12 +154,51 @@ function chaosOutcome(frame: Frame, data: Data, effect: ChaosEffect): ChaosOutco
   }
 }
 
+/**
+ * The outcome of a milestone-4 fault that is not a delay (`decide` resolves `jitter` and `slowRead` to a delay). The
+ * protocol mutations are core's `mutatePayload`, applied as `Connection` applies them to an outbound frame: a CALLRESULT
+ * payload as the action's response, anything else as its request. The engine never decides them for an inbound frame.
+ */
+function faultOutcome(
+  frame: Frame,
+  data: Data,
+  fault: ChaosFaultEffect,
+  version: OcppVersion,
+  action: string | undefined,
+): ChaosOutcome {
+  switch (fault.kind) {
+    case 'reorder':
+      return { forward: [data], hold: Math.max(1, fault.after ?? 1) };
+    case 'halfOpen':
+      return { forward: [], halfOpen: fault.ms === undefined ? {} : { ms: fault.ms } };
+    case 'reconnectStorm':
+      return { forward: [data], storm: { count: fault.count, windowMs: fault.windowMs } };
+    default: {
+      if (!('payload' in frame)) return { forward: [data] };
+      const kind = frame.type === MessageType.CallResult ? 'response' : 'request';
+      const payload = mutatePayload(version, action, kind, frame.payload, fault);
+      return { forward: [encodeFrame({ ...frame, payload })] };
+    }
+  }
+}
+
+/** A frame `reorder` holds until `remaining` more frames have been passed on in its direction. */
+type Held = { remaining: number; release: () => void };
+
 class Session {
   charger: ServerSocket | undefined;
   /** Frames for the charger that arrived before its socket opened. */
   private readonly early: Data[] = [];
   private readonly correlator = new Correlator();
   private closed = false;
+  /** How to close a charger socket that opens after the session ended (undefined code: terminate). */
+  private closeOnAttach: { code?: number; reason: string } | undefined;
+  /** Timers passing on frames chaos holds (delay, jitter, slowRead); cancelled when the session ends. */
+  private readonly timers = new Set<Timer>();
+  /** Frames held by `reorder`, per direction. Lazy: most connections never hold one. */
+  private held: Record<TraceDirection, Held[]> | undefined;
+  /** `halfOpen` in force: nothing is passed on either way. `rule` is the rule that started it. */
+  private halfOpen: { rule?: string; timer?: Timer } | undefined;
 
   constructor(
     private readonly proxy: OcppProxy,
@@ -137,6 +214,12 @@ class Session {
 
   attachCharger(ws: ServerSocket): void {
     this.charger = ws;
+    if (this.closed) {
+      const c = this.closeOnAttach;
+      if (c?.code !== undefined) ws.close(c.code, c.reason);
+      else ws.terminate();
+      return;
+    }
     for (const data of this.early.splice(0)) ws.send(data);
   }
 
@@ -151,16 +234,24 @@ class Session {
     });
     const { action } = this.correlator.observe(entry);
     const frame = entry.frame;
-    const decision = frame && this.chaos?.decide(dir, frame, action);
-    if (!frame || !decision?.effect || !decision.rule) {
+    // Half-open: what the charger writes still meets its chaos rules (as a station's writes do); the CSMS is not read.
+    const swallowed = this.halfOpen;
+    const decision = frame && !(swallowed && dir === 'in') ? this.chaos?.decide(dir, frame, action) : undefined;
+    const rule = decision?.rule;
+    if (!frame || !decision || !rule || (!decision.effect && !decision.fault)) {
+      if (swallowed) entry.chaos = halfOpenNote(swallowed.rule);
       this.proxy.recordEntry(entry);
       this.deliver(dir, data);
       return;
     }
-    const { effect, rule, delayed } = decision;
-    const outcome = chaosOutcome(frame, data, effect);
-    entry.chaos = { rule: rule.id, effect: effect.kind };
-    if (effect.kind === 'delay') entry.chaos.delayMs = effect.ms;
+    const { effect, fault, delayed } = decision;
+    const outcome = fault
+      ? faultOutcome(frame, data, fault, this.version ?? 'ocpp2.1', action)
+      : chaosOutcome(frame, data, effect as ChaosEffect);
+    // The rule's own kind: a `jitter` or `slowRead` is noted as such, with the delay the engine drew.
+    entry.chaos = { rule: rule.id, effect: rule.effect.kind };
+    if (outcome.delayMs !== undefined) entry.chaos.delayMs = outcome.delayMs;
+    if (outcome.hold !== undefined) entry.chaos.after = outcome.hold;
     if (outcome.forward.length > 1) entry.chaos.copies = outcome.forward.length;
     const passed = outcome.forward[0];
     if (passed !== undefined && passed !== data) entry.chaos.delivered = text(passed);
@@ -168,14 +259,15 @@ class Session {
       entry.chaos.delayMs = delayed.ms;
       this.proxy.emit('chaos', this.identity, delayed.rule, entry);
     }
+    if (swallowed) entry.chaos = halfOpenNote(swallowed.rule);
     this.proxy.recordEntry(entry);
     this.proxy.emit('chaos', this.identity, rule, entry);
-    const apply = () => this.apply(dir, outcome, effect.kind === 'delay' ? effect.ms : 0);
-    if (delayed) this.proxy.clock.setTimeout(apply, delayed.ms);
+    const apply = () => this.apply(dir, outcome, rule.id);
+    if (delayed) this.later(apply, delayed.ms);
     else apply();
   }
 
-  private apply(dir: TraceDirection, outcome: ChaosOutcome, delayMs: number): void {
+  private apply(dir: TraceDirection, outcome: ChaosOutcome, rule: string | undefined): void {
     if (outcome.back !== undefined) {
       // A CALL that goes no further: its sender gets the CALLERROR from the proxy.
       const back = opposite(dir);
@@ -191,27 +283,100 @@ class Session {
       this.proxy.recordEntry(injected);
       this.deliver(back, outcome.back);
     }
-    for (const data of outcome.forward) {
-      if (delayMs > 0) this.proxy.clock.setTimeout(() => this.deliver(dir, data), delayMs);
-      else this.deliver(dir, data);
-    }
-  }
-
-  private deliver(dir: TraceDirection, data: Data): void {
-    if (this.closed) return;
-    if (dir === 'out') {
-      if (this.upstream.readyState === WebSocket.OPEN) this.upstream.send(data);
+    if (outcome.halfOpen) {
+      this.goHalfOpen(rule, outcome.halfOpen.ms);
       return;
     }
-    if (this.charger) this.charger.send(data);
-    else this.early.push(data);
+    const send = () => {
+      for (const data of outcome.forward) this.deliver(dir, data);
+    };
+    if (outcome.hold !== undefined) this.hold(dir, outcome.hold, send);
+    else if (outcome.delayMs) this.later(send, outcome.delayMs);
+    else send();
+    if (outcome.storm) this.proxy.startStorm(this.identity, outcome.storm.count, outcome.storm.windowMs);
+  }
+
+  /** Pass a frame on, unless the session ended or is half-open; then count it for the frames `reorder` holds. */
+  private deliver(dir: TraceDirection, data: Data): void {
+    if (this.closed || this.halfOpen) return;
+    if (dir === 'out') {
+      if (this.upstream.readyState !== WebSocket.OPEN) return;
+      this.upstream.send(data);
+    } else if (this.charger) {
+      this.charger.send(data);
+    } else {
+      this.early.push(data);
+    }
+    if (this.held && this.held[dir].length > 0) this.passed(dir);
+  }
+
+  /** Run `fn` after `ms` unless the session ends first. */
+  private later(fn: () => void, ms: number): void {
+    const timer = this.proxy.clock.setTimeout(() => {
+      this.timers.delete(timer);
+      fn();
+    }, ms);
+    this.timers.add(timer);
+  }
+
+  /** Hold a frame until `after` later frames have been passed on in `dir`. */
+  private hold(dir: TraceDirection, after: number, release: () => void): void {
+    this.held ??= { in: [], out: [] };
+    this.held[dir].push({ remaining: after, release });
+  }
+
+  /** A frame was passed on in `dir`: count it against the held frames and release those that are due, in order. */
+  private passed(dir: TraceDirection): void {
+    const held = this.held;
+    if (!held) return;
+    const due: Held[] = [];
+    for (const h of held[dir]) if (--h.remaining <= 0) due.push(h);
+    if (due.length === 0) return;
+    held[dir] = held[dir].filter((h) => h.remaining > 0);
+    for (const h of due) h.release();
+  }
+
+  /** Stop passing frames on; with `ms`, drop the connection after that long. */
+  private goHalfOpen(rule: string | undefined, ms: number | undefined): void {
+    if (this.halfOpen || this.closed) return;
+    const state: { rule?: string; timer?: Timer } = { rule };
+    this.halfOpen = state;
+    if (ms === undefined) return;
+    state.timer = this.proxy.clock.setTimeout(() => {
+      state.timer = undefined;
+      if (this.halfOpen === state) this.drop('wattsim chaos: halfOpen');
+    }, ms);
+  }
+
+  /**
+   * Chaos drops the connection (`halfOpen for` giving up, `reconnectStorm`): close the charger's socket and the
+   * upstream one with 1001. A charger with reconnect enabled comes back through a new upstream connection.
+   */
+  drop(reason: string): void {
+    if (this.closed) return;
+    this.end();
+    this.proxy.emit('close', this.identity, 'proxy', CHAOS_CLOSE, reason);
+    if (this.upstream.readyState <= WebSocket.OPEN) this.upstream.close(CHAOS_CLOSE, reason);
+    if (this.charger) this.charger.close(CHAOS_CLOSE, reason);
+    else this.closeOnAttach = { code: CHAOS_CLOSE, reason };
+  }
+
+  /** The session is over: what chaos held on it is lost and its timers are cancelled. */
+  private end(): void {
+    this.closed = true;
+    this.proxy.forget(this);
+    for (const t of this.timers) t.cancel();
+    this.timers.clear();
+    this.held = undefined;
+    this.halfOpen?.timer?.cancel();
+    this.halfOpen = undefined;
+    this.early.length = 0;
   }
 
   /** One side went away: close the other the same way. */
   closedBy(side: 'charger' | 'csms', code: number, reason: string): void {
     if (this.closed) return;
-    this.closed = true;
-    this.proxy.forget(this);
+    this.end();
     this.proxy.emit('close', this.identity, side, code, reason);
     if (side === 'charger') {
       if (this.upstream.readyState <= WebSocket.OPEN) {
@@ -221,7 +386,10 @@ class Session {
       return;
     }
     const ws = this.charger;
-    if (!ws) return;
+    if (!ws) {
+      this.closeOnAttach = sendable(code) ? { code, reason } : { reason };
+      return;
+    }
     if (sendable(code)) ws.close(code, reason);
     else ws.terminate();
   }
@@ -238,6 +406,8 @@ export class OcppProxy extends TypedEmitter<ProxyEvents> {
   readonly recorder: Recorder | undefined;
   private readonly server: Bun.Server<SocketData>;
   private readonly sessions = new Set<Session>();
+  /** `reconnectStorm`s in progress, by identity: the drops still to come. */
+  private readonly storms = new Map<string, Timer[]>();
   private readonly ownsRecorder: boolean;
 
   constructor(private readonly opts: ProxyOptions) {
@@ -281,8 +451,28 @@ export class OcppProxy extends TypedEmitter<ProxyEvents> {
     this.sessions.delete(s);
   }
 
+  /**
+   * Drop `identity`'s connection `count` times, `windowMs / count` apart (the last after `windowMs`), as core's
+   * `Connection` drops its socket in a storm. A drop when the charger is not connected does nothing. A storm already in
+   * progress for the identity ignores the new trigger.
+   */
+  startStorm(identity: string, count: number, windowMs: number): void {
+    if (this.storms.has(identity) || count < 1) return;
+    const timers: Timer[] = [];
+    this.storms.set(identity, timers);
+    let left = count;
+    const drop = () => {
+      left--;
+      if (left === 0) this.storms.delete(identity);
+      for (const s of [...this.sessions]) if (s.identity === identity) s.drop('wattsim chaos: reconnectStorm');
+    };
+    for (let i = 1; i <= count; i++) timers.push(this.clock.setTimeout(drop, (i * windowMs) / count));
+  }
+
   /** Close every connection, stop listening and close the recording when the proxy opened it. */
   async stop(): Promise<void> {
+    for (const timers of this.storms.values()) for (const t of timers) t.cancel();
+    this.storms.clear();
     for (const s of [...this.sessions]) s.shutdown();
     await this.server.stop(true);
     if (this.ownsRecorder) await this.recorder?.close();
@@ -359,6 +549,31 @@ export class OcppProxy extends TypedEmitter<ProxyEvents> {
       };
     });
   }
+}
+
+function halfOpenNote(rule: string | undefined): ChaosNote {
+  return rule === undefined ? { effect: 'halfOpen' } : { rule, effect: 'halfOpen' };
+}
+
+/**
+ * A `ProxyOptions.chaos` function that gives each identity one engine holding `rules`, kept for the proxy's lifetime.
+ * A station keeps its engine across reconnects, so with this `nth` and `every` count a charger's frames over all its
+ * connections, `once` rules stay spent, and a rule that drops the connection (`halfOpen for`, `reconnectStorm`) does
+ * not fire again on every reconnect. `rng` seeds each identity's engine (default core's `lcg(1)`).
+ */
+export function chaosPerIdentity(
+  rules: readonly ChaosRule[],
+  rng?: (identity: string) => () => number,
+): (identity: string) => ChaosEngine {
+  const engines = new Map<string, ChaosEngine>();
+  return (identity) => {
+    let engine = engines.get(identity);
+    if (engine) return engine;
+    engine = new ChaosEngine(rng?.(identity));
+    for (const rule of rules) engine.add(rule);
+    engines.set(identity, engine);
+    return engine;
+  };
 }
 
 /** Start a proxy listening for chargers. Resolves once it is listening. */

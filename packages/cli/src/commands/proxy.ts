@@ -1,8 +1,8 @@
 import type { ChaosRule } from '@wattsim/core';
-import { ChaosEngine, lcg } from '@wattsim/core';
+import { lcg } from '@wattsim/core';
 import { fnv1a } from '@wattsim/scenario';
 import type { OcppProxy, TraceEntry, TraceFileFormat } from '@wattsim/trace';
-import { ChaosTextError, parseChaosRules, startProxy } from '@wattsim/trace';
+import { ChaosTextError, chaosPerIdentity, parseChaosRules, startProxy } from '@wattsim/trace';
 import { defineCommand } from 'citty';
 import { err, out } from '../load';
 
@@ -48,7 +48,8 @@ export const proxy = defineCommand({
     format: { type: 'string', description: 'Trace format: oot (Open OCPP Trace v1.1, default) or frames' },
     chaos: {
       type: 'string',
-      description: 'DSL chaos rules, e.g. "drop out MeterValues nth 3"; several separated by ;',
+      description:
+        'DSL chaos rules, e.g. "drop out MeterValues nth 3" or "jitter 100ms..2s in"; several separated by ;',
     },
     seed: { type: 'string', description: 'Seed for probability chaos rules' },
     quiet: { type: 'boolean', description: 'No per-frame output' },
@@ -79,15 +80,11 @@ export const proxy = defineCommand({
         upstream: args.upstream,
         record: args.record,
         recordFormat: format,
-        // One engine per connection, so `nth` counts each charger's frames, seeded per identity like `run`.
+        // One engine per charger, seeded per identity like `run`, kept across its reconnects (see `chaosPerIdentity`).
         chaos:
           rules.length === 0
             ? undefined
-            : (identity) => {
-                const engine = new ChaosEngine(lcg((seed ^ fnv1a(identity) ^ CHAOS_SEED_SALT) >>> 0));
-                for (const rule of rules) engine.add(rule);
-                return engine;
-              },
+            : chaosPerIdentity(rules, (identity) => lcg((seed ^ fnv1a(identity) ^ CHAOS_SEED_SALT) >>> 0)),
       });
     } catch (e) {
       await err(`cannot start the proxy: ${e instanceof Error ? e.message : String(e)}\n`);

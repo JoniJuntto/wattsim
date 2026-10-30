@@ -27,7 +27,7 @@ Frames are forwarded byte for byte, including ones that do not decode. A close o
 
 ### Chaos in the proxy
 
-`--chaos` takes DSL chaos statements without the `chaos` keyword, several separated by `;`. Counters run per connection, and `--seed` fixes `probability` draws.
+`--chaos` takes DSL chaos statements without the `chaos` keyword, several separated by `;`: the original seven faults and the milestone-4 transport (`jitter`, `reorder`, `halfOpen`, `slowRead`, `reconnectStorm`) and protocol (`invalidEnum`, `missingField`, `timestamp`, `oversized`) faults. Each charger gets one chaos engine for the life of the proxy, so counters and `once` carry over its reconnects, and `--seed` fixes `probability` and `jitter` draws. A "reconnect" fault (`halfOpen for`, `reconnectStorm`) closes both sockets and the charger reconnects on its own backoff.
 
 A frame a rule touches is still recorded as its sender sent it, with the rule and outcome in `meta.wattsim.chaos`: `delivered` holds the text passed on when the rule changed it, `copies` the count for a duplicate. With `callError` on a CALL the proxy answers the sender itself, and that CALLERROR is recorded with `meta.wattsim.injected`.
 

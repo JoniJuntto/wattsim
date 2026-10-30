@@ -6,9 +6,11 @@
  * - a station frame (`out`) is sent as it reached the CSMS when the trace was made, paced by the recorded timestamps
  *   divided by `speed` (default 1), or at once with `virtual`. Usually that is the recorded text; for a trace made
  *   through the chaos proxy it is what the proxy passed on: nothing for a dropped frame (drop, noResponse, callError
- *   on a CALL), the `delivered` text of a changed one (corrupt, wrongId, callError on a CALLRESULT, mutate), `copies`
- *   sends of a duplicated one, later by `delayMs` for a delayed one. A changed frame whose delivered text the trace
- *   lacks is skipped with a note. The CALLERROR the proxy itself sent to the CSMS for a CSMS CALL is sent too. A
+ *   on a CALL) or one a `halfOpen` swallowed, the `delivered` text of a changed one (corrupt, wrongId, callError on a
+ *   CALLRESULT, mutate, invalidEnum, missingField, timestamp, oversized), `copies` sends of a duplicated one, later by
+ *   `delayMs` for a delayed one (delay, jitter, slowRead). A frame `reorder` held is sent after the `after` station
+ *   frames that follow it have been sent, as the proxy passed it on; one still held after the last entry never reached
+ *   the CSMS and is skipped with a note. A changed frame whose delivered text the trace lacks is skipped with a note. The CALLERROR the proxy itself sent to the CSMS for a CSMS CALL is sent too. A
  *   station response to a CSMS CALL is re-addressed to the id the live CSMS used for that CALL; it is not sent when
  *   the live CSMS never sent the CALL.
  * - a CSMS frame (`in`) is an expectation, awaited for up to `timeoutMs`. A CALL (or 2.1 SEND) matches the first
@@ -144,16 +146,22 @@ export function loosen(value: unknown, ignore: IgnoreMatcher, path: readonly str
  * What a recorded station frame put on the CSMS's wire: the text, how many times and how much later than recorded,
  * or nothing (with the reason when the trace cannot say what was sent).
  */
-function onTheWire(e: TraceEntry): { raw: string; copies: number; delayMs: number } | { skip: string | undefined } {
+function onTheWire(
+  e: TraceEntry,
+): { raw: string; copies: number; delayMs: number; after?: number } | { skip: string | undefined } {
   const c = e.chaos;
   if (!c) return { raw: e.raw, copies: 1, delayMs: 0 };
+  if (c.effect === 'halfOpen') return { skip: undefined }; // swallowed: the connection passed nothing on
   const delayMs = c.delayMs ?? 0;
   const copies = c.copies ?? (c.effect === 'duplicate' ? 2 : 1);
-  if (c.delivered !== undefined) return { raw: c.delivered, copies, delayMs };
+  const after = c.effect === 'reorder' ? Math.max(1, c.after ?? 1) : undefined;
+  if (c.delivered !== undefined) return { raw: c.delivered, copies, delayMs, ...(after ? { after } : {}) };
   switch (c.effect) {
     case 'drop':
     case 'noResponse':
       return { skip: undefined };
+    case 'reorder':
+      return { raw: e.raw, copies, delayMs, after };
     case 'callError':
       if (e.frame?.type === MessageType.Call) return { skip: undefined }; // the proxy answered it; the CSMS never saw it
       if (e.frame?.type === MessageType.CallResult) break;
@@ -326,6 +334,19 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
   }
   /** Recorded id of a CSMS CALL -> the id the live CSMS used for it. */
   const liveIds = new Map<string, string>();
+  /** Station frames a `reorder` holds, as the proxy held them: until `remaining` more frames have been sent. */
+  let held: Array<{ remaining: number; raw: string; copies: number; index: number; line?: number }> = [];
+  const transmit = (raw: string, copies: number): void => {
+    for (let k = 0; k < copies; k++) {
+      ws.send(raw);
+      report.sent++;
+      if (held.length === 0) continue;
+      const due = held.filter((h) => --h.remaining <= 0);
+      if (due.length === 0) continue;
+      held = held.filter((h) => h.remaining > 0);
+      for (const h of due) transmit(h.raw, h.copies);
+    }
+  };
   for (const i of indexes) {
     const e = trace[i] as TraceEntry;
     // A CALLERROR the proxy sent the station never came from the CSMS; one it sent the CSMS is a station frame.
@@ -355,8 +376,8 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
         }
       }
       if (ws.readyState !== WebSocket.OPEN) break;
-      for (let k = 0; k < wire.copies; k++) ws.send(raw);
-      report.sent += wire.copies;
+      if (wire.after !== undefined) held.push({ remaining: wire.after, raw, copies: wire.copies, ...where });
+      else transmit(raw, wire.copies);
       continue;
     }
     // A CSMS frame: an expectation.
@@ -423,6 +444,15 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
       }
     }
     report.matched++;
+  }
+  for (const h of held) {
+    const { index, line } = h;
+    report.notes.push({
+      identity,
+      index,
+      ...(line !== undefined ? { line } : {}),
+      message: `not sent: the proxy's reorder still held this frame when the trace ends`,
+    });
   }
   // Keep listening a little: a CSMS frame the trace does not have may come after its last entry.
   if (ws.readyState === WebSocket.OPEN) await link.next(() => false, clock, opts.settleMs ?? DEFAULT_SETTLE_MS);
