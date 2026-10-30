@@ -114,11 +114,27 @@ describe('gG fuse, IEC 60269-1 Tables 2 and 3', () => {
     });
   }
 
+  test('gate table matches the published rows', () => {
+    // IS 13703 (Part 1):1993 Table III, Enel GSCL004 Table 7, Mersen TM-104, Schneider (see DECISIONS.md 2026-10-30).
+    const row = (In: number) => GG_GATES.find((r) => r[0] === In);
+    expect(row(63)).toEqual([63, 160, 320, 450, 820]);
+    expect(row(80)).toEqual([80, 215, 425, 610, 1100]);
+    expect(row(400)).toEqual([400, 1420, 2840, 4500, 8060]);
+    expect(row(630)).toEqual([630, 2200, 5100, 8060, 14140]);
+    expect(row(800)).toEqual([800, 3060, 7000, 10600, 19000]);
+    expect(row(1000)).toEqual([1000, 4000, 9500, 14140, 24000]);
+    expect(row(1250)).toEqual([1250, 5000, 13000, 19000, 35000]);
+    // From 25 A up, Imin(0.1 s) is the Imax(0.1 s) two ratings lower: 1.6:1 selectivity at 0.1 s.
+    for (let i = 2; i < GG_GATES.length; i++) {
+      expect((GG_GATES[i] as readonly number[])[3]).toBe((GG_GATES[i - 2] as readonly number[])[4]);
+    }
+  });
+
   test('band edges run through the gate points', () => {
     const fast = gGCurve(63, { band: 1e-12 });
     expect(fast.tripTime(1.25)).toBeCloseTo(H, 3);
     expect(fast.tripTime(160 / 63)).toBeCloseTo(10, 6);
-    expect(fast.tripTime(425 / 63)).toBeCloseTo(0.1, 9);
+    expect(fast.tripTime(450 / 63)).toBeCloseTo(0.1, 9);
     const slow = gGCurve(63, { band: 1 });
     expect(slow.tripTime(1.6)).toBeCloseTo(H, 6);
     expect(slow.tripTime(320 / 63)).toBeCloseTo(5, 9);

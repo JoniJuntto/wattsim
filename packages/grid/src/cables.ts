@@ -3,14 +3,26 @@
  *
  * Ampacity Iz: IEC 60364-5-52:2009 Annex B, PVC insulation (70 °C conductor), ambient 30 °C, no grouping:
  *   Table B.52.2 (2 loaded conductors) and B.52.4 (3 loaded conductors) for methods A1, B1, B2, C;
- *   Table B.52.10 (multicore cable in free air) for method E.
+ *   Table B.52.10 (copper) and B.52.11 (aluminium), multicore cable in free air, for method E.
  *   A1: insulated conductors in conduit in a thermally insulating wall
  *   B1: insulated conductors in conduit on a wall      B2: multicore cable in conduit on a wall
  *   C:  single or multicore cable clipped to a wall    E:  multicore cable in free air (tray, ladder)
- * Aluminium starts at 16 mm², the smallest size these tables list for every method.
+ * The tables list aluminium from 2.5 mm²; wattsim models it from 16 mm² only, and returns undefined below.
  * Grouping and ambient correction factors are not applied; pass `ampacityA` on the cable to override.
  *
- * Resistance: IEC 60228:2004 Table 2 (class 2 stranded conductors), maximum DC resistance at 20 °C, Ω/km.
+ * Every value was checked on 2026-10-30 against at least two reproductions (see DECISIONS.md):
+ *   - ABB SACE "Electrical installation handbook, Vol. 2: Electrical devices", 1SDC010001D0204 (2006), Table 8,
+ *     which reproduces the IEC 60364-5-52:2001 tables (its B1 and B2 columns stop at 120 mm²);
+ *   - Schneider Electric "Electrical Installation Guide" wiki, Fig. G20 (= Table B.52.4, Cu and Al, A1..C);
+ *   - TiSoft ElectricalDesign help pages for Tables B.52.2, B.52.4, B.52.10 and B.52.11;
+ *   - ECalPro "IEC 60364 Table B.52" page (B.52.2 copper, A1..C and E).
+ * One disagreement: TiSoft gives 198 A (70 mm²) and 278 A (120 mm²) for copper, method E, 3 loaded conductors.
+ * ABB Table 8 and BS 7671 Table 4D2A give 196 A and 276 A, which are kept.
+ * Single source (TiSoft B.52.2 only): aluminium, 2 loaded conductors, methods B1 and B2 at 150, 185 and 240 mm².
+ *
+ * Resistance: IEC 60228:2004 Table 2 (class 2 stranded conductors, plain copper and aluminium), maximum DC
+ * resistance at 20 °C, Ω/km. Checked against the standard's own preview pages, the Nexans "Classification of
+ * conductors according to IEC 60228" (2021) and the Cembre general catalogue reproduction.
  * Reactance: 0.08 Ω/km, the value IEC 60364-5-52 Annex G suggests when no other data is known.
  */
 

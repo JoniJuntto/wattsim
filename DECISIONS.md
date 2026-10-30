@@ -309,3 +309,61 @@ The model is quasi-static per phase at the fundamental frequency, with no power-
 **The DST change is a tariff boundary.** A local time-of-day boundary used to map to the first instant the wall clock reaches it, so the hour the autumn change repeats was priced once: 03:00-03:30 on 2026-10-25 in Europe/Helsinki cost 0.5 of 1.0. `nextLocalMinute` now returns the next pass through a repeated wall time too, and `TransactionCost` treats the instant the UTC offset changes as a boundary (found by comparing `Intl` offsets at the current instant and the next local boundary, then bisecting), so a window that ends inside the repeated hour also flips there. Both directions match a 10 s brute force over several days in Helsinki and New York.
 
 **`reorder` never holds an outbound CALL.** Only a later outbound frame releases a held frame, and the station's next outbound frame is normally its next CALL, which waits for the held one's answer, so the held CALL always timed out. `ChaosEngine.decide` does not match a `reorder` rule to an outbound CALL: the CALL passes unheld, the rule draws no `probability` and spends no `once`, and the CALL still counts for `nth` and `every` like every frame in its direction. Responses either way, inbound CALLs and 2.1 SENDs can still be held. The proxy uses the same engine (`out` is charger to CSMS there) and `faultOutcome` passes a charger CALL on as well.
+
+## 2026-10-30 Site-model reference tables checked against published sources
+
+The cable and protection tables in `packages/grid` were written from memory. They were then compared value by value with published reproductions, at least two per table where two could be found.
+
+**Changed: gG gates (`GG_GATES` in `curves.ts`).** Imin(0.1 s) was wrong from 40 A up, and the four columns were wrong from 315 A up. The published table follows a rule the old one broke: from 25 A up, each Imin(0.1 s) equals the Imax(0.1 s) two ratings lower, which gives 1.6:1 selectivity at 0.1 s. Corrected values (old → new, A):
+
+| In | Imin(10 s) | Imax(5 s) | Imin(0.1 s) | Imax(0.1 s) |
+|---|---|---|---|---|
+| 40 | | | 250 → 260 | |
+| 50 | | | 320 → 350 | |
+| 63 | | | 425 → 450 | |
+| 80 | | | 580 → 610 | |
+| 100 | | | 715 → 820 | |
+| 125 | | | 950 → 1100 | |
+| 160 | | | 1250 → 1450 | |
+| 200 | | | 1650 → 1910 | |
+| 250 | | | 2200 → 2590 | |
+| 315 | | | 2840 → 3420 | 5750 → 6000 |
+| 400 | 1340 → 1420 | | 3800 → 4500 | 7500 → 8060 |
+| 500 | 1700 → 1780 | | 5100 → 6000 | 10000 → 10600 |
+| 630 | 2400 → 2200 | | 7000 → 8060 | 13000 → 14140 |
+| 800 | 3000 → 3060 | | 9500 → 10600 | 17500 → 19000 |
+| 1000 | | | 13000 → 14140 | 25000 → 24000 |
+| 1250 | | | 17500 → 19000 | |
+
+The median curve is now slower at short times. For example, 400 A at 3.5 kA trips in 0.94 s (was 0.73 s), and 100 A at 700 A trips in 0.81 s (was 0.72 s). 630 A at 2.3 kA trips faster, in 77 s (was 86 s), because Imin(10 s) fell. The 63 A band-edge test now expects 450 A at 0.1 s. A new test pins the published rows and the 1.6:1 rule.
+
+Sources for the gates:
+- IS 13703 (Part 1):1993, Table III, the Indian adoption of IEC 269-1:1986 (https://law.resource.org/pub/in/bis/S05/is.13703.1.1993.pdf). This is the only source with every row from 16 to 800 A. For 1000 and 1250 A it prints every column except Imin(10 s).
+- Enel Global Standard GSCL004 Rev. 0 (2016), "Low voltage fuses (NH)", Table 7: the 25 A row and 40 to 630 A (https://www.eneldistribuicao.com.br/ce/documentos/GSCL-004_R-00.pdf). Endesa NNL011 4th ed. (2017), Table 6, has the same rows but comes from the same utility group.
+- Mersen TM-104 EduPack "IEC 60269 gG & aM standard low voltage fuses" (2012), slide 6: 25, 80, 250, 800 and 1250 A (https://www.mersen.com/sites/mersen_ca/files/2018-11/TM-104-Mersen-EduPack-IEC60269-gG-aM-Standard-Low-Voltage-Fuses.pdf).
+- Schneider Electric "Complementary technical information" (2018), gG gate table: 16, 400, 800, 1000 and 1250 A. Its host (tekdok.dk) refused downloads, so these rows come from search-engine extracts of it.
+
+**Unchanged and confirmed:**
+- gG conventional currents and times from 16 A up: Enel GSCL004 Table 6, ETI Polam "Important information for fuse links users" Table 1, and BEAMA "Guide to low voltage switch and fusegear devices".
+- IEC 60364-5-52 Annex B, PVC, every value in `cables.ts`:
+  - Table B.52.2 (2 loaded conductors), Cu and Al, A1/B1/B2/C: ABB SACE "Electrical installation handbook Vol. 2", 1SDC010001D0204 (2006), Table 8 (https://library.e.abb.com/public/561a28a17753c444c125714f00360967/1SDC010001D0204.pdf), whose B1 and B2 columns stop at 120 mm². Also TiSoft ElectricalDesign help, Table B.52.2 (https://www.ti-soft.com/en/support/help/electricaldesign/standards/iec-60364-5-52/current-carrying-capacity/table_b_52_2), and, for copper, the ECalPro table page (https://ecalpro.com/standards/iec-60364/table-b52-current-ratings).
+  - Table B.52.4 (3 loaded conductors), Cu and Al: Schneider Electric Electrical Installation Guide wiki, "General method for cable sizing", Fig. G20 (Wayback copy of https://www.electrical-installation.org/enwiki/General_method_for_cable_sizing, last edited 2022-06-22). Also TiSoft Table B.52.4 and ABB Table 8.
+  - Method E, Tables B.52.10 (Cu) and B.52.11 (Al): ABB Table 8 and TiSoft. The header now cites B.52.11 for aluminium; it had cited B.52.10 for both.
+- IEC 60228:2004 Table 2 resistances: the standard's own preview (https://cdn.standards.iteh.ai/samples/12024/921fee9a88c24612b68340a7330c2262/IEC-60228-2004.pdf, page 10), Nexans "Classification of conductors according to IEC 60228" (2021), and the Cembre general catalogue page 204.
+- IEC 60898-1 Table 7 test points (1.13 / 1.45 In, 2.55 In for 1 to 60 / 120 s, magnetic bands 3-5 / 5-10 / 10-20 In): Eaton "Industrial Switchgear" CA08103002Z-EN (2010), page 19/58, and the Schneider Acti 9 catalogue "Tripping curves" page.
+- IEC 60947-2 1.05 / 1.30 Ir and 1 h: Schneider Electric FAQ FA369327, and Eaton's IZM release manual for the 1.05 Ir lower bound.
+
+**Disagreement.** For copper, method E, 3 loaded conductors, TiSoft's B.52.10 gives 198 A at 70 mm² and 278 A at 120 mm². ABB Table 8 and BS 7671 Table 4D2A give 196 A and 276 A, and so does the code. The manufacturer guide wins, and those values are kept. TiSoft has typos elsewhere: its 4D2A page prints 2134 for 213.
+
+**Comment fixed.** `cables.ts` said aluminium starts at 16 mm² because that is the smallest size every method lists. That is wrong: Tables B.52.2, B.52.4 and B.52.11 list aluminium from 2.5 mm². wattsim still models aluminium from 16 mm² only, and the comment now says so.
+
+**Still unverified:**
+- gG gates below 16 A. They are in IEC 60269-2 Table 102, which could not be read, and IEC 269-1:1986 marks them "under consideration". The model scales the 16 A multiples down.
+- gG Inf = 1.5 In below 16 A, which only a secondary web page states. If = 2.1 / 1.9 In is in ETI Table 1.
+- The 20 A and 32 A gate rows, which have one source (IS 13703).
+- The Imin(10 s) value of 4000 A at 1000 A, which only the Schneider extract gives.
+- Aluminium with 2 loaded conductors, methods B1 and B2, at 150 to 240 mm², which only TiSoft gives.
+- The MCCB conventional time of 2 h above 63 A, and the ±20 % tolerance on Isd and Ii. Eaton gives -0/+20 % for its IZM release and Schneider ±10 % for MicroLogic X.
+- The reactance of 0.08 Ω/km (IEC 60364-5-52 Annex G), which was not checked.
+
+The IEC 60269-1 table numbers changed between editions: Tables II and III in 1986, Tables 3 and 4 in 2024. The 2006 numbering the code used to cite could not be confirmed, so the comments now give the 1986 and 2024 numbers.

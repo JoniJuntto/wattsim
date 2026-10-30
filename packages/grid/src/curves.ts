@@ -127,6 +127,8 @@ function finish(c: Omit<TripCurve, 'tripTime'>): TripCurve {
 // (fast edge) to 1.45 (slow edge) and t_c from 1 s to 60 / 120 s. Its time never drops below 0.1 s, so test d holds
 // at every band position. The magnetic release trips in 10 ms at lo + (hi - lo) × band (B: 3..5, C: 5..10, D: 10..20).
 // Test b is passed from cold, which is stricter than after test a.
+// Test points checked 2026-10-30 against Eaton "Industrial Switchgear" CA08103002Z-EN (2010), tripping
+// characteristics page 19/58, and the Schneider Electric Acti 9 catalogue "Tripping curves" page (iC60).
 // ---------------------------------------------------------------------------------------------------------------
 
 export type McbCharacteristic = 'B' | 'C' | 'D';
@@ -170,8 +172,8 @@ export function mcbCurve(characteristic: McbCharacteristic, ratingA: number, opt
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// gG fuse-links, IEC 60269-1:2006 Table 2 (conventional times and currents) and Table 3 (gates), with the ratings
-// of IEC 60269-2.
+// gG fuse-links, IEC 60269-1 conventional times and currents, and gates for specified pre-arcing times (Tables II
+// and III in IEC 269-1:1986, Tables 3 and 4 in IEC 60269-1:2024), with the ratings of IEC 60269-2.
 //
 //   In <= 4 A:        Inf 1.5 In, If 2.1 In, conventional time 1 h
 //   4 A < In < 16 A:  Inf 1.5 In, If 1.9 In, 1 h
@@ -181,34 +183,51 @@ export function mcbCurve(characteristic: McbCharacteristic, ratingA: number, opt
 // Gates (pre-arcing time): at Imin(10 s) no melting within 10 s; at Imax(5 s) melting within 5 s; at Imin(0.1 s)
 // no melting within 0.1 s; at Imax(0.1 s) melting within 0.1 s.
 //
+// Sources, checked 2026-10-30 (see DECISIONS.md):
+//   - Gates 16..800 A: IS 13703 (Part 1):1993 Table III, the Indian adoption of IEC 269-1:1986. Its 1000 A and
+//     1250 A rows print every column but Imin(10 s).
+//   - Gates 25 and 40..630 A: Enel GSCL004 Rev. 0 (2016) Table 7, and Endesa NNL011 4th ed. (2017) Table 6.
+//   - Gates 25, 80, 250, 800 and 1250 A: Mersen TM-104 EduPack "IEC 60269 gG & aM" (2012), slide 6.
+//   - Gates 16, 400, 800, 1000 and 1250 A: Schneider Electric "Complementary technical information" (2018), as
+//     quoted by search-engine extracts; the PDF itself could not be downloaded.
+//   - Conventional currents >= 16 A: Enel GSCL004 Table 6, ETI Polam "Important information for fuse links users"
+//     Table 1, BEAMA "Guide to low voltage switch and fusegear devices". Below 16 A, If (2.1 / 1.9 In) is in ETI
+//     Table 1; Inf 1.5 In is from a secondary web source only and is unverified.
+//   The 20 A and 32 A gate rows have one source (IS 13703). Gates below 16 A are in IEC 60269-2 (Table 102), which
+//   was not available; IEC 269-1:1986 says they are "under consideration". Below 16 A the model therefore scales
+//   the 16 A multiples, which is unverified.
+//
 // Model: the fast edge runs through (Inf, t_conv), Imin(10 s), Imin(0.1 s); the slow edge through (If, t_conv),
 // Imax(5 s), Imax(0.1 s). The curve at band p takes, at each of t_conv, 10 s, 5 s and 0.1 s, the current p of the way
 // from the fast edge to the slow one, and runs through those four points. Below 0.1 s it is I²t = constant.
 // Ratings between table rows interpolate the gate multiples log-log in In; below 16 A the 16 A multiples are used.
 // ---------------------------------------------------------------------------------------------------------------
 
-/** IEC 60269-1 Table 3 gates for gG: In -> [Imin(10 s), Imax(5 s), Imin(0.1 s), Imax(0.1 s)], A. */
+/**
+ * IEC 60269-1 gates for gG: In -> [Imin(10 s), Imax(5 s), Imin(0.1 s), Imax(0.1 s)], A. From 25 A up, each
+ * Imin(0.1 s) equals the Imax(0.1 s) two ratings lower, which is how the table gives 1.6:1 selectivity at 0.1 s.
+ */
 export const GG_GATES: ReadonlyArray<readonly [number, number, number, number, number]> = [
   [16, 33, 65, 85, 150],
   [20, 42, 85, 110, 200],
   [25, 52, 110, 150, 260],
   [32, 75, 150, 200, 350],
-  [40, 95, 190, 250, 450],
-  [50, 125, 250, 320, 610],
-  [63, 160, 320, 425, 820],
-  [80, 215, 425, 580, 1100],
-  [100, 290, 580, 715, 1450],
-  [125, 355, 715, 950, 1910],
-  [160, 460, 950, 1250, 2590],
-  [200, 610, 1250, 1650, 3420],
-  [250, 750, 1650, 2200, 4500],
-  [315, 1050, 2200, 2840, 5750],
-  [400, 1340, 2840, 3800, 7500],
-  [500, 1700, 3800, 5100, 10000],
-  [630, 2400, 5100, 7000, 13000],
-  [800, 3000, 7000, 9500, 17500],
-  [1000, 4000, 9500, 13000, 25000],
-  [1250, 5000, 13000, 17500, 35000],
+  [40, 95, 190, 260, 450],
+  [50, 125, 250, 350, 610],
+  [63, 160, 320, 450, 820],
+  [80, 215, 425, 610, 1100],
+  [100, 290, 580, 820, 1450],
+  [125, 355, 715, 1100, 1910],
+  [160, 460, 950, 1450, 2590],
+  [200, 610, 1250, 1910, 3420],
+  [250, 750, 1650, 2590, 4500],
+  [315, 1050, 2200, 3420, 6000],
+  [400, 1420, 2840, 4500, 8060],
+  [500, 1780, 3800, 6000, 10600],
+  [630, 2200, 5100, 8060, 14140],
+  [800, 3060, 7000, 10600, 19000],
+  [1000, 4000, 9500, 14140, 24000],
+  [1250, 5000, 13000, 19000, 35000],
 ];
 
 export const GG_MIN_RATING_A = 2;
@@ -306,6 +325,9 @@ export function gGCurve(ratingA: number, opts: BandOptions = {}): TripCurve {
 // point of ABB, Schneider and Siemens trip units; not standardised), Isd (multiple of Ir), tsd (s, definite time),
 // Ii (multiple of In). Long time: t = tr × 36 / (I / Ir)², I²t = constant, above a pickup that goes from 1.05 Ir
 // (fast edge) to 1.30 Ir (slow edge). tr carries a ±20 % time tolerance (manufacturer typical), Isd and Ii ±20 %.
+// Checked 2026-10-30: 1.05 / 1.30 and the 1 h conventional time in Schneider Electric FAQ FA369327, and the 1.05 Ir
+// lower bound in Eaton's IZM release manual. Unverified: the 2 h conventional time above 63 A and the ±20 % on Isd
+// and Ii (Eaton gives -0 / +20 % for its IZM release, Schneider ±10 % for MicroLogic X).
 // ---------------------------------------------------------------------------------------------------------------
 
 export type MccbSettings = {
