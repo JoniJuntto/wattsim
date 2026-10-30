@@ -1,6 +1,17 @@
 /** Wire types shared with the browser UI. This file is the server side of the contract in the UI plan; keep it verbatim. */
 import type { BootStatus, ConformanceViolation, RuleId, Severity, Tally } from '@wattsim/csms';
+import type {
+  DlmScore,
+  Violation as GridViolation,
+  NextEvent,
+  NodeInfo,
+  NodeState,
+  Phase,
+  SiteDescription,
+  TripEventCause,
+} from '@wattsim/grid';
 import type { Violation } from '@wattsim/protocol';
+import type { Allocation, LeafInfo, LeafSnapshot, SiteReport } from '@wattsim/site';
 
 export type OcppVersion = 'ocpp1.6' | 'ocpp2.0.1' | 'ocpp2.1';
 
@@ -80,7 +91,8 @@ export type StreamMessage =
   | { type: 'csms.session'; session: CsmsSessionView }
   | { type: 'csms.violation'; violation: ConformanceViolation }
   | { type: 'series'; stationId: string; points: SeriesPoint[] }
-  | { type: 'fleet'; bin: FleetBin };
+  | { type: 'fleet'; bin: FleetBin }
+  | SiteStreamMessage;
 
 // ---- server mode (milestone 4) ----------------------------------------------------------------------------------
 
@@ -124,6 +136,8 @@ export type RunSummary = {
   /** Why the run could not complete (not an assertion failure). */
   error?: string;
   recordingId?: string;
+  /** The run's electrical site (scenarios with a `site` block): `/sites/:siteId`. */
+  siteId?: string;
   /**
    * A virtual run against the test CSMS gets a CSMS of its own on the run's virtual clock. Its conformance report is
    * saved (`GET /api/csms/reports/:reportId`) when the run ends; these are its totals.
@@ -377,3 +391,102 @@ export type FindingsBinsView = {
   severity: Record<string, 'error' | 'warning'>;
   total: number;
 };
+
+// ---- sites (the DLM test environment) ---------------------------------------------------------------------------
+
+export type { DlmScore, GridViolation, LeafInfo, LeafSnapshot, NextEvent, NodeInfo, NodeState, Phase, SiteDescription };
+
+/** `run`: a scenario run's site; `sandbox`: built from DSL with UI stations; `upload`: a `--site-report` file. */
+export type SiteKind = 'run' | 'sandbox' | 'upload';
+
+/**
+ * One DLM control step: the reference controller's own decision trail, or (`inferred`) one rebuilt from the charging
+ * profiles the stations received and what they drew, for a DLM under test that does not explain itself.
+ */
+export type AllocationView = Omit<Allocation, 'reason'> & { reason: Allocation['reason'] | 'profile'; inferred?: true };
+
+export type SiteSummary = {
+  id: string;
+  name: string;
+  kind: SiteKind;
+  /** The site is running now (its runtime is in this process). */
+  live: boolean;
+  runId?: string;
+  /** ISO */
+  createdAt: string;
+  /** Epoch ms on the site's clock (virtual time for a virtual run). */
+  start: number;
+  end?: number;
+  controller: 'reference' | 'none';
+  nodes: number;
+  leaves: number;
+  trips: number;
+  /** The rated node with the highest peak loading so far. */
+  peak?: { nodeId: string; pct: number };
+  fairness?: number;
+};
+
+export type SiteTopology = { description: SiteDescription; nodes: NodeInfo[]; leaves: LeafInfo[] };
+
+/** The DLM score without the per-EVSE energy table (that one is in the report). */
+export type SiteScoreView = Omit<DlmScore, 'evse'>;
+
+/** A live site's state. `seq` orders it with the `site` stream messages that change it. */
+export type SiteLive = {
+  seq: number;
+  t: number;
+  /** Every node and leaf by id, the supply point as `@supply`. */
+  nodes: Record<string, NodeState>;
+  imbalanceA: number;
+  leaves: LeafSnapshot[];
+  next: NextEvent | null;
+  controller: 'reference' | 'none';
+  score: SiteScoreView;
+  violations: GridViolation[];
+};
+
+export type SiteDetail = SiteSummary & {
+  topology: SiteTopology;
+  /** A live site's state now. */
+  state?: SiteLive;
+  /** Sandbox: the UI station bound to each EVSE leaf. */
+  bindings?: Record<string, string>;
+};
+
+export type SiteEventView =
+  | { type: 'trip'; t: number; nodeId: string; phases: Phase[]; cause: TripEventCause; currentA: number }
+  | { type: 'reclose'; t: number; nodeId: string; auto: boolean }
+  | { type: 'violation'; t: number; phase: 'start' | 'end'; violation: GridViolation };
+
+/** `GET /api/sites/:id/report`: the `--site-report` file, plus the inferred allocations of an external DLM. */
+export type SiteReportView = SiteReport & { inferred?: AllocationView[] };
+
+/** `GET /api/sites/:id/events`. */
+export type SiteEventsView = { events: SiteEventView[]; violations: GridViolation[] };
+
+export type SiteStreamMessage =
+  /**
+   * A live site changed: the nodes and leaves that changed since message `seq - 1` (all of them when `full`).
+   * Coalesced to one per 250 ms per site. A client whose state is not at `seq - 1` refetches `GET /api/sites/:id`.
+   */
+  | {
+      type: 'site';
+      siteId: string;
+      seq: number;
+      t: number;
+      full: boolean;
+      nodes: Record<string, NodeState>;
+      leaves: LeafSnapshot[];
+      imbalanceA: number;
+      next: NextEvent | null;
+      controller: 'reference' | 'none';
+      score: SiteScoreView;
+      violations: GridViolation[];
+    }
+  /** Every control step, at most 10 a second per site (the rest: `GET /api/sites/:id/allocations`). */
+  | { type: 'site.allocation'; siteId: string; allocation: AllocationView }
+  /** Trips, reclosures, violations starting or ending; at most 50 a second per site. */
+  | { type: 'site.event'; siteId: string; event: SiteEventView }
+  /** A site appeared, changed state (finished) or its summary moved (coalesced, 1 per second). */
+  | { type: 'site.summary'; site: SiteSummary }
+  | { type: 'site.removed'; id: string };

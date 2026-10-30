@@ -1,3 +1,4 @@
+import type { Allocation, SiteEventView, SiteLive, SiteSummary } from '../api/site-types';
 import type {
   ConformanceViolation,
   CsmsSessionView,
@@ -38,6 +39,18 @@ export const SERIES_CAP = 3000;
 export const SERIES_MERGE_MS = 250;
 /** Streamed fleet bins kept: 6 h of 10 s bins. */
 export const FLEET_BIN_CAP = 2160;
+/** Streamed control steps and site events kept per watched site (history comes from the report). */
+export const SITE_ALLOCATION_CAP = 2000;
+export const SITE_EVENT_CAP = 500;
+
+/** A watched site's live state: the merged `site` messages, and what streamed since the page loaded. */
+export type SiteLiveState = {
+  /** null until the page loaded it (`site-loaded`), or after a gap in the stream (the page refetches). */
+  live: SiteLive | null;
+  allocations: Allocation[];
+  events: SiteEventView[];
+};
+
 /** How many recent frames a new violation is matched against. */
 const VIOLATION_LOOKBACK = 50;
 
@@ -73,6 +86,11 @@ export type State = {
   seriesWatch: Record<string, number>;
   /** Streamed fleet aggregate bins, oldest first. */
   fleetBins: FleetBin[];
+  /** Electrical sites by id, from `GET /api/sites` and `site.summary` messages. */
+  sites: Record<string, SiteSummary>;
+  /** Sites a view is showing (mounted views per site): the only ones whose stream is kept. */
+  siteWatch: Record<string, number>;
+  siteLive: Record<string, SiteLiveState>;
 };
 
 export type StoreAction =
@@ -83,7 +101,11 @@ export type StoreAction =
   | { type: 'run-removed'; id: string }
   | { type: 'csms-loaded'; view: CsmsView; violations?: ConformanceViolation[] }
   /** A view starts (+1) or stops (-1) showing a station's series; points of unwatched stations are not kept. */
-  | { type: 'series-watch'; stationId: string; delta: 1 | -1 };
+  | { type: 'series-watch'; stationId: string; delta: 1 | -1 }
+  | { type: 'sites-loaded'; sites: SiteSummary[] }
+  | { type: 'site-watch'; siteId: string; delta: 1 | -1 }
+  /** The page fetched a live site's state (`GET /api/sites/:id`). */
+  | { type: 'site-loaded'; siteId: string; live: SiteLive };
 
 export const initialState: State = {
   stations: {},
@@ -102,6 +124,9 @@ export const initialState: State = {
   series: {},
   seriesWatch: {},
   fleetBins: [],
+  sites: {},
+  siteWatch: {},
+  siteLive: {},
 };
 
 /**
@@ -218,8 +243,98 @@ function addViolation(state: State, stationId: string, violation: Violation, now
   return { ...state, nextKey: state.nextKey + 1, violations: { ...state.violations, [stationId]: list } };
 }
 
+const EMPTY_SITE: SiteLiveState = { live: null, allocations: [], events: [] };
+
+/** Apply a `site` diff to a watched site; a message that does not follow the state it has drops it (refetch). */
+function siteDiff(state: State, msg: Extract<StreamMessage, { type: 'site' }>): State {
+  const cur = state.siteLive[msg.siteId];
+  if (!cur) return state;
+  let live: SiteLive | null = null;
+  if (cur.live && msg.seq === cur.live.seq + 1) {
+    live = {
+      seq: msg.seq,
+      t: msg.t,
+      nodes: { ...cur.live.nodes, ...msg.nodes },
+      imbalanceA: msg.imbalanceA,
+      leaves: mergeLeaves(cur.live.leaves, msg.leaves),
+      next: msg.next,
+      controller: msg.controller,
+      score: msg.score,
+      violations: msg.violations,
+    };
+  } else if (msg.full) {
+    live = {
+      seq: msg.seq,
+      t: msg.t,
+      nodes: msg.nodes,
+      imbalanceA: msg.imbalanceA,
+      leaves: msg.leaves,
+      next: msg.next,
+      controller: msg.controller,
+      score: msg.score,
+      violations: msg.violations,
+    };
+  } else if (cur.live && msg.seq <= cur.live.seq) {
+    return state;
+  }
+  return { ...state, siteLive: { ...state.siteLive, [msg.siteId]: { ...cur, live } } };
+}
+
+function mergeLeaves(prev: SiteLive['leaves'], changed: SiteLive['leaves']): SiteLive['leaves'] {
+  if (changed.length === 0) return prev;
+  const byId = new Map(changed.map((l) => [l.leafId, l]));
+  const out = prev.map((l) => byId.get(l.leafId) ?? l);
+  for (const l of changed) if (!prev.some((p) => p.leafId === l.leafId)) out.push(l);
+  return out;
+}
+
 export function reduce(state: State, action: StoreAction, now: number): State {
   switch (action.type) {
+    case 'sites-loaded': {
+      const sites: Record<string, SiteSummary> = {};
+      for (const s of action.sites) sites[s.id] = state.sites[s.id]?.live ? (state.sites[s.id] as SiteSummary) : s;
+      return { ...state, sites };
+    }
+    case 'site.summary':
+      return { ...state, sites: { ...state.sites, [action.site.id]: action.site } };
+    case 'site.removed':
+      return { ...state, sites: without(state.sites, action.id) };
+    case 'site-watch': {
+      const n = (state.siteWatch[action.siteId] ?? 0) + action.delta;
+      if (n > 0) {
+        return {
+          ...state,
+          siteWatch: { ...state.siteWatch, [action.siteId]: n },
+          siteLive:
+            action.siteId in state.siteLive ? state.siteLive : { ...state.siteLive, [action.siteId]: EMPTY_SITE },
+        };
+      }
+      return {
+        ...state,
+        siteWatch: without(state.siteWatch, action.siteId),
+        siteLive: without(state.siteLive, action.siteId),
+      };
+    }
+    case 'site-loaded': {
+      const cur = state.siteLive[action.siteId];
+      if (!cur) return state;
+      if (cur.live && cur.live.seq >= action.live.seq) return state;
+      return { ...state, siteLive: { ...state.siteLive, [action.siteId]: { ...cur, live: action.live } } };
+    }
+    case 'site':
+      return siteDiff(state, action);
+    case 'site.allocation': {
+      const cur = state.siteLive[action.siteId];
+      if (!cur) return state;
+      const allocations = [...cur.allocations, action.allocation].slice(-SITE_ALLOCATION_CAP);
+      return { ...state, siteLive: { ...state.siteLive, [action.siteId]: { ...cur, allocations } } };
+    }
+    case 'site.event': {
+      const cur = state.siteLive[action.siteId];
+      if (!cur) return state;
+      const events = [...cur.events, action.event].slice(-SITE_EVENT_CAP);
+      return { ...state, siteLive: { ...state.siteLive, [action.siteId]: { ...cur, events } } };
+    }
     case 'snapshot': {
       const keep = new Set(action.stations.map((s) => s.id));
       let next: State = {

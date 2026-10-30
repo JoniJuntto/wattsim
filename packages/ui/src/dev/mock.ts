@@ -29,6 +29,7 @@ import {
   stationSeries,
 } from './mock-charts';
 import { type MockContext, MockHttpError, seedServerMode, serverModeRoute, serverModeTick } from './mock-server-mode';
+import { siteRoute } from './mock-site';
 
 const FRAME_CAP = 2000;
 
@@ -597,6 +598,8 @@ async function route(method: string, url: URL, body: unknown): Promise<Response>
         return json(undefined, 204);
       }
     }
+    const site = siteRoute(method, parts, body, emit);
+    if (site) return site;
     const served = serverModeRoute(mockContext, method, url, parts, body);
     if (served) return served;
     throw new HttpError(404, `Mock has no route ${method} ${url.pathname}`);

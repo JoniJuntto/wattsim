@@ -11,6 +11,7 @@
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { toJUnit as csmsJUnit } from '@wattsim/csms';
+import { type SiteDescription, validateSite } from '@wattsim/grid';
 import { validatePayload } from '@wattsim/protocol';
 import { toJUnit as runJUnit } from '@wattsim/scenario';
 import { Elysia } from 'elysia';
@@ -21,26 +22,31 @@ import { buildMeta } from './meta';
 import { fileName, sessionTrace } from './recording';
 import { Conflict, FRAMES_PER_STATION, NotFound, Registry } from './registry';
 import { DEFAULT_RUN_LIMITS, Runs, TooManyRuns } from './runs';
-import { checkScenario, formatScenario, prepare } from './scenario';
+import { checkScenario, formatScenario, prepare, toDiagnostic } from './scenario';
 import type { CreateStation } from './schemas';
 import {
   BadRequest,
   chaosRule,
   createBulk,
+  createSite,
   createStation,
   parseAction,
   parseBody,
+  parseSiteAction,
   saveRecording,
   saveReport,
   saveScenario,
   scenarioSource,
+  siteReport,
   startRun,
   validateBody,
 } from './schemas';
+import { planSandbox, type SandboxPlan } from './site-sandbox';
+import { MAX_SITE_LEAVES, Sites } from './sites';
 import { serveUi } from './static';
 import { StreamHub } from './stream';
 import { startTestCsmsOn, TestCsms } from './test-csms';
-import type { ScenarioDiagnostic, StationView } from './types';
+import type { OcppVersion, ScenarioDiagnostic, SiteLive, SiteReportView, SiteSummary, StationView } from './types';
 
 export { DB_FILE } from './db/store';
 export type {
@@ -60,6 +66,10 @@ export type {
   SavedScenarioSummary,
   ScenarioCheck,
   ScenarioDiagnostic,
+  SiteDetail,
+  SiteLive,
+  SiteReportView,
+  SiteSummary,
   StationView,
   StreamMessage,
 } from './types';
@@ -91,6 +101,8 @@ export type ServerOptions = {
   allowOrigins?: string[];
   /** Width of a fleet aggregate bin; default `FLEET_BIN_MS` (10 s). For tests. */
   fleetBinMs?: number;
+  /** EVSE leaves a site may have to be shown, built or uploaded; default `MAX_SITE_LEAVES` (500). */
+  maxSiteLeaves?: number;
 };
 
 export type RunningServer = { url: string; stop(): Promise<void> };
@@ -104,6 +116,10 @@ export const DEFAULT_MAX_RUN_MS = DEFAULT_RUN_LIMITS.maxRunMs;
 export const SCENARIO_DIR = 'scenarios';
 const DEFAULT_UI_DIR = resolve(import.meta.dir, '../../ui/dist');
 const DEFAULT_FRAME_LIMIT = 500;
+/** Largest request body; an uploaded site report may be larger (`MAX_REPORT_BYTES`). */
+export const MAX_BODY_BYTES = 8 * 1024 * 1024;
+export const MAX_REPORT_BYTES = 64 * 1024 * 1024;
+const REPORT_UPLOAD = '/api/sites/reports';
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -202,6 +218,9 @@ function hostName(host: string): string {
  * and its Origin matches that Host, so the Origin check alone would let it read and drive the server.
  */
 function guard(request: Request, allowed: ReadonlySet<string>, loopbackOnly: boolean): Response | undefined {
+  const length = Number(request.headers.get('content-length') ?? 0);
+  const max = new URL(request.url).pathname === REPORT_UPLOAD ? MAX_REPORT_BYTES : MAX_BODY_BYTES;
+  if (length > max) return json(413, { error: `request body too large: at most ${max} bytes` });
   if (loopbackOnly) {
     const host = request.headers.get('host');
     if (host !== null && !isLoopback(hostName(host))) {
@@ -251,17 +270,24 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
   const maxStations = opts.maxStations ?? DEFAULT_MAX_STATIONS;
   const scenarioOpts = { dir: scenarioDir, maxStations };
   const allowed: ReadonlySet<string> = new Set(opts.allowOrigins ?? []);
-  const runs = new Runs(store, hub, (clock) => startTestCsmsOn({ host, clock }), {
-    maxRuns: opts.maxRuns ?? DEFAULT_MAX_RUNS,
-    maxRunMs: opts.maxRunMs ?? DEFAULT_MAX_RUN_MS,
-    maxStations,
-  });
   const testCsms = new TestCsms(
     host,
     opts.csmsPort ?? 0,
     hub,
     (id) => reg.has(id),
     (csms, report) => store.saveReport(`test CSMS stopped ${new Date().toISOString()}`, csms.url, report),
+  );
+  const sites = new Sites(store, hub, { stations: reg, csms: testCsms }, opts.maxSiteLeaves ?? MAX_SITE_LEAVES);
+  const runs = new Runs(
+    store,
+    hub,
+    (clock) => startTestCsmsOn({ host, clock }),
+    {
+      maxRuns: opts.maxRuns ?? DEFAULT_MAX_RUNS,
+      maxRunMs: opts.maxRunMs ?? DEFAULT_MAX_RUN_MS,
+      maxStations,
+    },
+    sites,
   );
   const app = new Elysia()
     .onRequest(({ request }) => guard(request, allowed, isLoopback(host.replace(/^\[|\]$/g, ''))))
@@ -396,6 +422,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
         file: p.file,
         name: b.name ?? saved?.name ?? 'untitled',
         scenarioId: b.scenarioId,
+        siteController: b.siteController,
         target: b.target,
         csmsUrl,
         overrideCsms: override !== undefined,
@@ -498,6 +525,81 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       if (!store.deleteReport(params.id)) throw new NotFound(`no report ${params.id}`);
       return noContent();
     })
+    // ---- electrical sites (the DLM test environment) ----
+    .get('/api/sites', () => sites.list())
+    .post('/api/sites', async ({ body: raw }) => {
+      const b = parseBody(createSite, body(raw));
+      const p = await prepare(b.source, scenarioOpts);
+      if (!p.ok) throw new InvalidScenario(p.diagnostics);
+      let plan: SandboxPlan;
+      try {
+        plan = planSandbox(p.scenario, p.linked, p.file, opts.maxSiteLeaves ?? MAX_SITE_LEAVES);
+      } catch (err) {
+        throw new InvalidScenario([toDiagnostic(b.source, err, p.file)]);
+      }
+      const detail = await sites.createSandbox({
+        plan,
+        ...(b.name !== undefined ? { name: b.name } : {}),
+        controller: b.controller ?? plan.controller?.mode ?? 'none',
+        bind: b.bind,
+        create: b.create,
+        ...(b.version !== undefined ? { version: b.version as OcppVersion } : {}),
+      });
+      return json(201, detail);
+    })
+    .post(REPORT_UPLOAD, ({ body: raw }) => {
+      if (typeof raw === 'string' && raw.length > MAX_REPORT_BYTES) {
+        return json(413, { error: `request body too large: at most ${MAX_REPORT_BYTES} bytes` });
+      }
+      const r = parseBody(siteReport, body(raw)) as unknown as SiteReportView;
+      const issue = validateSite(r.description as SiteDescription)[0];
+      if (issue) throw new BadRequest(`description: ${issue.message}`);
+      const keyframes = r.allocations.length;
+      for (const [k, step] of (r.allocationSteps ?? []).entries()) {
+        if (typeof step === 'number' && step >= keyframes) {
+          throw new BadRequest(`allocationSteps.${k}: keyframe ${step} is not in allocations (${keyframes})`);
+        }
+        if (k === 0 && typeof step !== 'number') throw new BadRequest('allocationSteps.0: must be a keyframe index');
+      }
+      for (const [id, n] of Object.entries(r.series.nodes)) {
+        const len = r.series.t.length;
+        const bad = [n.neutralA, n.powerW, n.energized, ...n.currentA, ...n.voltageV].some((a) => a.length !== len);
+        if (bad) throw new BadRequest(`series.nodes.${id}: every column must have one value per time (${len})`);
+      }
+      return json(201, sites.upload(r));
+    })
+    .get('/api/sites/:id', ({ params }) => sites.detail(params.id))
+    .get('/api/sites/:id/report', ({ params, query }) => {
+      const r = sites.report(params.id);
+      return query.download === undefined
+        ? r
+        : download(
+            JSON.stringify(r),
+            fileName(r.name ?? `site-${params.id.slice(0, 8)}`, '.site.json'),
+            'application/json',
+          );
+    })
+    .get('/api/sites/:id/series', ({ params, query }) => {
+      const from = query.from === undefined ? undefined : timeOf(query.from, 'from', 0);
+      const to = query.to === undefined ? undefined : timeOf(query.to, 'to', 0);
+      const nodes = query.nodes ? query.nodes.split(',').filter(Boolean) : undefined;
+      return sites.series(params.id, from, to, nodes);
+    })
+    .get('/api/sites/:id/allocations', ({ params, query }) => {
+      const from = query.from === undefined ? undefined : timeOf(query.from, 'from', 0);
+      const to = query.to === undefined ? undefined : timeOf(query.to, 'to', 0);
+      return sites.allocations(params.id, from, to, limitOf(query.limit, 1000, 20_000));
+    })
+    .get('/api/sites/:id/events', ({ params }) => sites.events(params.id))
+    .post(
+      '/api/sites/:id/actions',
+      ({ params, body: raw }): SiteLive => sites.action(params.id, parseSiteAction(body(raw))),
+    )
+    .post('/api/sites/:id/stop', async ({ params }): Promise<SiteSummary> => sites.stopSandbox(params.id))
+    .delete('/api/sites/:id', async ({ params }) => {
+      await sites.remove(params.id);
+      return noContent();
+    })
     .ws('/api/stream', {
       open: (ws) => hub.add(ws.raw, reg.views()),
       close: (ws) => hub.delete(ws.raw),
@@ -506,7 +608,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     .all('/api/*', () => json(404, { error: 'not found' }))
     .get('/*', ({ path }) => (path.startsWith('/api/') ? json(404, { error: 'not found' }) : serveUi(uiDir, path)));
 
-  app.listen({ port: opts.port ?? DEFAULT_PORT, hostname: host });
+  app.listen({ port: opts.port ?? DEFAULT_PORT, hostname: host, maxRequestBodySize: MAX_REPORT_BYTES });
   const port = app.server?.port;
   if (port === undefined) throw new Error('server did not start');
   const urlHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host.includes(':') ? `[${host}]` : host;
@@ -518,6 +620,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       stopping ??= (async () => {
         clearInterval(fleetTimer);
         await runs.cancelAll();
+        await sites.stopAll();
         await reg.closeAll();
         await testCsms.stop();
         hub.close();

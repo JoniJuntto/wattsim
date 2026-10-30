@@ -115,6 +115,18 @@
   --cat-other: #a7afb3;
   /* Sequential ramps mix one hue into --card: --seq-power for kW, --violation for finding counts. */
   --seq-power: #1f55b0;
+
+  /*
+   * Site diagram: a conductor's loading against its rating. Normal is the drawing's own ink; amber above 80 %, crimson
+   * over the rating (deutan dE 20 between the two, both >= 3:1 on --card); dead conductors recede. Each state also
+   * carries a label (the % and an icon), never the color alone.
+   */
+  --load-ok: #33434d;
+  --load-near: #c08100;
+  --load-over: #a3123a;
+  --load-dead: #b4bcb7;
+  --sld-paper: #f4f6f3;
+  --sld-grid: #e4e8e4;
 }
 
 .dark {
@@ -179,6 +191,13 @@
   --cat-5: #d55181;
   --cat-other: #6b7479;
   --seq-power: #6a9ff2;
+
+  --load-ok: #aab6bb;
+  --load-near: #e6ad2e;
+  --load-over: #f2607a;
+  --load-dead: #4a5357;
+  --sld-paper: #23282b;
+  --sld-grid: #2b3134;
 }
 
 @layer base {
@@ -218,6 +237,23 @@
     color: var(--foreground);
     box-shadow: inset 0 0 0 1.5px var(--st);
   }
+}
+
+/* Current flowing in the site diagram: dashes travel along the conductor, speed set per wire (--flow-s). */
+@keyframes sld-flow {
+  to {
+    stroke-dashoffset: -16;
+  }
+}
+.sld-flow {
+  stroke-dasharray: 3 13;
+  animation: sld-flow var(--flow-s, 1s) linear infinite;
+}
+.sld-flow[data-reverse="true"] {
+  animation-direction: reverse;
+}
+.sld-label {
+  font-stretch: 78%;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -15,6 +15,13 @@
       "when": 1793357905426,
       "tag": "0001_run_csms",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793379265116,
+      "tag": "0002_site_reports",
+      "breakpoints": true
     }
   ]
 }

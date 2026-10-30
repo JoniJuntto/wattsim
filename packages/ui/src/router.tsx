@@ -93,6 +93,30 @@ export const csmsRoute = createRoute({
   component: CsmsPage,
 });
 
+const PHASE_WORDS = ['L1', 'L2', 'L3', 'N'] as const;
+export type SiteSearch = { node?: string; phase?: (typeof PHASE_WORDS)[number] };
+
+export const sitesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: 'sites',
+  // The Site page and its diagram live in their own chunk.
+  component: lazyRouteComponent(() => import('@/routes/site'), 'SitesPage'),
+});
+
+export const siteRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: 'sites/$siteId',
+  /** `node`: the node whose detail is open; `phase`: the diagram's phase filter (default all phases). */
+  validateSearch: (s: Record<string, unknown>): SiteSearch => {
+    const out: SiteSearch = {};
+    const node = str(s.node);
+    if (node !== undefined) out.node = node;
+    if (PHASE_WORDS.includes(s.phase as SiteSearch['phase'] & string)) out.phase = s.phase as SiteSearch['phase'];
+    return out;
+  },
+  component: lazyRouteComponent(() => import('@/routes/site'), 'SitePage'),
+});
+
 export const csmsSessionRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: 'csms/sessions/$identity',
@@ -100,7 +124,15 @@ export const csmsSessionRoute = createRoute({
   component: CsmsSessionPage,
 });
 
-const routeTree = rootRoute.addChildren([fleetRoute, stationRoute, scenariosRoute, csmsRoute, csmsSessionRoute]);
+const routeTree = rootRoute.addChildren([
+  fleetRoute,
+  stationRoute,
+  scenariosRoute,
+  csmsRoute,
+  csmsSessionRoute,
+  sitesRoute,
+  siteRoute,
+]);
 
 export const router = createRouter({ routeTree, defaultPreload: 'intent' });
 

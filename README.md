@@ -385,7 +385,7 @@ const next = site.nextEvent(); // { t, type: 'trip', nodeId: 'Q1', cause: 'therm
 | gG fuse | IEC 60269-1 Table 2 conventional non-fusing and fusing currents and times per rating band. Pre-arcing curve through the Table 3 gates: Imin(10 s), Imax(5 s), Imin(0.1 s), Imax(0.1 s) |
 | MCCB | IEC 60947-2: Ir with 1.05 / 1.30 Ir conventional currents, tr at 6 Ir (I²t), Isd with tsd, Ii, pickup tolerance ±20 % |
 
-Thermal memory is a normalised I²t accumulator: heat grows by dt / tripTime(m) and cools exponentially (`coolingS`) when the device is not heating. A single pulse at 2.55 In shorter than the curve does not trip, but repeated pulses can. Magnetic, short-time and instantaneous releases have no memory. A breaker opens all poles together. A fuse blows per link, so a leaf can lose one phase; `site.supplyOf(leafId)` gives its live phases and voltages, or `null` when it is dead. `site.trip(id)` and `site.reclose(id)` operate a device by hand (reclosing a fuse replaces it). `reclose: { afterS, attempts }` on a breaker recloses it automatically after a protection trip.
+Thermal memory is a normalised accumulator that warms below the pickup too: under constant current below the pickup it settles towards a level proportional to I² that never reaches a trip, above the pickup it climbs so a cold device trips exactly on its curve, and it cools with `coolingS`. A device that has carried rated current for a while therefore trips sooner on a following overload (a median C16 after 2 h at In trips at 1.45 In in 811 s instead of 1255 s), while 1.13 In never trips. A single pulse at 2.55 In shorter than the curve does not trip, but repeated pulses can. Magnetic, short-time and instantaneous releases have no memory. A breaker opens all poles together. A fuse blows per link, so a leaf can lose one phase; `site.supplyOf(leafId)` gives its live phases and voltages, or `null` when it is dead. `site.trip(id)` and `site.reclose(id)` operate a device by hand (reclosing a fuse replaces it). `reclose: { afterS, attempts }` on a breaker recloses it automatically after a protection trip.
 
 **Violations and events.** Each node tracks these violations, each with start, end, peak and the integral over the limit (A·s, or V·s for voltage):
 - current over its rating;
@@ -398,7 +398,7 @@ Thermal memory is a normalised I²t accumulator: heat grows by dt / tripTime(m) 
 `site.on(fn)` receives `trip`, `reclose`, `violation-start` and `violation-end` events. They also arrive in each returned state.
 
 **Static checks.** `site.check()` reports three kinds of issue:
-- selectivity: an upstream device that trips no later than a downstream one at the downstream device's magnetic threshold, upstream at its fast tolerance edge and downstream at its slow one;
+- selectivity: every pair of devices in series is scanned from the downstream device's setting up to the prospective fault current at it (from `supply.faultCurrentA`, default 6 kA, plus transformer and cable impedance), and a partial pair is reported with its selectivity limit Is (C40 over B32: partial, Is 200 A; gG 63 over gG 40: total); overloads compare median curves, short circuits compare the upstream fast edge against the downstream slow edge;
 - cable coordination: Ib ≤ In and I2 ≤ 1.45 Iz (IEC 60364-4-43 §433.1), and cables with no protection;
 - ratings: a device rated above what feeds it, and connected ratings above a node's rating.
 

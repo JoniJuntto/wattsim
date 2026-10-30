@@ -11,7 +11,7 @@
 import type { Clock, Station as CoreStationType, StationConfig } from '@wattsim/core';
 import { Station, VirtualClock, WallClock } from '@wattsim/core';
 import type { Csms } from '@wattsim/csms';
-import type { Linked, RunEvent, RunResult, Scenario } from '@wattsim/scenario';
+import type { Linked, RunEvent, RunResult, Scenario, SiteRun } from '@wattsim/scenario';
 import { driveVirtual, formatDuration, isIdle, run as runScenario } from '@wattsim/scenario';
 import type { TraceEntry } from '@wattsim/trace';
 import { formatTrace, parseTrace, Recorder } from '@wattsim/trace';
@@ -70,6 +70,15 @@ export type StartRun = {
    * from a station whose virtual clock ran ahead would be a `time.skew` finding.
    */
   dedicatedCsms?: boolean;
+  /** Overrides the site block's `controller` (scenarios with a site). */
+  siteController?: 'reference' | 'none';
+};
+
+/** Where a run's electrical site is shown live and its report saved (`Sites`). */
+export type RunSites = {
+  attachRun(runId: string, runName: string, run: SiteRun): { id: string } | { refused: string };
+  watchStation(siteId: string, station: CoreStationType): void;
+  finishRun(siteId: string): Promise<unknown>;
 };
 
 /** Starts a test CSMS on the given clock (see `startTestCsmsOn`). */
@@ -90,6 +99,8 @@ type Live = {
   clock: Clock;
   /** The run's own test CSMS (`StartRun.dedicatedCsms`). */
   csms?: Csms;
+  /** The run's site on the Site page. */
+  siteId?: string;
 };
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -144,6 +155,7 @@ export class Runs {
     private readonly hub: StreamHub,
     private readonly startCsms: CsmsFactory,
     private readonly limits: RunLimits = DEFAULT_RUN_LIMITS,
+    private readonly sites?: RunSites,
   ) {}
 
   /** Throws `TooManyRuns` when every slot is taken. */
@@ -186,6 +198,7 @@ export class Runs {
       eventsDropped: 0,
       recordingId: null,
       csms: null,
+      siteId: null,
     };
     this.store.insertRun(row);
     const live: Live = {
@@ -311,7 +324,20 @@ export class Runs {
       const station = new Station(cfg);
       stations.push(station);
       l.recorder.attach(station);
+      if (l.siteId) this.sites?.watchStation(l.siteId, station);
       return station;
+    };
+    const onSite = (site: SiteRun) => {
+      const r = this.sites?.attachRun(l.row.id, l.row.name, site);
+      if (!r) return;
+      if ('refused' in r) {
+        this.onEvent(l, { type: 'log', message: `site: not shown on the Site page: ${r.refused}`, at: clock.now() });
+        return;
+      }
+      l.siteId = r.id;
+      l.row.siteId = r.id;
+      this.store.updateRun(l.row.id, { siteId: r.id });
+      this.changed(l.row.id);
     };
     let result: RunResult | undefined;
     let error: string | undefined;
@@ -336,6 +362,10 @@ export class Runs {
         allowPlugins: false,
         maxStations,
         onEvent: (e) => this.onEvent(l, e),
+        onSite,
+        // Meters on free ports: two runs of the same site (or a run and a sandbox) never fight over a Modbus port.
+        siteModbus: 'free',
+        ...(spec.siteController ? { siteController: spec.siteController } : {}),
       });
       if (clock instanceof VirtualClock) {
         try {
@@ -378,6 +408,7 @@ export class Runs {
       error !== undefined ? 'error' : cancelled ? 'cancelled' : result?.ok ? 'passed' : 'failed';
     const finishedAt = Date.now();
     const csms = await this.stopCsms(l);
+    if (l.siteId) await this.sites?.finishRun(l.siteId).catch(() => {});
     const entries = l.recorder.entries;
     let recordingId: string | null = null;
     if (entries.length > 0) {

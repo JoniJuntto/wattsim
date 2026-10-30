@@ -71,6 +71,8 @@ export type StationSetup = {
 export class SessionRecorder {
   private readonly stations = new Map<string, StationRecord>();
   private t0: number | undefined;
+  /** The site sandbox's `site` block, as canonical lines (the DSL has one site per scenario: the latest wins). */
+  private siteLines: string[] | undefined;
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -107,6 +109,21 @@ export class SessionRecorder {
     rec.entries.push({ at, line });
   }
 
+  /**
+   * A site sandbox: its `site` block, and the `site ... at` line of each station attached to it (placed with the
+   * station's configuration). Site actions are recorded as statements of one of its stations (`record`).
+   */
+  site(lines: string[], attach: ReadonlyMap<string, readonly string[]>): void {
+    if (this.siteLines) {
+      for (const rec of this.stations.values()) rec.config = rec.config.filter((l) => !l.startsWith('site '));
+    }
+    this.siteLines = lines;
+    for (const [id, attachLines] of attach) {
+      const rec = this.stations.get(id);
+      if (rec) rec.config.push(...attachLines);
+    }
+  }
+
   note(stationId: string, text: string): void {
     this.record(stationId, comment(text));
   }
@@ -117,6 +134,7 @@ export class SessionRecorder {
     const out = ['wattsim 1', comment(`exported by wattsim ui on ${new Date(this.now()).toISOString()}`)];
     const csms = mostCommon(recs.map((r) => r.csmsUrl));
     if (csms !== undefined) out.push('', `csms ${dslString(csms)}`);
+    if (this.siteLines) out.push('', ...this.siteLines);
     const t0 = this.t0 ?? 0;
     for (const rec of recs) {
       out.push('', `station ${dslString(rec.id)} {`);

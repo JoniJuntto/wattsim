@@ -1,4 +1,5 @@
-import { CheckIcon, FileCodeIcon, FileDownIcon, SquareIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { Link } from '@tanstack/react-router';
+import { CheckIcon, FileCodeIcon, FileDownIcon, SquareIcon, Trash2Icon, XIcon, ZapIcon } from 'lucide-react';
 import { useMemo } from 'react';
 import { useRunTimeline } from '@/api/charts';
 import { downloads } from '@/api/http';
@@ -262,6 +263,14 @@ export function RunPanel({
             </span>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-1">
+            {run.siteId && (
+              <Button asChild variant="outline" size="sm" title="How electricity flowed and how the DLM decided">
+                <Link to="/sites/$siteId" params={{ siteId: run.siteId }}>
+                  <ZapIcon data-icon="inline-start" />
+                  Site
+                </Link>
+              </Button>
+            )}
             {running ? (
               <Button variant="outline" size="sm" onClick={() => cancel.mutate(run.id)} disabled={cancel.isPending}>
                 {cancel.isPending ? <Spinner data-icon="inline-start" /> : <SquareIcon data-icon="inline-start" />}

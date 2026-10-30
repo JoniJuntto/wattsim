@@ -102,6 +102,11 @@ export class Registry {
     return [...this.entries.values()].map((e) => this.toView(e));
   }
 
+  /** The station itself (the site sandbox binds it to a leaf). */
+  station(id: string): CoreStation | undefined {
+    return this.entries.get(id)?.station;
+  }
+
   view(id: string): StationView | undefined {
     const e = this.entries.get(id);
     return e ? this.toView(e) : undefined;

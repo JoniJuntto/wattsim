@@ -282,6 +282,8 @@ export const startRun = z
     virtual: z.boolean().default(true),
     speed: z.number().positive().max(1000).optional(),
     seed: z.number().int().optional(),
+    /** Overrides the site block's `controller` line (scenarios with a site). */
+    siteController: z.enum(['reference', 'none']).optional(),
   })
   .refine((r) => r.target === 'url' || r.csmsUrl === undefined, {
     message: "csmsUrl is only allowed with target 'url'",
@@ -299,3 +301,114 @@ export const saveRecording = z.object({
 });
 
 export const saveReport = z.object({ name: z.string().trim().min(1).max(200).optional() });
+
+// ---- sites --------------------------------------------------------------------------------------------------------
+
+const phase = z.enum(['L1', 'L2', 'L3']);
+const nodeId = z.string().min(1).max(200);
+
+/** `POST /api/sites`: a site sandbox from DSL. */
+export const createSite = z.object({
+  /** A scenario text with a `site` block; station blocks' `site ... at` statements add the EVSE leaves. */
+  source: z.string().min(1).max(256_000, 'must be at most 256000 characters'),
+  name: z.string().trim().min(1).max(200).optional(),
+  /** Default: the site block's `controller` line, else none. */
+  controller: z.enum(['reference', 'none']).optional(),
+  /** EVSE leaf id -> UI station id to bind it to. */
+  bind: z.record(nodeId, stationId).default({}),
+  /** Create a UI station (on the test CSMS) for every unbound leaf. Default true. */
+  create: z.boolean().default(true),
+  version: version.optional(),
+});
+
+export const SITE_ACTION_SCHEMAS = {
+  trip: z.object({ node: nodeId, phases: z.array(phase).min(1).max(3).optional() }),
+  reclose: z.object({ node: nodeId }),
+  load: z
+    .object({ node: nodeId, watts: z.number().min(-1e8).max(1e8).optional(), on: z.boolean().optional() })
+    .refine((b) => (b.watts === undefined) !== (b.on === undefined), { message: 'give watts or on' }),
+  controller: z.object({ mode: z.enum(['reference', 'none']) }),
+} as const;
+
+export function parseSiteAction(body: unknown) {
+  const type = (body as { type?: unknown } | null)?.type;
+  if (typeof type !== 'string' || !Object.hasOwn(SITE_ACTION_SCHEMAS, type)) {
+    throw new BadRequest(`type: expected one of ${Object.keys(SITE_ACTION_SCHEMAS).join(', ')}`);
+  }
+  const schema = SITE_ACTION_SCHEMAS[type as keyof typeof SITE_ACTION_SCHEMAS] as z.ZodType<object>;
+  return { type, ...parseBody(schema, body) } as import('./sites').SiteActionBody;
+}
+
+const num = z.number();
+const nums = z.array(num);
+const triple = z.tuple([num, num, num]);
+const seriesNode = z.object({
+  currentA: z.tuple([nums, nums, nums]),
+  neutralA: nums,
+  powerW: nums,
+  voltageV: z.tuple([nums, nums, nums]),
+  loadingPct: nums.optional(),
+  thermal: nums.optional(),
+  energized: nums,
+});
+const nodeState = z.looseObject({
+  id: z.string(),
+  kind: z.string(),
+  energized: z.boolean(),
+  currentA: triple,
+  powerW: triple,
+  voltageV: triple,
+});
+
+/** An uploaded `--site-report` file: the shape the Site page reads, checked before it is stored. */
+export const siteReport = z.object({
+  format: z.literal('wattsim-site-report'),
+  /** 1: every step in `allocations`; 2: keyframes in `allocations`, every step in `allocationSteps`. */
+  version: z.union([z.literal(1), z.literal(2)]),
+  name: z.string().max(200).optional(),
+  description: z.looseObject({
+    supply: z.looseObject({ phases: z.union([z.literal(1), z.literal(3)]) }),
+    nodes: z.array(z.unknown()),
+  }),
+  nodes: z
+    .array(
+      z.object({
+        id: nodeId,
+        kind: z.string().max(20),
+        parentId: z.string().optional(),
+        childIds: z.array(z.string()),
+        leaf: z.boolean(),
+        phases: z.array(phase),
+        ratingA: num.optional(),
+      }),
+    )
+    .max(5000),
+  leaves: z.array(z.object({ leafId: nodeId, station: z.string().max(200), evseId: z.number().int(), maxA: num })),
+  run: z.object({
+    start: num,
+    end: num,
+    durationMs: num,
+    controller: z.enum(['reference', 'none']),
+    timeOffsetMs: num,
+  }),
+  score: z.looseObject({
+    trips: num,
+    fairness: z.object({ mean: num, min: num }),
+    nodes: z.record(z.string(), z.unknown()),
+  }),
+  series: z.object({
+    resolutionMs: num,
+    t: nums,
+    marks: z.array(z.number().int()),
+    nodes: z.record(z.string(), seriesNode),
+  }),
+  events: z.array(z.looseObject({ type: z.enum(['trip', 'reclose']), t: num, nodeId: z.string() })),
+  violations: z.array(z.looseObject({ nodeId: z.string(), kind: z.string(), start: num })),
+  allocations: z.array(z.looseObject({ t: num, nodes: z.array(z.unknown()), evses: z.array(z.unknown()) })),
+  allocationSteps: z
+    .array(z.union([z.number().int().min(0), z.looseObject({ t: num, reason: z.string() })]))
+    .optional(),
+  modbus: z.array(z.unknown()),
+  final: z.looseObject({ t: num, supply: nodeState, nodes: z.record(z.string(), nodeState) }).optional(),
+  inferred: z.array(z.looseObject({ t: num, nodes: z.array(z.unknown()), evses: z.array(z.unknown()) })).optional(),
+});

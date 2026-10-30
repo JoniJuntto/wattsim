@@ -33,6 +33,11 @@ const TYPES = new Set([
   'csms.violation',
   'series',
   'fleet',
+  'site',
+  'site.allocation',
+  'site.event',
+  'site.summary',
+  'site.removed',
 ]);
 
 const isObject = (v: unknown) => typeof v === 'object' && v !== null;
@@ -76,6 +81,18 @@ export function parseStreamMessage(data: unknown): StreamMessage | null {
       return typeof m.stationId === 'string' && Array.isArray(m.points) ? (m as StreamMessage) : null;
     case 'fleet':
       return isObject(m.bin) ? (m as StreamMessage) : null;
+    case 'site':
+      return typeof m.siteId === 'string' && typeof m.seq === 'number' && isObject(m.nodes)
+        ? (m as StreamMessage)
+        : null;
+    case 'site.allocation':
+      return typeof m.siteId === 'string' && isObject(m.allocation) ? (m as StreamMessage) : null;
+    case 'site.event':
+      return typeof m.siteId === 'string' && isObject(m.event) ? (m as StreamMessage) : null;
+    case 'site.summary':
+      return isObject(m.site) ? (m as StreamMessage) : null;
+    case 'site.removed':
+      return typeof m.id === 'string' ? (m as StreamMessage) : null;
     default:
       return null;
   }

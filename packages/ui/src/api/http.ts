@@ -1,4 +1,13 @@
 import type {
+  Allocation,
+  CreateSiteBody,
+  SiteAction,
+  SiteDetail,
+  SiteLive,
+  SiteReport,
+  SiteSummary,
+} from './site-types';
+import type {
   ActionResult,
   ChaosRuleBody,
   ChaosRuleView,
@@ -73,6 +82,7 @@ async function requestWithStatus<T>(
 }
 
 const station = (id: string) => `/api/stations/${encodeURIComponent(id)}`;
+const site = (id: string) => `/api/sites/${encodeURIComponent(id)}`;
 
 export const api = {
   health: () => request<Health>('GET', '/api/health'),
@@ -126,6 +136,17 @@ export const api = {
   saveCsmsReport: (name?: string) =>
     request<CsmsReportSummary>('POST', '/api/csms/reports', name === undefined ? {} : { name }),
   deleteCsmsReport: (id: string) => request<void>('DELETE', `/api/csms/reports/${encodeURIComponent(id)}`),
+
+  sites: () => request<SiteSummary[]>('GET', '/api/sites'),
+  site: (id: string) => request<SiteDetail>('GET', site(id)),
+  siteReport: (id: string) => request<SiteReport>('GET', `${site(id)}/report`),
+  /** Every control step (reference and inferred), decoded by the server, oldest first. */
+  siteAllocations: (id: string) => request<Allocation[]>('GET', `${site(id)}/allocations?limit=20000`),
+  createSite: (body: CreateSiteBody) => request<SiteDetail>('POST', '/api/sites', body),
+  uploadSiteReport: (report: unknown) => request<SiteSummary>('POST', '/api/sites/reports', report),
+  siteAction: (id: string, action: SiteAction) => request<SiteLive>('POST', `${site(id)}/actions`, action),
+  stopSite: (id: string) => request<SiteSummary>('POST', `${site(id)}/stop`),
+  deleteSite: (id: string) => request<void>('DELETE', site(id)),
 };
 
 /** Plain links for downloads (the server sets `content-disposition`). */
@@ -135,6 +156,7 @@ export const downloads = {
   runTrace: (id: string) => `/api/runs/${encodeURIComponent(id)}/trace`,
   runJUnit: (id: string) => `/api/runs/${encodeURIComponent(id)}/junit`,
   recording: (id: string) => `/api/recordings/${encodeURIComponent(id)}`,
+  siteReport: (id: string) => `${site(id)}/report?download=1`,
   csmsReport: (format: 'json' | 'junit') => `/api/csms/report?format=${format}`,
   savedCsmsReport: (id: string, format: 'json' | 'junit') =>
     `/api/csms/reports/${encodeURIComponent(id)}?format=${format}`,

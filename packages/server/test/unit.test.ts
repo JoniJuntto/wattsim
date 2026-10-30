@@ -57,7 +57,7 @@ describe('session text', () => {
 describe('Registry.remove', () => {
   let csms: FakeCsms;
   beforeAll(async () => {
-    csms = await FakeCsms.start();
+    csms = await FakeCsms.start({ listen: true });
   });
   afterAll(async () => {
     await csms.stop();

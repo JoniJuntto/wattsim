@@ -88,6 +88,9 @@ export type Layer =
 
 export type StatusBand = { times: readonly number[]; statuses: readonly string[] };
 
+/** An event on the time axis: a tick along the bottom, or a flag (line through the plot) with a symbol on top. */
+export type TimeMark = { t: number; kind: 'tick' | 'flag'; color: string; label: string; symbol?: 'triangle' | 'dot' };
+
 /** Consecutive samples with the same status merged into one run; `next` is null for the run still in force. */
 function runs(band: StatusBand): { t: number; next: number | null; status: string }[] {
   const out: { t: number; next: number | null; status: string }[] = [];
@@ -160,6 +163,9 @@ export function TimeChart({
   ariaLabel,
   snapTimes,
   className,
+  marks,
+  cursor,
+  onPick,
 }: {
   layers: Layer[];
   /** y domain; computed by the caller (zero-based for magnitudes, tight for voltages). */
@@ -174,6 +180,12 @@ export function TimeChart({
   /** Times the crosshair snaps to (the samples); default: the first layer's. */
   snapTimes?: readonly number[];
   className?: string;
+  /** Events drawn over the plot (profiles sent, trips). */
+  marks?: readonly TimeMark[];
+  /** A time to draw as a solid cursor (the replay position). */
+  cursor?: number;
+  /** Clicking the plot picks the time under the pointer. */
+  onPick?: (t: number) => void;
 }) {
   const { from, to, hover, setHover } = useTimeSync();
   const { ref, width } = useWidth<HTMLDivElement>();
@@ -238,6 +250,14 @@ export function TimeChart({
           tabIndex={0}
           className="block rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
           onPointerMove={(e) => setHover(pointerT(e.clientX, e.currentTarget))}
+          onClick={
+            onPick
+              ? (e) => {
+                  const t = pointerT(e.clientX, e.currentTarget);
+                  if (t !== null) onPick(t);
+                }
+              : undefined
+          }
           onPointerLeave={() => setHover(null)}
           onKeyDown={onKey}
           onBlur={() => setHover(null)}
@@ -307,6 +327,61 @@ export function TimeChart({
             </g>
           )}
           <g clipPath={`url(#${clipId})`}>{paths}</g>
+          {marks && w > 0 && (
+            <g clipPath={`url(#${clipId})`} pointerEvents="none">
+              {marks.map((m) => {
+                if (m.t < from || m.t > to) return null;
+                const mx = x(m.t);
+                if (m.kind === 'tick') {
+                  return (
+                    <line
+                      key={`${m.kind}${m.t}${m.label}`}
+                      x1={mx}
+                      x2={mx}
+                      y1={top + plotH - 5}
+                      y2={top + plotH}
+                      stroke={m.color}
+                      strokeWidth={1}
+                    >
+                      <title>{m.label}</title>
+                    </line>
+                  );
+                }
+                return (
+                  <g key={`${m.kind}${m.t}${m.label}`}>
+                    <line
+                      x1={mx}
+                      x2={mx}
+                      y1={top}
+                      y2={top + plotH}
+                      stroke={m.color}
+                      strokeWidth={1.25}
+                      strokeDasharray="2 2"
+                    />
+                    {m.symbol === 'dot' ? (
+                      <circle cx={mx} cy={top + 4} r={3.5} fill={m.color} stroke="var(--card)" strokeWidth={1.5} />
+                    ) : (
+                      <path d={`M${mx - 4.5},${top}h9l-4.5,7z`} fill={m.color} stroke="var(--card)" strokeWidth={1} />
+                    )}
+                    <title>{m.label}</title>
+                  </g>
+                );
+              })}
+            </g>
+          )}
+          {cursor !== undefined && cursor >= from && cursor <= to && (
+            <g pointerEvents="none">
+              <line
+                x1={x(cursor)}
+                x2={x(cursor)}
+                y1={M.top}
+                y2={top + plotH}
+                stroke="var(--foreground)"
+                strokeWidth={1.5}
+              />
+              <path d={`M${x(cursor) - 4},${M.top}h8l-4,5z`} fill="var(--foreground)" />
+            </g>
+          )}
           {xAxis &&
             xTicks.map((t) => (
               <text

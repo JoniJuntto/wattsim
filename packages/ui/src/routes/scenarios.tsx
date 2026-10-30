@@ -166,6 +166,8 @@ export function ScenariosPage() {
   const [url, setUrl] = useState('');
   const [clock, setClock] = useState<'virtual' | 'real'>('virtual');
   const [speed, setSpeed] = useState('1');
+  const [dlm, setDlm] = useState<'scenario' | 'reference' | 'none'>('scenario');
+  const hasSite = /^site\s+"[^"]*"\s*\{/m.test(source);
 
   useEffect(() => {
     if (selectedId === undefined) {
@@ -234,6 +236,7 @@ export function ScenariosPage() {
         csmsUrl: target === 'url' && url.trim() ? url.trim() : undefined,
         virtual: clock === 'virtual',
         speed: clock === 'real' ? sp : undefined,
+        siteController: hasSite && dlm !== 'scenario' ? dlm : undefined,
       },
       {
         onSuccess: (run) => void navigate({ search: (prev) => ({ ...prev, run: run.id }) }),
@@ -449,6 +452,29 @@ export function ScenariosPage() {
                   className="h-7 w-14 font-mono text-xs"
                 />
               </span>
+            )}
+            {hasSite && (
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                size="sm"
+                value={dlm}
+                onValueChange={(v) => v && setDlm(v as 'scenario' | 'reference' | 'none')}
+                aria-label="DLM controller"
+              >
+                <ToggleGroupItem value="scenario" title="The site block's controller line">
+                  DLM as written
+                </ToggleGroupItem>
+                <ToggleGroupItem value="reference" title="wattsim's reference DLM shares the site's capacity">
+                  Reference
+                </ToggleGroupItem>
+                <ToggleGroupItem
+                  value="none"
+                  title="No DLM in wattsim: the CSMS under test (or nobody) limits the chargers"
+                >
+                  Off
+                </ToggleGroupItem>
+              </ToggleGroup>
             )}
             <Button
               size="sm"

@@ -5,7 +5,7 @@
  */
 import type { ConformanceReport } from '@wattsim/csms';
 import { index, integer, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
-import type { RunCsmsView, RunEventView, RunResultView } from '../types';
+import type { RunCsmsView, RunEventView, RunResultView, SiteReportView } from '../types';
 
 export const scenarios = sqliteTable('scenarios', {
   id: text('id').primaryKey(),
@@ -39,6 +39,8 @@ export const runs = sqliteTable(
     recordingId: text('recording_id'),
     /** The dedicated test CSMS of a virtual loopback run: its saved report and finding totals. */
     csms: text('csms', { mode: 'json' }).$type<RunCsmsView>(),
+    /** The run's electrical site; its report is in `site_reports` once the run ended. */
+    siteId: text('site_id'),
   },
   (t) => [index('runs_started_at').on(t.startedAt)],
 );
@@ -75,4 +77,28 @@ export const csmsReports = sqliteTable(
     report: text('report', { mode: 'json' }).$type<ConformanceReport>().notNull(),
   },
   (t) => [index('csms_reports_created_at').on(t.createdAt)],
+);
+
+/** Site reports: a finished run's site (`run_id`), or a `--site-report` file uploaded for replay. */
+export const siteReports = sqliteTable(
+  'site_reports',
+  {
+    id: text('id').primaryKey(),
+    kind: text('kind', { enum: ['run', 'sandbox', 'upload'] }).notNull(),
+    runId: text('run_id'),
+    name: text('name').notNull(),
+    createdAt: integer('created_at').notNull(),
+    controller: text('controller', { enum: ['reference', 'none'] }).notNull(),
+    start: integer('start').notNull(),
+    end: integer('end').notNull(),
+    nodes: integer('nodes').notNull(),
+    leaves: integer('leaves').notNull(),
+    trips: integer('trips').notNull(),
+    peakNode: text('peak_node'),
+    peakPct: real('peak_pct'),
+    fairness: real('fairness'),
+    /** The `SiteReportView` JSON (the `--site-report` file plus inferred allocations). */
+    report: text('report', { mode: 'json' }).$type<SiteReportView>().notNull(),
+  },
+  (t) => [index('site_reports_created_at').on(t.createdAt), index('site_reports_run_id').on(t.runId)],
 );

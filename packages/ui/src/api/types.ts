@@ -3,6 +3,8 @@
  * UI"). Change it there first; this file follows.
  */
 
+import type { SiteStreamMessage } from './site-types';
+
 export type OcppVersion = 'ocpp1.6' | 'ocpp2.0.1' | 'ocpp2.1';
 export type EvView = {
   state: 'Unplugged' | 'Plugged' | 'Ready' | 'Charging' | 'Suspended' | 'Full';
@@ -169,7 +171,8 @@ export type StreamMessage =
   | { type: 'csms.session'; session: CsmsSessionView }
   | { type: 'csms.violation'; violation: ConformanceViolation }
   | { type: 'series'; stationId: string; points: SeriesPoint[] }
-  | { type: 'fleet'; bin: FleetBin };
+  | { type: 'fleet'; bin: FleetBin }
+  | SiteStreamMessage;
 
 // ---- server mode (milestone 4), mirrors packages/server/src/types.ts ---------------------------------------------
 
@@ -206,6 +209,8 @@ export type RunSummary = {
   frames: number;
   error?: string;
   recordingId?: string;
+  /** The run's electrical site: `/sites/:siteId`. */
+  siteId?: string;
   /** Virtual runs against the test CSMS: the run's own CSMS, its saved report and finding totals. */
   csms?: RunCsmsView;
 };
@@ -238,6 +243,8 @@ export type StartRunBody = {
   virtual?: boolean;
   speed?: number;
   seed?: number;
+  /** Overrides the site block's `controller` line (scenarios with a site). */
+  siteController?: 'reference' | 'none';
 };
 
 export type RecordingView = {

@@ -121,6 +121,7 @@ function ThemeMenu() {
 const NAV = [
   { to: '/', label: 'Fleet', exact: true },
   { to: '/scenarios', label: 'Scenarios', exact: false },
+  { to: '/sites', label: 'Sites', exact: false },
   { to: '/csms', label: 'CSMS', exact: false },
 ] as const;
 

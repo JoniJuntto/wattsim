@@ -18,6 +18,8 @@ import type {
   RunSummary,
   SavedScenario,
   SavedScenarioSummary,
+  SiteReportView,
+  SiteSummary,
 } from '../types';
 import * as schema from './schema';
 
@@ -29,6 +31,8 @@ const iso = (ms: number) => new Date(ms).toISOString();
 export type RunRow = typeof schema.runs.$inferSelect;
 export type RunInsert = typeof schema.runs.$inferInsert;
 export type RecordingInsert = typeof schema.recordings.$inferInsert;
+export type SiteReportRow = typeof schema.siteReports.$inferSelect;
+export type SiteReportInsert = typeof schema.siteReports.$inferInsert;
 
 /** History lists are capped so a long-lived data directory never turns a page load into a dump of everything. */
 export const LIST_LIMIT = 200;
@@ -62,6 +66,7 @@ export function runSummary(r: RunRow): RunSummary {
   if (r.error !== null) s.error = r.error;
   if (r.recordingId !== null) s.recordingId = r.recordingId;
   if (r.csms !== null) s.csms = r.csms;
+  if (r.siteId !== null) s.siteId = r.siteId;
   return s;
 }
 
@@ -69,6 +74,27 @@ export function runDetail(r: RunRow): RunDetail {
   const d: RunDetail = { ...runSummary(r), source: r.source, events: r.events, eventsDropped: r.eventsDropped };
   if (r.result) d.result = r.result;
   return d;
+}
+
+/** A stored site report's summary (`row` without the report). */
+export function siteSummary(r: Omit<SiteReportRow, 'report'>): SiteSummary {
+  const s: SiteSummary = {
+    id: r.id,
+    name: r.name,
+    kind: r.kind,
+    live: false,
+    createdAt: iso(r.createdAt),
+    start: r.start,
+    end: r.end,
+    controller: r.controller,
+    nodes: r.nodes,
+    leaves: r.leaves,
+    trips: r.trips,
+  };
+  if (r.runId) s.runId = r.runId;
+  if (r.peakNode !== null && r.peakPct !== null) s.peak = { nodeId: r.peakNode, pct: r.peakPct };
+  if (r.fairness !== null) s.fairness = r.fairness;
+  return s;
 }
 
 function recordingView(r: Omit<typeof schema.recordings.$inferSelect, 'trace'> & { bytes: number }): RecordingView {
@@ -179,6 +205,7 @@ export class Store {
     if (!row) return false;
     if (row.recordingId) this.deleteRecording(row.recordingId);
     if (row.csms) this.deleteReport(row.csms.reportId);
+    this.db.delete(schema.siteReports).where(eq(schema.siteReports.runId, id)).run();
     this.db.delete(schema.runs).where(eq(schema.runs.id, id)).run();
     return true;
   }
@@ -273,6 +300,57 @@ export class Store {
 
   deleteReport(id: string): boolean {
     return this.db.delete(schema.csmsReports).where(eq(schema.csmsReports.id, id)).returning().all().length > 0;
+  }
+
+  // ---- site reports ---------------------------------------------------------------------------------------------
+
+  saveSiteReport(row: SiteReportInsert): SiteSummary {
+    this.db.insert(schema.siteReports).values(row).run();
+    const { report: _, ...rest } = row;
+    return siteSummary({
+      ...rest,
+      runId: rest.runId ?? null,
+      peakNode: rest.peakNode ?? null,
+      peakPct: rest.peakPct ?? null,
+      fairness: rest.fairness ?? null,
+    });
+  }
+
+  siteReports(): SiteSummary[] {
+    const t = schema.siteReports;
+    return this.db
+      .select({
+        id: t.id,
+        kind: t.kind,
+        runId: t.runId,
+        name: t.name,
+        createdAt: t.createdAt,
+        controller: t.controller,
+        start: t.start,
+        end: t.end,
+        nodes: t.nodes,
+        leaves: t.leaves,
+        trips: t.trips,
+        peakNode: t.peakNode,
+        peakPct: t.peakPct,
+        fairness: t.fairness,
+      })
+      .from(t)
+      .orderBy(desc(t.createdAt))
+      .limit(LIST_LIMIT)
+      .all()
+      .map(siteSummary);
+  }
+
+  siteReport(id: string): { summary: SiteSummary; report: SiteReportView } | undefined {
+    const r = this.db.select().from(schema.siteReports).where(eq(schema.siteReports.id, id)).get();
+    if (!r) return undefined;
+    const { report, ...rest } = r;
+    return { summary: siteSummary(rest), report };
+  }
+
+  deleteSiteReport(id: string): boolean {
+    return this.db.delete(schema.siteReports).where(eq(schema.siteReports.id, id)).returning().all().length > 0;
   }
 }
 
