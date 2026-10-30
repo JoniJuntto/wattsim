@@ -7,13 +7,15 @@
  *   offer  = min(rated, smart-charging limit)                          >= 0
  *
  * A smart-charging limit written in A is a per-phase current, so it is rescaled to the phases in use; one in W is
- * taken as is. The EV then takes min(offer, its own curve x temperature derate x current limit), see `EvModel`.
+ * taken as is. A limit made of both (a TxDefaultProfile in A under a Max profile in W) is evaluated part by part at
+ * the phases in use, so the tighter of the two binds on those phases. The EV then takes min(offer, its own curve x temperature derate x current limit), see `EvModel`.
  *
  * 2.1 V2X (`bidirectional`): a setpoint is a target the EV follows (positive: at most the offer; negative: a
  * discharge of at most the rated power and the tightest discharge limit). A negative `limit` without a setpoint is
  * the pre-2.1 way to ask for a discharge and is read as one. Without V2X a negative limit offers nothing.
  */
 import type { Limit, V2xLimits } from './charging';
+import { limitKwAt } from './charging';
 
 export type PhaseCount = 1 | 2 | 3;
 
@@ -47,11 +49,6 @@ function phaseCount(n: number | undefined): number {
   return n !== undefined && n >= 1 && n <= 3 ? Math.floor(n) : 3;
 }
 
-/** A limit in kW on `phases` phases: an A limit scales with the phases in use, a W limit does not. */
-export function limitKwAt(l: Limit, phases: number, voltageV: number): number {
-  return l.amps !== undefined ? (l.amps * phases * voltageV) / 1000 : l.kw;
-}
-
 export function resolvePower(i: PowerInputs): PowerOffer {
   const scheduled = i.limit?.phases ?? i.v2x?.setpoint?.phases;
   const phases = Math.min(i.stationPhases, phaseCount(i.evPhases), phaseCount(scheduled)) as PhaseCount;
@@ -62,7 +59,7 @@ export function resolvePower(i: PowerInputs): PowerOffer {
   const out: PowerOffer = { phases, offerKw };
   if (!i.bidirectional) return out;
   const setpoint = i.v2x?.setpoint ? limitKwAt(i.v2x.setpoint, phases, i.voltageV) : undefined;
-  const dl = i.v2x?.dischargeLimit ? limitKwAt(i.v2x.dischargeLimit, phases, i.voltageV) : undefined;
+  const dl = i.v2x?.dischargeLimit ? limitKwAt(i.v2x.dischargeLimit, phases, i.voltageV, Math.max) : undefined;
   const dischargeCap = Math.min(rated, dl === undefined ? Number.POSITIVE_INFINITY : Math.max(0, -dl));
   if (setpoint !== undefined) {
     out.targetKw = setpoint >= 0 ? Math.min(setpoint, offerKw) : -Math.min(-setpoint, dischargeCap);

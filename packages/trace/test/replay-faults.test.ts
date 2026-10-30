@@ -116,7 +116,7 @@ test('a recording made through a proxy applying the new faults replays cleanly a
     vendor: 'wattsim',
     model: 'trace-test',
   });
-  station.on('error', () => {}); // the late answer to the reordered Heartbeat
+  station.on('error', () => {}); // the Authorize the half-open proxy swallowed
   await station.connect();
   await station.boot();
   await settle(station, sclock);
@@ -125,13 +125,11 @@ test('a recording made through a proxy applying the new faults replays cleanly a
   await until(() => pclock.pendingTimers() === 1, 1000, 'heartbeat held');
   await pclock.advance(200);
   await beat1;
-  // reorder: held until the next frame passes, which the station only sends once this one timed out.
-  const beat2 = station.sendHeartbeat().catch((e: Error) => e.name);
-  await Bun.sleep(30);
-  await sclock.advance(30_000);
-  expect(await beat2).toBe('RequestTimeoutError');
+  // reorder never holds a charger CALL (only the charger's next CALL could release it, and that waits for this
+  // one's answer): the Heartbeat passes unheld and the rule does not fire.
   await station.sendHeartbeat();
-  await until(() => csms.callsFrom('CP-FAULTS', 'Heartbeat').length === 3, 1000, 'reordered heartbeat released');
+  await station.sendHeartbeat();
+  await until(() => csms.callsFrom('CP-FAULTS', 'Heartbeat').length === 3, 1000, 'heartbeats passed');
   // halfOpen: the Authorize is swallowed, the proxy drops the charger after 5 s and it reconnects and resends.
   const auth = station.authorize('TAG-1');
   await Bun.sleep(30);
@@ -150,7 +148,6 @@ test('a recording made through a proxy applying the new faults replays cleanly a
   expect(recorded.filter((e) => e.chaos).map((e) => e.chaos?.effect)).toEqual([
     'invalidEnum',
     'jitter',
-    'reorder',
     'halfOpen',
     'timestamp',
     'oversized',

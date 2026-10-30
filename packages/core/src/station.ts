@@ -161,6 +161,10 @@ export type TransactionState = {
   driverTariff?: boolean;
   /** Running cost the CSMS sent (2.x CostUpdated, TransactionEventResponse `totalCost`). */
   csmsTotalCost?: number;
+  /** ms with no energy flowing, kept on a 2.1 station until the transaction has a tariff (its idle-time conditions). */
+  idleMs?: number;
+  /** Export register at the start, when it was not zero (a 2.1 tariff arriving later counts the export since). */
+  meterStartExportWh?: number;
   /** Pending start message, so a stop issued before the CSMS answered waits for the transaction id. */
   starting?: Promise<boolean>;
   ending?: Promise<void>;
@@ -213,6 +217,8 @@ export const MAX_TX_SAMPLES = 1000;
 const RESET_DELAY_MS = 1000;
 /** Longest delay `setTimeout` honours; longer ones fire almost at once. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
+/** Most pieces one integration step is cut into before the rest is taken whole (a guard; real cuts are far fewer). */
+const MAX_STEPS = 100_000;
 const BOOT_RETRY_FALLBACK_MS = 60_000;
 const MANUAL_STATUSES: ReadonlySet<ConnectorStatus> = new Set<ConnectorStatus>(['Faulted', 'Reserved']);
 /** What a call interceptor answers with; `undefined` lets the next interceptor (or the adapter) handle the CALL. */
@@ -240,7 +246,7 @@ type Realism = {
 
 function sameLimit(a: Limit | undefined, b: Limit | undefined): boolean {
   if (a === undefined || b === undefined) return a === b;
-  return a.kw === b.kw && a.phases === b.phases && a.amps === b.amps;
+  return a.kw === b.kw && a.phases === b.phases && a.amps === b.amps && a.capKw === b.capKw;
 }
 
 function toError(err: unknown): Error {
@@ -361,6 +367,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       evses: evseCount,
       now: () => this.clock.now(),
       txStartedAt: (id) => this.evses[id - 1]?.tx?.startedAt,
+      evPhases: (id) => this.evses[id - 1]?.ev?.config.phases,
     });
 
     this.baseUrl = cfg.csmsUrl;
@@ -656,7 +663,19 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     }
     this.integrate(evse);
     if (tx.cost) tx.cost.changeTariff(tariff);
-    else tx.cost = new TransactionCost(tariff, tx.startedAt, this.timeZone, this.clock.now());
+    else {
+      // Nothing priced the transaction so far, and the new tariff does not either; its energy and duration
+      // conditions still count from the transaction start.
+      const now = this.clock.now();
+      const idleS = (tx.idleMs ?? 0) / 1000;
+      tx.cost = new TransactionCost(tariff, tx.startedAt, this.timeZone, now, {
+        importWh: Math.max(0, evse.meter.energy - tx.meterStartWh),
+        exportWh: Math.max(0, evse.meter.exported - (tx.meterStartExportWh ?? 0)),
+        chargingS: Math.max(0, (now - tx.startedAt) / 1000 - idleS),
+        idleS,
+      });
+      tx.idleMs = undefined;
+    }
     tx.driverTariff = true;
     fire(this.adapter.txUpdate(this, evse, this.takeSample(evse, tx, 'Other'), 'TariffChanged'));
     return { status: 'Accepted' };
@@ -928,6 +947,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       seqNo: 0,
       samples: [],
     };
+    if (evse.meter.exported > 0) tx.meterStartExportWh = evse.meter.exported;
     evse.tx = tx;
     evse.idTag = tx.idTag;
     const tariffs = this.rx?.tariffs;
@@ -1117,19 +1137,39 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     return evse.ev.drawKw(evse.offeredKw, evse.meter.voltageV, evse.phases ?? this.cfg.phases, evse.targetKw);
   }
 
-  /** Integrate the power that has flowed since the last step into the EV, the meter and the running cost. */
+  /**
+   * Integrate the power that has flowed since the last step into the EV, the meter and the running cost. The step is
+   * cut wherever the EV's power would change (`EvModel.holdMs`: a soc target or floor, the charge curve, the
+   * temperature derate, the end of a pause) and the power re-evaluated there, so the energy does not depend on how
+   * often this runs (the meter interval).
+   */
   private integrate(evse: EvseState): void {
     const tx = evse.tx;
     if (!tx) return;
     const now = this.clock.now();
-    const dt = now - tx.lastTickAt;
+    let t = tx.lastTickAt;
     tx.lastTickAt = now;
-    const kw = this.drawKw(evse);
-    if (dt > 0) {
-      // The constant model keeps the EV where it started: same soc, same temperature, same power.
-      if (!this.rx?.constantPower) evse.ev?.tick(dt, kw);
+    let kw = this.drawKw(evse);
+    if (now <= t) return;
+    // The constant model keeps the EV where it started: same soc, same temperature, same power.
+    const ev = this.rx?.constantPower ? undefined : evse.ev;
+    const voltageV = evse.meter.voltageV;
+    const phases = evse.phases ?? this.cfg.phases;
+    // Idle time before a driver tariff arrives counts towards its conditions (2.1 only).
+    const trackIdle = tx.cost === undefined && this.version === 'ocpp2.1';
+    for (let step = 0; ; step++) {
+      let dt = now - t;
+      if (ev && step < MAX_STEPS) {
+        const hold = ev.holdMs(kw, voltageV, phases);
+        if (hold > 0 && hold < dt) dt = hold;
+      }
+      ev?.tick(dt, kw);
       evse.meter.tick(dt, kw);
-      tx.cost?.advance(now, kw, evse.meter.voltageV);
+      if (kw === 0 && trackIdle) tx.idleMs = (tx.idleMs ?? 0) + dt;
+      t = dt === now - t ? now : t + dt;
+      tx.cost?.advance(t, kw, voltageV);
+      if (t >= now) return;
+      kw = this.drawKw(evse);
     }
   }
 

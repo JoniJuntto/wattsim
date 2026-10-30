@@ -408,7 +408,7 @@ Faults:
 | `jitter <min>..<max>` | transport | Hold each frame for a delay drawn between `min` and `max` (whole ms) from the run's seeded RNG. |
 | `duplicate` | transport | Deliver the frame twice. |
 | `corrupt` | transport | Turn the raw text into invalid JSON. |
-| `reorder [after N]` | transport | Hold the frame until N (default 1) later frames in the same direction have passed it. |
+| `reorder [after N]` | transport | Hold the frame until N (default 1) later frames in the same direction have passed it. Never an outbound CALL: only a later outbound frame releases it, and the station's next CALL waits for this one's answer, so it could only time out. An outbound CALL passes unheld and does not count as a match (no `once` spent, no `probability` drawn); `nth` and `every` still count it, like every frame in its direction. Responses either way, inbound CALLs and 2.1 SENDs can be held. |
 | `halfOpen [for <dur>]` | transport | From this frame on (included) nothing is written to or read from the socket, which stays open: the CSMS sees silence. With `for`, the station gives up after `dur`, drops the socket and reconnects as usual. |
 | `slowRead <step>` | transport | Inbound only: the n-th frame this rule matches is held n x `step`. |
 | `reconnectStorm K within <dur>` | transport | Drop the socket K times in `dur`, every `dur`/K starting one interval after the frame, reconnecting at once each time. A storm in progress ignores further matches. |

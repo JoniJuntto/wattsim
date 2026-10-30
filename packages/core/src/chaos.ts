@@ -53,7 +53,8 @@ export type ChaosEffect =
  *
  * Transport:
  * - `jitter`: hold the frame for a delay drawn uniformly from `minMs..maxMs` with the engine's RNG. A delay.
- * - `reorder`: hold the frame until `after` (default 1) later frames in the same direction have passed it.
+ * - `reorder`: hold the frame until `after` (default 1) later frames in the same direction have passed it. Never an
+ *   outbound CALL: only a later outbound frame releases it, and the station's next CALL waits for this one's answer.
  * - `halfOpen`: from this frame on (the frame included) nothing is written to or read from the socket, which stays
  *   open. With `ms`, the station notices after that long and drops the socket (then reconnects as usual).
  * - `slowRead`: inbound only. The n-th frame this rule delays is held `n * stepMs`. A delay.
@@ -159,7 +160,8 @@ export class ChaosEngine {
    * The first matching delay rule and the first matching other rule both apply (see the module comment); once
    * one of each kind has matched, later rules of that kind are not evaluated. A `once` rule is removed after it
    * matches. A rule whose fault does not apply in `direction` (a protocol mutation on an inbound frame, `slowRead` on
-   * an outbound one) does not match, so it draws no `probability` and spends no `once`.
+   * an outbound one) does not match, so it draws no `probability` and spends no `once`. Nor does `reorder` on an
+   * outbound CALL, which it could only make time out; the CALL still counts for `nth` and `every`.
    */
   decide(direction: ChaosDirection, frame: Frame, action?: string): ChaosDecision {
     const frameAction = frame.type === 2 || frame.type === 6 ? frame.action : action;
@@ -172,7 +174,9 @@ export class ChaosEngine {
       const kind = rule.effect.kind;
       const isDelay = DELAYS.has(kind);
       if (isDelay ? delay : other) continue;
-      if (direction === 'in' ? OUT_ONLY.has(kind) : IN_ONLY.has(kind)) continue;
+      if (direction === 'in' ? OUT_ONLY.has(kind) : IN_ONLY.has(kind) || (kind === 'reorder' && frame.type === 2)) {
+        continue;
+      }
       const m = rule.match;
       if (m.direction !== undefined && m.direction !== direction) continue;
       if (m.action !== undefined && m.action !== frameAction) continue;

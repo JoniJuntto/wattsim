@@ -9,7 +9,9 @@
  *   one installed on the station (evseId 0).
  * - Caps: Max and ExternalConstraints profiles. Installed on the station (evseId 0) they are one shared cap,
  *   divided equally across the EVSEs with an active transaction (counting `e` itself).
- * - The result is the minimum of the transaction limit and the caps; `undefined` when no profile applies.
+ * - The result is the minimum of the transaction limit and the caps; `undefined` when no profile applies. A limit in
+ *   A scales with the phases in use and one in W does not, so the result keeps both parts (`Limit.amps`,
+ *   `Limit.capKw`) and the lowest `numberPhases`: which one binds is decided at the phases actually in use.
  */
 import type { ProfilePurpose } from './adapters/types';
 
@@ -67,6 +69,8 @@ export type ChargingEnv = {
   now(): number;
   /** Epoch ms the EVSE's transaction started, undefined without one. */
   txStartedAt(evseId: number): number | undefined;
+  /** Phases of the EV plugged into the EVSE, undefined without one: GetCompositeSchedule reports at the phases in use. */
+  evPhases?(evseId: number): number | undefined;
 };
 
 export type ClearCriteria = { id?: number; evseId?: number; purpose?: ProfilePurpose; stackLevel?: number };
@@ -107,10 +111,24 @@ function isCap(cls: PurposeClass): boolean {
 }
 
 /**
- * A limit in kW and the `numberPhases` of the schedule period that set it (undefined: the station's phases). A limit
- * written in A also keeps its per-phase current, so a station that switches phases can rescale it (`amps`).
+ * A limit in kW at `phases`, the lowest `numberPhases` of the schedule periods behind it (undefined: the station's
+ * phases). A limit written in A keeps its per-phase current (`amps`), so a station that switches phases can rescale
+ * it. A combination of A and W limits keeps both parts: `amps` and `capKw`, the tightest W part, which does not scale
+ * with the phases; `kw` is then the tighter of the two at `phases`. Use `limitKwAt` for its value on other phases.
  */
-export type Limit = { kw: number; phases?: number; amps?: number };
+export type Limit = { kw: number; phases?: number; amps?: number; capKw?: number };
+
+/**
+ * `l` in kW on `phases` phases: an A part scales with the phases, a W part does not. `tighter` picks between the two:
+ * `Math.min` for a limit, `Math.max` for a (negative) discharge limit, whose tighter value is the one closer to zero.
+ */
+export function limitKwAt(l: Limit, phases: number, voltageV: number, tighter: Tighter = Math.min): number {
+  if (l.amps === undefined) return l.kw;
+  const a = (l.amps * phases * voltageV) / 1000;
+  return l.capKw === undefined ? a : tighter(a, l.capKw);
+}
+
+type Tighter = (a: number, b: number) => number;
 
 /** 2.1 V2X values in force for one EVSE: the setpoint of the transaction profile and the tightest discharge limit. */
 export type V2xLimits = { setpoint?: Limit; dischargeLimit?: Limit };
@@ -120,11 +138,46 @@ function isV2xPeriod(q: SchedulePeriod): boolean {
   return q.setpoint !== undefined || q.dischargeLimit !== undefined || (q.limit !== undefined && q.limit < 0);
 }
 
-/** The lower of two limits, keeping its phases. */
-function minLimit(a: Limit | undefined, b: Limit | undefined): Limit | undefined {
+/** The W part of a limit: the whole of a W limit, `capKw` of a mixed one, undefined for an A limit. */
+function wattPart(l: Limit): number | undefined {
+  return l.amps === undefined ? l.kw : l.capKw;
+}
+
+function pick(a: number | undefined, b: number | undefined, tighter: Tighter): number | undefined {
   if (a === undefined) return b;
   if (b === undefined) return a;
-  return b.kw < a.kw ? b : a;
+  return tighter(a, b);
+}
+
+/**
+ * Both limits at once, whatever the phases in use: the A parts and the W parts combine separately (an A limit and a
+ * W limit cannot be compared before the phase count is known), and `numberPhases` is the lower one. A part that
+ * cannot bind on any phase count up to the limit's is dropped, so plain limits keep their plain shape. `tighter` is
+ * `Math.min` for limits, `Math.max` for (negative) discharge limits.
+ */
+function combine(
+  a: Limit | undefined,
+  b: Limit | undefined,
+  cfg: { voltageV: number; phases: number },
+  tighter: Tighter = Math.min,
+): Limit | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  const phases = pick(a.phases, b.phases, Math.min);
+  const amps = pick(a.amps, b.amps, tighter);
+  let capKw = pick(wattPart(a), wattPart(b), tighter);
+  if (amps === undefined) return { kw: capKw as number, phases };
+  if (capKw !== undefined) {
+    // kW of the A part is linear in the phase count, so its ends decide whether the W part can ever bind.
+    const one = (amps * cfg.voltageV) / 1000;
+    const all = (amps * (phases ?? cfg.phases) * cfg.voltageV) / 1000;
+    if (tighter(one, capKw) === one && tighter(all, capKw) === all) capKw = undefined;
+    else if (tighter(one, capKw) === capKw && tighter(all, capKw) === capKw) return { kw: capKw, phases };
+  }
+  const out: Limit = { kw: 0, phases, amps };
+  if (capKw !== undefined) out.capKw = capKw;
+  out.kw = limitKwAt(out, phases ?? cfg.phases, cfg.voltageV, tighter);
+  return out;
 }
 
 /** kW of a schedule limit. A uses the period's `numberPhases`, else the station's phases, at the station voltage. */
@@ -265,9 +318,10 @@ export class ProfileStore {
       pick('txDefault', evseId, 'setpoint') ??
       pick('txDefault', 0, 'setpoint');
     if (setpoint) out.setpoint = setpoint;
+    // Discharge limits are negative: the tighter of two is the one closer to zero, at the phases in use.
     let discharge: Limit | undefined;
     const tighter = (l: Limit | undefined) => {
-      if (l && (discharge === undefined || l.kw > discharge.kw)) discharge = l;
+      discharge = combine(discharge, l, this.env, Math.max);
     };
     tighter(
       (hasTx ? pick('tx', evseId, 'dischargeLimit') : undefined) ??
@@ -276,10 +330,7 @@ export class ProfileStore {
     );
     tighter(pick('max', evseId, 'dischargeLimit'));
     tighter(pick('external', evseId, 'dischargeLimit'));
-    // Discharge limits are negative: the tighter of two is the one closer to zero.
-    const a = pick('max', 0, 'dischargeLimit');
-    const b = pick('external', 0, 'dischargeLimit');
-    const cap = a && b ? (a.kw > b.kw ? a : b) : (a ?? b);
+    const cap = combine(pick('max', 0, 'dischargeLimit'), pick('external', 0, 'dischargeLimit'), this.env, Math.max);
     if (cap) tighter(this.share(evseId, cap));
     if (discharge) out.dischargeLimit = discharge;
     return out;
@@ -319,18 +370,24 @@ export class ProfileStore {
 
   /**
    * GetCompositeSchedule periods for `evseId` from `from` over `durationMs`, in `unit`. Where no profile applies the
-   * EVSE's physical limit is reported. evseId 0 is the grid connection: the sum of the EVSE limits (without the
-   * station-level share), capped by the station-level profiles.
+   * EVSE's physical limit is reported. An EVSE with an EV plugged in reports at the phases in use (the EV's, at
+   * most), where A and W limits compare as the EVSE applies them. evseId 0 is the grid connection: the sum of the EVSE
+   * limits (without the station-level share), capped by the station-level profiles.
    */
   composite(evseId: number, from: number, durationMs: number, unit: ChargingRateUnit): CompositePeriod[] {
     const end = from + durationMs;
     const out: CompositePeriod[] = [];
+    const { voltageV, phases: wired } = this.env;
+    // The physical limit is a current per phase: on one phase it is a third of the three-phase power.
+    const rated: Limit = { kw: this.env.ratedKw, amps: (this.env.ratedKw * 1000) / (voltageV * wired) };
+    const evPhases = evseId === 0 ? undefined : this.env.evPhases?.(evseId);
     let t = from;
     for (;;) {
-      const rated: Limit = { kw: this.env.ratedKw };
-      const lim = (evseId === 0 ? this.gridLimit(t, from) : minLimit(rated, this.limit(evseId, t, from))) ?? rated;
-      const phases = lim.phases ?? this.env.phases;
-      const limit = floorTenth(unit === 'W' ? lim.kw * 1000 : (lim.kw * 1000) / (this.env.voltageV * phases));
+      const lim =
+        (evseId === 0 ? this.gridLimit(t, from) : combine(rated, this.limit(evseId, t, from), this.env)) ?? rated;
+      const phases = Math.min(lim.phases ?? wired, evPhases ?? wired);
+      const kw = limitKwAt(lim, phases, voltageV);
+      const limit = floorTenth(unit === 'W' ? kw * 1000 : (kw * 1000) / (voltageV * phases));
       // Whole seconds from `from`: a rise is reported at or after the instant it takes effect, a drop at or
       // before it, so the reported schedule never allows more than the real one.
       const prev = out.at(-1);
@@ -445,6 +502,7 @@ export class ProfileStore {
     for (let id = 1; id <= this.env.evses; id++) if (this.env.txStartedAt(id) !== undefined) sharing++;
     const out: Limit = { kw: cap.kw / sharing, phases: cap.phases };
     if (cap.amps !== undefined) out.amps = cap.amps / sharing;
+    if (cap.capKw !== undefined) out.capKw = cap.capKw / sharing;
     return out;
   }
 
@@ -464,7 +522,7 @@ export class ProfileStore {
     const own = this.ownLimit(evseId, t, anchor);
     const cap = this.stationCap(t);
     if (cap === undefined) return own;
-    return minLimit(own, this.share(evseId, cap));
+    return combine(own, this.share(evseId, cap), this.env);
   }
 
   /** The EVSE's own limit: transaction limit capped by caps installed on the EVSE itself. */
@@ -472,16 +530,17 @@ export class ProfileStore {
     const tx = this.env.txStartedAt(evseId) !== undefined ? this.best('tx', evseId, evseId, t, fallback) : undefined;
     const txLimit =
       tx ?? this.best('txDefault', evseId, evseId, t, fallback) ?? this.best('txDefault', 0, evseId, t, fallback);
-    const caps = minLimit(
+    const caps = combine(
       this.best('max', evseId, evseId, t, fallback),
       this.best('external', evseId, evseId, t, fallback),
+      this.env,
     );
-    return minLimit(txLimit, caps);
+    return combine(txLimit, caps, this.env);
   }
 
   /** The station-level cap (Max and ExternalConstraints on evseId 0), before it is shared. */
   private stationCap(t: number): Limit | undefined {
-    return minLimit(this.best('max', 0, 0, t, t), this.best('external', 0, 0, t, t));
+    return combine(this.best('max', 0, 0, t, t), this.best('external', 0, 0, t, t), this.env);
   }
 
   /** The grid connection: the sum of the EVSE limits (station phases), capped by the station-level profiles. */
@@ -490,6 +549,6 @@ export class ProfileStore {
     for (let e = 1; e <= this.env.evses; e++) {
       sum += Math.min(this.env.ratedKw, this.ownLimit(e, t, fallback)?.kw ?? Number.POSITIVE_INFINITY);
     }
-    return minLimit({ kw: sum }, this.stationCap(t)) ?? { kw: sum };
+    return combine({ kw: sum }, this.stationCap(t), this.env) ?? { kw: sum };
   }
 }

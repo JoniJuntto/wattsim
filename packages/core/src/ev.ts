@@ -14,6 +14,11 @@
  * Power: the EV draws at most `curve(soc) * derate(temperature) * phases * V * min(maxCurrentA, cableMaxA)`.
  * The battery temperature heats with the square of the power (`heatPerHourC` at a 1C rate) and cools towards
  * `ambientC` (`coolingPerHour`); both are integrated exactly over each tick at the power of that tick.
+ *
+ * Power is constant within a tick, so the owner cuts its steps where the power would change: `holdMs` gives the time
+ * until the soc reaches a target, floor or `suspendAt`, until the charge curve or the temperature derate move the
+ * EV's power limit by `POWER_STEP` (or reach a corner of the default curves), or until a pause ends. Each is a closed
+ * form at the power of the step, so the energy delivered does not depend on how often the owner integrates.
  */
 
 export type EvConfig = {
@@ -61,6 +66,13 @@ export type EvConfig = {
 export type EvState = 'Unplugged' | 'Plugged' | 'Ready' | 'Charging' | 'Suspended' | 'Full';
 
 const MS_PER_HOUR = 3_600_000;
+/** Largest relative change of the EV's power limit (charge curve x temperature derate) one step may span. */
+const POWER_STEP = 0.002;
+/** A soc this close to a mark (target, `suspendAt`, the curve knee) has reached it: a step cut there lands on it. */
+const SOC_EPS = 1e-12;
+/** `defaultChargeCurve`: full power up to the knee, then down by `CURVE_SLOPE` per unit of soc (to 0.1 at soc 1). */
+const CURVE_KNEE = 0.8;
+const CURVE_SLOPE = 4.5;
 /** Battery temperatures outside this range are clamped (the model is not meant for fires or arctic nights). */
 const MIN_TEMP_C = -40;
 const MAX_TEMP_C = 90;
@@ -258,8 +270,102 @@ export class EvModel {
   }
 
   /**
+   * How long the EV can take `kw` (what `drawKw` just returned) before its state or its power limit changes, in ms:
+   * until the soc reaches `targetSoc`, `suspendAt` or (discharging) `minDischargeSoc`, until the charge curve or the
+   * temperature derate move the power limit by `POWER_STEP` or reach a corner of the default curves, or until a pause
+   * with `resumeAfterMs` ends. Infinity when nothing changes. Closed forms at constant power, so cutting a step there
+   * costs one evaluation, not a timer.
+   */
+  holdMs(kw: number, voltageV: number, phases: number): number {
+    if (this._state === 'Suspended') {
+      const after = this.cfg.resumeAfterMs;
+      return after === undefined ? Number.POSITIVE_INFINITY : Math.max(0, after - this.suspendedMs);
+    }
+    if (this._state !== 'Charging' || kw === 0) return Number.POSITIVE_INFINITY;
+    const soc = this._soc;
+    let mark: number;
+    if (kw > 0) {
+      mark = Math.min(this.cfg.targetSoc, this.curveMark(kw, voltageV, phases));
+      const at = this.cfg.suspendAt;
+      if (at !== undefined && !this.suspendFired && soc < at) mark = Math.min(mark, at);
+    } else {
+      mark = this.cfg.minDischargeSoc ?? 0.2;
+    }
+    const msPerSoc = (this.cfg.batteryKwh * MS_PER_HOUR) / Math.abs(kw);
+    return Math.min(Math.abs(mark - soc) * msPerSoc, this.temperatureHoldMs(kw));
+  }
+
+  /** The soc at which the charge curve has moved the power limit enough to re-evaluate `kw`. */
+  private curveMark(kw: number, voltageV: number, phases: number): number {
+    const soc = this._soc;
+    const curve = this.cfg.curve ?? defaultChargeCurve;
+    if (curve === defaultChargeCurve) {
+      if (soc < CURVE_KNEE - SOC_EPS) return CURVE_KNEE;
+      const u = defaultChargeCurve(soc);
+      const full = this.maxChargeKw(voltageV, phases) / u; // the limit at curve 1
+      // Held back by the curve: step until it has fallen by POWER_STEP. Held back by the offer: until the limit
+      // falls to the offer, where the curve takes over.
+      if (kw >= full * u * (1 - 1e-9)) return soc + (POWER_STEP * u) / CURVE_SLOPE;
+      return CURVE_KNEE + (1 - kw / full) / CURVE_SLOPE;
+    }
+    // Another curve: step by its local slope, at most 1% soc, so a corner is not stepped over by much.
+    const c = curve(soc);
+    const h = soc < 1 - 1e-4 ? 1e-4 : -1e-4;
+    const slope = (curve(soc + h) - c) / h;
+    return soc + (slope < 0 ? Math.min(0.01, (POWER_STEP * Math.max(c, 0.05)) / -slope) : 0.01);
+  }
+
+  /** ms until the battery temperature, moving at power `kw`, reaches the next temperature worth re-evaluating at. */
+  private temperatureHoldMs(kw: number): number {
+    const ambient = this.cfg.ambientC ?? 20;
+    const c = this.cfg.coolingPerHour ?? 0.5;
+    const rate = kw / this.cfg.batteryKwh;
+    const h = (this.cfg.heatPerHourC ?? 6) * rate * rate;
+    const t0 = this._tempC;
+    const eq = c > 0 ? ambient + h / c : h > 0 ? Number.POSITIVE_INFINITY : t0;
+    if (Math.abs(eq - t0) < 1e-9) return Number.POSITIVE_INFINITY;
+    const up = eq > t0;
+    const goal = this.temperatureMark(up);
+    if (goal === undefined || goal < MIN_TEMP_C || goal > MAX_TEMP_C) return Number.POSITIVE_INFINITY;
+    if (up ? goal >= eq : goal <= eq) return Number.POSITIVE_INFINITY; // approached, never reached
+    const hours = c > 0 ? Math.log((t0 - eq) / (goal - eq)) / c : (goal - t0) / h;
+    return hours * MS_PER_HOUR;
+  }
+
+  /**
+   * The next temperature, rising (`up`) or falling, at which the derate has moved by POWER_STEP or reaches a corner of
+   * the default curve. Undefined on a flat stretch without a corner ahead.
+   */
+  private temperatureMark(up: boolean): number | undefined {
+    const t = this._tempC;
+    const dir = up ? 1 : -1;
+    const custom = this.cfg.temperatureDerate;
+    if (custom) {
+      const f = custom(t);
+      const slope = Math.abs(custom(t + dir * 0.01) - f) / 0.01;
+      const step = slope > 1e-9 ? Math.min(1, Math.max(0.01, (POWER_STEP * Math.max(f, 0.05)) / slope)) : 1;
+      return t + dir * step;
+    }
+    let corner: number | undefined;
+    for (let i = 0; i < DERATE_POINTS.length; i++) {
+      const tc = (DERATE_POINTS[up ? i : DERATE_POINTS.length - 1 - i] as readonly [number, number])[0];
+      if (up ? tc > t + 1e-9 : tc < t - 1e-9) {
+        corner = tc;
+        break;
+      }
+    }
+    if (corner === undefined) return undefined; // beyond the last corner the curve is flat
+    const mid = (t + corner) / 2; // the piece between t and the corner is linear
+    const slope = Math.abs(defaultTemperatureDerate(mid + 1e-3) - defaultTemperatureDerate(mid - 1e-3)) / 2e-3;
+    if (slope < 1e-9) return corner;
+    const step = Math.max(0.01, (POWER_STEP * Math.max(this.derate, 0.05)) / slope);
+    return up ? Math.min(t + step, corner) : Math.max(t - step, corner);
+  }
+
+  /**
    * Advance `dtMs` at `deliveredKw` (negative while discharging): battery temperature always, soc while Charging,
-   * the `resumeAfterMs` countdown while Suspended.
+   * the `resumeAfterMs` countdown while Suspended. The soc never passes `targetSoc` or (discharging)
+   * `minDischargeSoc`; a step that would is clamped there, and the owner cuts its steps at `holdMs` so none does.
    */
   tick(dtMs: number, deliveredKw: number): void {
     if (dtMs <= 0) return;
@@ -276,17 +382,20 @@ export class EvModel {
     const prev = this._soc;
     const kwh = (deliveredKw * dtMs) / MS_PER_HOUR;
     if (kwh < 0) {
-      this._soc = Math.max(0, prev + kwh / this.cfg.batteryKwh);
+      const floor = this.cfg.minDischargeSoc ?? 0.2;
+      const soc = prev + kwh / this.cfg.batteryKwh;
+      this._soc = Math.max(0, prev >= floor ? Math.max(floor, soc) : soc);
       return;
     }
     this._soc = Math.min(1, prev + kwh / this.cfg.batteryKwh);
-    if (this._soc >= this.cfg.targetSoc) {
-      this._soc = Math.min(this._soc, Math.max(this.cfg.targetSoc, prev));
+    if (this._soc >= this.cfg.targetSoc - SOC_EPS) {
+      this._soc = Math.max(this.cfg.targetSoc, prev);
       this._state = 'Full';
       return;
     }
     const at = this.cfg.suspendAt;
-    if (at !== undefined && !this.suspendFired && prev < at && this._soc >= at) {
+    if (at !== undefined && !this.suspendFired && prev < at && this._soc >= at - SOC_EPS) {
+      this._soc = Math.max(this._soc, at);
       this.suspendFired = true;
       this._state = 'Suspended';
       this.suspendedMs = 0;

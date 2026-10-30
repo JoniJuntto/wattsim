@@ -5,7 +5,8 @@
  * Price elements are tried in list order and the first whose conditions all hold applies (energy, charging time and
  * idle time independently; the fixed fee once, at the start of the transaction). Time-of-day, weekday and date
  * conditions are local time in the tariff's time zone (the station's `ClockCtrlr.TimeZone`, via `Intl`), so a
- * boundary at 22:00 or midnight lands on the right UTC instant on both sides of a DST change. Between two
+ * boundary at 22:00 or midnight lands on the right UTC instant on both sides of a DST change. The instant the UTC
+ * offset changes is a boundary too, and a wall time the autumn change repeats is reached twice. Between two
  * integration steps power is constant; a step is cut wherever a condition can flip (a local time boundary, an
  * energy or duration threshold), so a price change inside a meter interval is charged exactly.
  *
@@ -109,17 +110,28 @@ function offsetAt(ms: number, tz: string): number {
  * occurs twice (autumn) gives the first; one that is skipped (spring) gives the instant the clock jumps past it.
  */
 export function wallToUtc(wallMs: number, tz: string): number {
-  const offsets = new Set([offsetAt(wallMs - DAY_MS, tz), offsetAt(wallMs, tz), offsetAt(wallMs + DAY_MS, tz)]);
-  let best = Number.POSITIVE_INFINITY;
+  return wallInstants(wallMs, tz)[0] as number;
+}
+
+/**
+ * Every instant at which the wall clock in `tz` reaches `wallMs`, in order: one, two for a wall time the autumn change
+ * repeats, or the instant of the jump for one the spring change skips.
+ */
+function wallInstants(wallMs: number, tz: string): number[] {
+  const offsets = [...new Set([offsetAt(wallMs - DAY_MS, tz), offsetAt(wallMs, tz), offsetAt(wallMs + DAY_MS, tz)])];
+  const out: number[] = [];
   for (const o of offsets) {
     const x = wallMs - o;
-    if (offsetAt(x, tz) === o && x < best) best = x;
+    if (offsetAt(x, tz) === o) out.push(x);
   }
-  if (best !== Number.POSITIVE_INFINITY) return best;
+  if (out.length > 0) return out.sort((a, b) => a - b);
   // Skipped: the offset changes between the two candidates; find the instant it does.
-  const sorted = [...offsets].sort((a, b) => a - b);
-  let lo = wallMs - (sorted.at(-1) as number);
-  let hi = wallMs - (sorted[0] as number);
+  offsets.sort((a, b) => a - b);
+  return [offsetChange(wallMs - (offsets.at(-1) as number), wallMs - (offsets[0] as number), tz)];
+}
+
+/** The first instant in (`lo`, `hi`] whose UTC offset differs from `lo`'s; `hi` must have another offset. */
+function offsetChange(lo: number, hi: number, tz: string): number {
   const before = offsetAt(lo, tz);
   while (hi - lo > 1) {
     const mid = Math.floor((lo + hi) / 2);
@@ -129,12 +141,15 @@ export function wallToUtc(wallMs: number, tz: string): number {
   return hi;
 }
 
-/** The first instant after `t` at which the wall clock in `tz` reaches `minuteOfDay` (0..1439). */
+/**
+ * The first instant after `t` at which the wall clock in `tz` reaches `minuteOfDay` (0..1439), counting the second
+ * pass through a repeated hour.
+ */
 export function nextLocalMinute(t: number, tz: string, minuteOfDay: number): number {
   const today = Date.parse(`${localTime(t, tz).date}T00:00:00Z`);
-  for (let day = 0; day <= 2; day++) {
-    const at = wallToUtc(today + day * DAY_MS + minuteOfDay * 60_000, tz);
-    if (at > t) return at;
+  // From the day before: a change at local midnight repeats the end of the previous day after `t`.
+  for (let day = -1; day <= 2; day++) {
+    for (const at of wallInstants(today + day * DAY_MS + minuteOfDay * 60_000, tz)) if (at > t) return at;
   }
   return t + DAY_MS; // unreachable for real time zones
 }
@@ -370,12 +385,16 @@ export class TariffStore {
 
 type Period = {
   startMs: number;
-  tariffId: string;
+  /** Undefined for the usage before a tariff arrived during the transaction, which no tariff priced. */
+  tariffId: string | undefined;
   key: string;
   energyWh: number;
   chargingS: number;
   idleS: number;
 };
+
+/** Usage of a transaction before its tariff arrived (2.1 ChangeTransactionTariff on a transaction without one). */
+export type UsageSoFar = { importWh: number; exportWh: number; chargingS: number; idleS: number };
 
 /**
  * The cost of one transaction under its tariff, advanced step by step on the station clock. `advance(to, kW, V)`
@@ -406,14 +425,33 @@ export class TransactionCost {
     energy: [],
   };
 
-  /** `fromMs` (default `startMs`): when pricing begins, for a tariff that arrives during the transaction. */
-  constructor(tariff: Tariff, startMs: number, timeZone: string, fromMs: number = startMs) {
+  /**
+   * `fromMs` (default `startMs`): when pricing begins, for a tariff that arrives during the transaction. `before` is
+   * the transaction's usage until then: energy and duration conditions count from the transaction start (the
+   * schema's "consumed energy" and transaction durations), and costDetails reports it as a period without a
+   * tariffId, unpriced, so totalUsage agrees with the meter.
+   */
+  constructor(tariff: Tariff, startMs: number, timeZone: string, fromMs: number = startMs, before?: UsageSoFar) {
     this.tariff = tariff;
     this.currency = tariff.currency;
     this.startMs = startMs;
     this.lastMs = fromMs;
     this.tz = timeZone;
     this.index();
+    if (before && fromMs > startMs) {
+      this.importWh = before.importWh;
+      this.exportWh = before.exportWh;
+      this.chargingS = before.chargingS;
+      this.idleS = before.idleS;
+      this.periods.push({
+        startMs,
+        tariffId: undefined,
+        key: 'before',
+        energyWh: before.importWh - before.exportWh,
+        chargingS: before.chargingS,
+        idleS: before.idleS,
+      });
+    }
     const fees = tariff.fixedFee;
     if (fees && fromMs === startMs) {
       const local = localTime(startMs, timeZone);
@@ -465,7 +503,7 @@ export class TransactionCost {
       const e = charging ? firstMatch(this.tariff.energy?.prices, local, u) : -1;
       const dim = charging ? this.tariff.chargingTime : this.tariff.idleTime;
       const d = firstMatch(dim?.prices, local, u);
-      const next = Math.max(t + 1, Math.min(toMs, this.nextBoundary(t, p, charging)));
+      const next = Math.min(toMs, Math.max(t + 1, this.nextBoundary(t, p, charging)));
       const dt = next - t;
       const wh = (p * dt) / 3600; // kW * ms / 3600 == Wh
       if (e >= 0) this.energyCost += ((this.tariff.energy?.prices[e]?.priceKwh ?? 0) * wh) / 1000;
@@ -538,8 +576,8 @@ export class TransactionCost {
       if (p.idleS !== 0) dims.push({ type: 'IdleTIme', volume: round(p.idleS) });
       const cp: NonNullable<CostDetails['chargingPeriods']>[number] = {
         startPeriod: new Date(p.startMs).toISOString(),
-        tariffId: p.tariffId,
       };
+      if (p.tariffId !== undefined) cp.tariffId = p.tariffId;
       if (dims.length > 0) cp.dimensions = dims;
       return cp;
     });
@@ -561,6 +599,11 @@ export class TransactionCost {
     if (t >= this.nextLocal) {
       let next = Number.POSITIVE_INFINITY;
       for (const m of this.boundaries) next = Math.min(next, nextLocalMinute(t, this.tz, m));
+      // A DST change moves every local time at once (and repeats or skips an hour): it is a boundary of its own.
+      // Local boundaries recur daily, so at most one change lies before the next of them.
+      if (next !== Number.POSITIVE_INFINITY && offsetAt(t, this.tz) !== offsetAt(next, this.tz)) {
+        next = offsetChange(t, next, this.tz);
+      }
       this.nextLocal = next;
     }
     let next = this.nextLocal;

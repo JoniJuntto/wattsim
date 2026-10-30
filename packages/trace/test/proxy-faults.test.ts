@@ -142,6 +142,29 @@ describe('transport faults', () => {
     await station.disconnect();
   });
 
+  test('reorder out never holds a charger CALL: it passes, and the rule spends its once on a CALLRESULT', async () => {
+    await startWith('reorder out once');
+    // Boot, StatusNotification and this Heartbeat are charger CALLs: none is held, so none times out.
+    const station = await connected('CP-REO-OUT');
+    await station.sendHeartbeat();
+    expect(recorder.entries.filter((e) => e.chaos)).toEqual([]);
+    const atCsms = () => csms.receivedFrom('CP-REO-OUT').filter((f) => f.type === 3);
+    const answer = csms.call('CP-REO-OUT', 'GetConfiguration', { key: ['k'] });
+    await until(() => recorded('GetConfiguration', 'out').length === 1, 1000, 'CALLRESULT recorded');
+    await Bun.sleep(20);
+    expect(atCsms()).toEqual([]);
+    expect(recorded('GetConfiguration', 'out')[0]?.chaos).toEqual({
+      rule: expect.any(String),
+      effect: 'reorder',
+      after: 1,
+    });
+    // The charger's next frame passes it and releases it.
+    await station.sendHeartbeat();
+    await answer;
+    expect(atCsms().length).toBe(1);
+    await station.disconnect();
+  });
+
   test('halfOpen for 5s out Heartbeat nth 1: nothing passes, then the proxy drops the charger, which reconnects', async () => {
     const p = await startWith('halfOpen for 5s out Heartbeat nth 1');
     const closes: string[] = [];

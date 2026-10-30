@@ -16,7 +16,8 @@
  *
  * - `delay`, `jitter` and `slowRead` hold the frame (the engine draws the delay); the note has `delayMs`.
  * - `reorder` holds the frame until `after` later frames have been passed on in the same direction; the note has
- *   `after`.
+ *   `after`. A charger CALL is never held (the engine does not match one): the charger's next frame is usually its
+ *   next CALL, which waits for this one's answer.
  * - `halfOpen` swallows the frame and from then on passes nothing either way; frames that still arrive are recorded
  *   with a `halfOpen` note. Frames the charger sends still go through the chaos rules, as a station's writes do; frames
  *   from the CSMS are not looked at, as a station stops reading. With `for d`, the proxy drops the connection after
@@ -160,6 +161,7 @@ function chaosOutcome(frame: Frame, data: Data, effect: ChaosEffect): ChaosOutco
  * payload as the action's response, anything else as its request. The engine never decides them for an inbound frame.
  */
 function faultOutcome(
+  dir: TraceDirection,
   frame: Frame,
   data: Data,
   fault: ChaosFaultEffect,
@@ -168,6 +170,9 @@ function faultOutcome(
 ): ChaosOutcome {
   switch (fault.kind) {
     case 'reorder':
+      // A charger CALL is only released by a later charger frame, and the charger sends its next CALL only after
+      // this one is answered: holding it would always time out. `ChaosEngine` never matches one; pass it on anyway.
+      if (dir === 'out' && frame.type === MessageType.Call) return { forward: [data] };
       return { forward: [data], hold: Math.max(1, fault.after ?? 1) };
     case 'halfOpen':
       return { forward: [], halfOpen: fault.ms === undefined ? {} : { ms: fault.ms } };
@@ -246,7 +251,7 @@ class Session {
     }
     const { effect, fault, delayed } = decision;
     const outcome = fault
-      ? faultOutcome(frame, data, fault, this.version ?? 'ocpp2.1', action)
+      ? faultOutcome(dir, frame, data, fault, this.version ?? 'ocpp2.1', action)
       : chaosOutcome(frame, data, effect as ChaosEffect);
     // The rule's own kind: a `jitter` or `slowRead` is noted as such, with the delay the engine drew.
     entry.chaos = { rule: rule.id, effect: rule.effect.kind };

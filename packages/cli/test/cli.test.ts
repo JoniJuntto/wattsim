@@ -3,6 +3,7 @@ import { mkdtemp, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FakeCsms } from '../../core/test/fake-csms';
+import { parseRunTime } from '../src/commands/ui';
 
 const repoRoot = new URL('../../..', import.meta.url).pathname;
 const basicFixture = join(repoRoot, 'packages/scenario/test/fixtures/basic.ws');
@@ -242,6 +243,27 @@ describe('wattsim run', () => {
     expect(stdout).toContain('interrupted');
     expect(stdout).toMatch(/^CP-1\s+FAIL\s+/m);
     expect(await stderr).toBe('');
+  });
+});
+
+describe('wattsim ui', () => {
+  test('--max-run-time takes 0 or a duration with a unit', () => {
+    expect([parseRunTime('0'), parseRunTime('90s'), parseRunTime('30m'), parseRunTime('2h')]).toEqual([
+      0, 90_000, 1_800_000, 7_200_000,
+    ]);
+    expect([parseRunTime('10'), parseRunTime('-1h'), parseRunTime('1d')]).toEqual([undefined, undefined, undefined]);
+  });
+
+  test.each([
+    ['--max-stations', '0'],
+    ['--max-runs', 'many'],
+    ['--max-run-time', '10'],
+    ['--allow-origin', 'localhost:5173'],
+    ['--allow-origin', 'http://localhost:5173/app'],
+  ])('rejects %s %s', async (flag, value) => {
+    const r = await cli('ui', '--no-open', '--port', '0', flag, value);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain(`invalid ${flag} ${value}`);
   });
 });
 
