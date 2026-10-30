@@ -133,7 +133,8 @@ describe('station lifecycle (1.6)', () => {
 
   test('a CALLERROR answered within the wait is a 409 and one stream error, not two', async () => {
     const before = stream.of('error').length;
-    const res = await act('CP-1', { type: 'send', action: 'DataTransfer', payload: { vendorId: 'x' } });
+    // A CSMS-only action sent by the station: the CSMS answers CALLERROR NotSupported.
+    const res = await act('CP-1', { type: 'send', action: 'RemoteStartTransaction', payload: { idTag: 'TAG' } });
     expect(res.status).toBe(409);
     expect(String(res.json.error)).toContain('CALLERROR');
     await Bun.sleep(100);

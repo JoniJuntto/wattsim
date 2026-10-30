@@ -6,8 +6,8 @@
 import { resolve } from 'node:path';
 import { validatePayload } from '@wattsim/protocol';
 import { Elysia } from 'elysia';
-// ponytail: FakeCsms is a core test double reused as the loopback CSMS; it moves to the CSMS package later.
-import { FakeCsms } from '../../core/test/fake-csms';
+import { type Csms, startCsms } from '@wattsim/csms';
+import { createTestCa, signCsr } from '@wattsim/pki';
 import pkg from '../package.json' with { type: 'json' };
 import { buildMeta } from './meta';
 import { Conflict, FRAMES_PER_STATION, NotFound, Registry } from './registry';
@@ -64,7 +64,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
   const meta = buildMeta();
   const hub: StreamHub = new StreamHub((id): StationView | undefined => reg.view(id));
   const reg: Registry = new Registry(hub);
-  let loopbackStarting: Promise<FakeCsms> | undefined;
+  let loopbackStarting: Promise<Csms> | undefined;
+  // The built-in test CSMS: the real CSMS simulator (with its conformance checker) and a test CA, so certificate
+  // signing works with zero setup. Created on first use.
+  const startLoopback = async (): Promise<Csms> => {
+    const ca = await createTestCa({ name: 'wattsim test CA' });
+    return startCsms({ port: 0, signer: ({ csr, identity }) => signCsr(ca, csr, { identity }) });
+  };
 
   const app = new Elysia()
     // Every body is JSON whatever the content type says (curl defaults to form encoding); `body()` parses it.
@@ -118,7 +124,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       return r.ok ? { ok: true, violations: [] } : { ok: false, violations: r.violations };
     })
     .post('/api/loopback', async () => {
-      loopbackStarting ??= FakeCsms.start({ port: 0 }).catch((err: unknown) => {
+      loopbackStarting ??= startLoopback().catch((err: unknown) => {
         loopbackStarting = undefined;
         throw err;
       });

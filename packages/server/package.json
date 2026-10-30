@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "@wattsim/core": "workspace:*",
+    "@wattsim/csms": "workspace:*",
+    "@wattsim/pki": "workspace:*",
     "@wattsim/protocol": "workspace:*",
     "@wattsim/scenario": "workspace:*",
     "elysia": "1.4.30",
