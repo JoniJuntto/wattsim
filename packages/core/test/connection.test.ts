@@ -77,7 +77,7 @@ async function openConn(conn: Connection): Promise<void> {
 }
 
 beforeEach(async () => {
-  csms = await FakeCsms.start({ version: 'ocpp1.6' });
+  csms = await FakeCsms.start({ listen: true, version: 'ocpp1.6' });
   clock = new VirtualClock(T0);
 });
 
@@ -123,7 +123,7 @@ describe('Connection: connect and disconnect', () => {
   });
 
   test('connect rejects when the server refuses and reconnect is disabled', async () => {
-    const dead = await FakeCsms.start();
+    const dead = await FakeCsms.start({ listen: true });
     await dead.stop();
     const conn = make({ url: dead.url, reconnect: false });
     await expect(conn.connect()).rejects.toThrow(/reconnect is disabled/);
@@ -280,7 +280,7 @@ describe('Connection: offline queue and reconnect', () => {
     await clock.advance(3000); // capped at maxMs
     await until(() => connecting() === 4 && conn.state === 'Disconnected');
 
-    csms = await FakeCsms.start({ port, version: 'ocpp1.6' });
+    csms = await FakeCsms.start({ listen: true, port, version: 'ocpp1.6' });
     await clock.advance(3000);
     await until(() => conn.state === 'Connected');
     csms.dropClient('CP1');
@@ -827,7 +827,7 @@ describe('Connection: version-specific CALLERROR codes', () => {
   });
 
   test('ocpp2.0.1: missing field, wrong type and bad enum get the 2.x spellings', async () => {
-    const csms201 = await FakeCsms.start({ version: 'ocpp2.0.1' });
+    const csms201 = await FakeCsms.start({ listen: true, version: 'ocpp2.0.1' });
     try {
       const conn = await connected({ url: csms201.url, version: 'ocpp2.0.1' });
       let dispatched = 0;

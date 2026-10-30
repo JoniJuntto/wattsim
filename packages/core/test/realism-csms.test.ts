@@ -7,7 +7,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import type { v21 } from '@wattsim/protocol';
 import type { Csms } from '../../csms/src/index';
-import { startCsms } from '../../csms/src/index';
+import { connectInMemory, startCsms } from '../../csms/src/index';
 import type { Tariff } from '../src/index';
 import { Station, VirtualClock } from '../src/index';
 import { until } from './fake-csms';
@@ -42,12 +42,13 @@ const TARIFF: Tariff = {
 
 test('2.1 V2X + tariff session: zero conformance violations', async () => {
   const clock = new VirtualClock(T0);
-  const server = startCsms({ clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
+  const server = startCsms({ listen: false, clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
   csms = server;
   const st = new Station({
     id: 'V2X-1',
     version: 'ocpp2.1',
     csmsUrl: server.url,
+    socket: connectInMemory,
     clock,
     meterIntervalMs: 5 * MIN,
     timeZone: 'Europe/Helsinki',

@@ -6,7 +6,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import type { OcppVersion } from '@wattsim/protocol';
 import type { Csms } from '../../csms/src/index';
-import { startCsms } from '../../csms/src/index';
+import { connectInMemory, startCsms } from '../../csms/src/index';
 import type { EvseDraw, EvseSupply } from '../src/index';
 import { PowerLossError, Station, VirtualClock } from '../src/index';
 import { until } from './fake-csms';
@@ -27,7 +27,7 @@ afterEach(async () => {
 
 function setup(version: OcppVersion) {
   const clock = new VirtualClock(T0);
-  const server = startCsms({ clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
+  const server = startCsms({ listen: false, clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
   csms = server;
   let supply: EvseSupply | null = LIVE;
   const draws: EvseDraw[] = [];
@@ -35,6 +35,7 @@ function setup(version: OcppVersion) {
     id: `SUP-${version}`,
     version,
     csmsUrl: server.url,
+    socket: connectInMemory,
     clock,
     meterIntervalMs: MIN,
     supply: () => supply,
@@ -190,10 +191,17 @@ test('a lost phase reduces the phases in use; a one-phase EV needs the EVSE phas
 
 test('a station created without power connects and boots when the power comes', async () => {
   const clock = new VirtualClock(T0);
-  const server = startCsms({ clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
+  const server = startCsms({ listen: false, clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
   csms = server;
   let supply: EvseSupply | null = null;
-  const st = new Station({ id: 'DARK', version: 'ocpp1.6', csmsUrl: server.url, clock, supply: () => supply });
+  const st = new Station({
+    id: 'DARK',
+    version: 'ocpp1.6',
+    csmsUrl: server.url,
+    socket: connectInMemory,
+    clock,
+    supply: () => supply,
+  });
   station = st;
   st.on('error', () => {});
   expect(st.powered).toBe(false);

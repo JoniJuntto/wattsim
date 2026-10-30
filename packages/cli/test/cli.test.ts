@@ -1,26 +1,15 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { mkdtemp, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FakeCsms } from '../../core/test/fake-csms';
 import { parseRunTime } from '../src/commands/ui';
+import { MEMORY_CSMS, runInMemory, spawnInMemory } from './in-memory';
 
 const repoRoot = new URL('../../..', import.meta.url).pathname;
 const basicFixture = join(repoRoot, 'packages/scenario/test/fixtures/basic.ws');
 
-async function cli(...args: string[]) {
-  const proc = Bun.spawn(['bun', 'packages/cli/src/index.ts', ...args], {
-    cwd: repoRoot,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { stdout, stderr, code };
-}
+/** `wattsim` in a child process whose stations reach its in-memory CSMS at `MEMORY_CSMS` (see in-memory.ts). */
+const cli = (...args: string[]) => runInMemory('packages/cli/src/index.ts', args);
 
 const scratch = await mkdtemp(join(tmpdir(), 'wattsim-cli-'));
 const tmpFile = async (name: string, content: string) => {
@@ -115,7 +104,7 @@ describe('wattsim fmt', () => {
     expect(dirty.stdout).toBe(`${a}\n${b}\n`);
     expect(await Bun.file(a).text()).toBe(messy);
     const clean = await cli('fmt', '--check', basicFixture);
-    expect(clean).toEqual({ stdout: '', stderr: '', code: 0 });
+    expect(clean).toEqual({ stdout: '', stderr: '', code: 0, calls: {} });
   });
 
   test('--check reports a syntax error and exits 1; --write takes several files', async () => {
@@ -138,13 +127,7 @@ describe('wattsim fmt', () => {
 });
 
 describe('wattsim run', () => {
-  let csms: FakeCsms;
-  let csmsUrl: string;
-  beforeAll(async () => {
-    csms = await FakeCsms.start();
-    csmsUrl = `${csms.url}/ocpp`;
-  });
-  afterAll(() => csms.stop());
+  const csmsUrl = `${MEMORY_CSMS}/ocpp`;
 
   const station = (body: string, csmsLine = '') =>
     `wattsim 1\n${csmsLine}\nstation "CP-1" {\n  version 1.6\n${body}\n}\n`;
@@ -213,14 +196,14 @@ describe('wattsim run', () => {
     const port = probe.port;
     probe.stop(true);
     const file = await tmpFile('slow.ws', station('  boot\n  wait 60s'));
-    const proc = Bun.spawn(
-      ['bun', 'packages/cli/src/index.ts', 'run', file, '--csms', csmsUrl, '--metrics', String(port)],
-      {
-        cwd: repoRoot,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      },
-    );
+    const { proc } = await spawnInMemory('packages/cli/src/index.ts', [
+      'run',
+      file,
+      '--csms',
+      csmsUrl,
+      '--metrics',
+      String(port),
+    ]);
     const stderr = new Response(proc.stderr).text();
     const reader = proc.stdout.getReader();
     const decoder = new TextDecoder();
@@ -270,11 +253,6 @@ describe('wattsim ui', () => {
 describe('examples/*.ws', async () => {
   const dir = join(repoRoot, 'examples');
   const examples = (await readdir(dir)).filter((f) => f.endsWith('.ws')).sort();
-  let csms: FakeCsms;
-  beforeAll(async () => {
-    csms = await FakeCsms.start();
-  });
-  afterAll(() => csms.stop());
 
   test('there are examples', () => {
     expect(examples.length).toBeGreaterThan(0);
@@ -286,7 +264,7 @@ describe('examples/*.ws', async () => {
     const fmt = await cli('fmt', file);
     expect(fmt.code).toBe(0);
     expect(fmt.stdout).toBe(await Bun.file(file).text());
-    const run = await cli('run', file, '--csms', `${csms.url}/ocpp`, '--virtual', '--quiet');
+    const run = await cli('run', file, '--csms', `${MEMORY_CSMS}/ocpp`, '--virtual', '--quiet');
     expect(run.stdout).toContain(' 0 failed;');
     expect(run.code).toBe(0);
   });

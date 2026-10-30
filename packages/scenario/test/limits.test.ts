@@ -9,7 +9,8 @@ import { join } from 'node:path';
 import type { StationConfig } from '@wattsim/core';
 import { VirtualClock } from '@wattsim/core';
 import type { Scenario } from '../src/index';
-import { link, ParseError, parse, run } from '../src/index';
+import { link, ParseError, parse } from '../src/index';
+import { run } from './in-memory';
 
 const scratch = await realpath(await mkdtemp(join(tmpdir(), 'wattsim-limits-')));
 afterAll(() => rm(scratch, { recursive: true, force: true }));

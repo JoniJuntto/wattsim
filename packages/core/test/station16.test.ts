@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { CallFrame, v16 } from '@wattsim/protocol';
 import type { ConnectorStatus, StationConfig } from '../src/index';
 import { Station, VirtualClock } from '../src/index';
-import { FakeCsms, until } from './fake-csms';
+import { connectInMemory, FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MINUTE = 60_000;
@@ -13,7 +13,14 @@ let clock: VirtualClock;
 const open: Station[] = [];
 
 function make(opts: Partial<StationConfig> = {}): Station {
-  const station = new Station({ id: 'CP1', version: 'ocpp1.6', csmsUrl: csms.url, clock, ...opts });
+  const station = new Station({
+    id: 'CP1',
+    version: 'ocpp1.6',
+    csmsUrl: csms.url,
+    socket: connectInMemory,
+    clock,
+    ...opts,
+  });
   station.on('error', () => {});
   open.push(station);
   return station;

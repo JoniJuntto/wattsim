@@ -8,7 +8,8 @@ import type { StationConfig } from '@wattsim/core';
 import { Station, VirtualClock } from '@wattsim/core';
 import type { Csms, RuleId } from '../../csms/src/index';
 import { startCsms } from '../../csms/src/index';
-import { driveVirtual, isIdle, parse, run } from '../src/index';
+import { driveVirtual, isIdle, parse } from '../src/index';
+import { run } from './in-memory';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 
@@ -22,7 +23,7 @@ afterEach(async () => {
 /** Run one station block against a fresh CSMS and return the rules it flagged, in order, without repeats. */
 async function flagged(version: string, body: string): Promise<RuleId[]> {
   const clock = new VirtualClock(T0);
-  csms = startCsms({ clock, topology: { evses: 1 } });
+  csms = startCsms({ listen: false, clock, topology: { evses: 1 } });
   const stations: Station[] = [];
   const src = `wattsim 1\nstation "CP-1" {\n  version ${version}\n${body}\n}\n`;
   const running = run(parse(src), {

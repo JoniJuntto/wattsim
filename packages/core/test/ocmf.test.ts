@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { OcppVersion, v16, v201 } from '@wattsim/protocol';
 import { validatePayload } from '@wattsim/protocol';
 import { OCMF_SIGNING_METHOD, OcmfSigner, ocmfTime, Station, splitOcmf, VirtualClock } from '../src/index';
-import { FakeCsms, until } from './fake-csms';
+import { connectInMemory, FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MIN = 60_000;
@@ -168,6 +168,7 @@ describe('signed meter values on the wire', () => {
       id: 'CS1',
       version,
       csmsUrl: csms.url,
+      socket: connectInMemory,
       clock,
       meterIntervalMs: MIN,
       signedMeterValues: true,
@@ -246,7 +247,7 @@ describe('signed meter values on the wire', () => {
   });
 
   test('stations without signedMeterValues send no signature and create no key', async () => {
-    const st = new Station({ id: 'CS1', version: 'ocpp2.0.1', csmsUrl: csms.url, clock });
+    const st = new Station({ id: 'CS1', version: 'ocpp2.0.1', csmsUrl: csms.url, socket: connectInMemory, clock });
     expect(st.meterSigner).toBeUndefined();
   });
 });

@@ -14,7 +14,7 @@
  *   run once it ended.
  */
 import { resolve } from 'node:path';
-import type { Clock } from '@wattsim/core';
+import { type Clock, VirtualClock } from '@wattsim/core';
 import { type Csms, startCsms } from '@wattsim/csms';
 import { type DlmScore, type ViolationKind, validateSite } from '@wattsim/grid';
 import { type SiteRuntime, startSite } from '@wattsim/site';
@@ -46,10 +46,35 @@ export type SiteRunOptions = {
   externalUrl?: string;
   /** Overrides the site block's `controller`. */
   controller?: 'reference' | 'none';
+  /**
+   * The run's speed (a real-time run at x40 passes 40): the series resolution and the load-model step are divided by
+   * it, so a fast real-time run records as much scenario time per point as a run at x1. Default 1.
+   */
+  speed?: number;
+  /** Time series resolution, clock ms. Default 10000 / `speed`. */
+  seriesMs?: number;
+  /** Load models are evaluated at least this often, clock ms. Default 10000 / `speed`. */
+  loadStepMs?: number;
+  /**
+   * The site's Modbus meters: `on` (default) listens on the ports the site names, `free` on free ports (several runs
+   * of a site that pins a port can coexist), `off` serves none (e.g. runs started from the UI).
+   */
+  modbus?: 'on' | 'free' | 'off';
   log: (message: string) => void;
 };
 
 type Inst = { name: string; block: StationBlock };
+
+/**
+ * Model time of a site without a `time` line on a virtual clock (midnight UTC; a load's `utc` offset applies on top
+ * as usual), so that shapes, PV and daily profiles do not depend on when the run was launched. A real-time run keeps
+ * the wall clock.
+ */
+export const DEFAULT_SITE_TIME = '2026-01-01T00:00:00Z';
+const DEFAULT_SITE_MS = Date.parse(DEFAULT_SITE_TIME);
+
+/** `ms` of scenario time in clock ms at `speed` (at least 100 ms). */
+const scaled = (ms: number, speed: number | undefined) => (speed && speed > 1 ? Math.max(100, ms / speed) : ms);
 
 const plain = (s: StringExpr) => s.parts.map((p) => (typeof p === 'string' ? p : `{${p.var}}`)).join('');
 
@@ -58,6 +83,10 @@ export class SiteRun {
   readonly csms: Csms | undefined;
   readonly csmsUrl: string;
   readonly controller: 'reference' | 'none';
+  /** Model time at the start of the run (load models read model time). */
+  readonly modelStartMs: number;
+  /** Where `modelStartMs` comes from: the site `time`, the default of a virtual run, or the wall clock. */
+  readonly modelTime: 'time' | 'default' | 'clock';
   private readonly setup: SiteSetup;
   /** Leaf ids of each station's attached EVSEs, and the station's EVSE rating when the attachment gave one. */
   private readonly byStation = new Map<string, { leaves: string[]; maxA?: number }>();
@@ -68,7 +97,11 @@ export class SiteRun {
     csms: Csms | undefined,
     csmsUrl: string,
     controller: 'reference' | 'none',
+    modelStartMs: number,
+    modelTime: 'time' | 'default' | 'clock',
   ) {
+    this.modelStartMs = modelStartMs;
+    this.modelTime = modelTime;
     this.setup = setup;
     this.runtime = runtime;
     this.csms = csms;
@@ -91,7 +124,15 @@ export class SiteRun {
       if (csv === undefined) throw new ParseError(`load profile "${path}" was not read`, loc.line, loc.col, opts.file);
       return csv;
     };
-    const { locs, ...setup } = siteSetup(scenario.site, { file: opts.file, read });
+    const now = opts.clock.now();
+    const virtual = opts.clock instanceof VirtualClock;
+    const { locs, ...setup } = siteSetup(scenario.site, {
+      file: opts.file,
+      read,
+      startMs: virtual ? DEFAULT_SITE_MS : now,
+    });
+    const modelStartMs = setup.startMs ?? now;
+    const modelTime = setup.timeMs !== undefined ? 'time' : virtual ? 'default' : 'clock';
     const attachments: Attachment[] = [];
     const byStation = new Map<string, { leaves: string[]; maxA?: number }>();
     for (const inst of instances) {
@@ -138,8 +179,12 @@ export class SiteRun {
               ...(c?.minA !== undefined ? { minA: c.minA } : {}),
             }
           : null,
-      ...(setup.modbus.length > 0 ? { modbus: { meters: setup.modbus } } : {}),
-      ...(setup.timeMs !== undefined ? { timeOffsetMs: setup.timeMs - clock.now() } : {}),
+      ...(setup.modbus.length > 0 && opts.modbus !== 'off'
+        ? { modbus: { meters: setup.modbus, ...(opts.modbus === 'free' ? { freePorts: true } : {}) } }
+        : {}),
+      seriesMs: opts.seriesMs ?? scaled(10_000, opts.speed),
+      loadStepMs: opts.loadStepMs ?? scaled(10_000, opts.speed),
+      ...(modelStartMs !== now ? { timeOffsetMs: modelStartMs - now } : {}),
     });
     runtime.on('log', (m) => opts.log(m));
     runtime.on('trip', (e) =>
@@ -151,9 +196,25 @@ export class SiteRun {
     for (const m of runtime.modbus)
       opts.log(`site: meter ${m.meterId} (${m.map}) on modbus ${m.host}:${m.port} unit ${m.unitId}`);
     for (const i of runtime.site.check()) opts.log(`site check: ${i.message}`);
-    const run = new SiteRun(setup as SiteSetup, runtime, csms, csmsUrl, controller);
+    const run = new SiteRun(setup as SiteSetup, runtime, csms, csmsUrl, controller, modelStartMs, modelTime);
     for (const [k, v] of byStation) run.byStation.set(k, v);
     return run;
+  }
+
+  /** The site block's name. */
+  get name(): string {
+    return this.setup.name;
+  }
+
+  /** One line for a run's header: when the site's model time starts and where that comes from. */
+  describeStart(): string {
+    const why =
+      this.modelTime === 'time'
+        ? 'site time'
+        : this.modelTime === 'default'
+          ? 'default; set it with a site time line'
+          : 'wall clock';
+    return `site ${this.name}: model time starts ${new Date(this.modelStartMs).toISOString()} (${why})`;
   }
 
   /** The EVSE leaves of a station and the rating its attachment gave, if it is wired to the site. */

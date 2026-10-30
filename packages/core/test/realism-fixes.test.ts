@@ -17,7 +17,7 @@ import {
   TransactionCost,
   VirtualClock,
 } from '../src/index';
-import { FakeCsms, until } from './fake-csms';
+import { connectInMemory, FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-06-01T10:00:00Z');
 const MIN = 60_000;
@@ -38,7 +38,15 @@ afterEach(async () => {
 });
 
 async function booted(version: OcppVersion, cfg: Partial<StationConfig> = {}): Promise<Station> {
-  const st = new Station({ id: 'CS1', version, csmsUrl: csms.url, clock, meterIntervalMs: MIN, ...cfg });
+  const st = new Station({
+    id: 'CS1',
+    version,
+    csmsUrl: csms.url,
+    socket: connectInMemory,
+    clock,
+    meterIntervalMs: MIN,
+    ...cfg,
+  });
   st.on('error', () => {});
   open.push(st);
   await st.connect();
@@ -457,7 +465,14 @@ describe('reorder never holds an outbound CALL', () => {
     csms = await FakeCsms.start({ version: 'ocpp1.6' });
     const chaos = new ChaosEngine();
     chaos.add({ match: { direction: 'out' }, effect: { kind: 'reorder' }, once: true });
-    const conn = new Connection({ url: csms.url, identity: 'CP1', version: 'ocpp1.6', clock, chaos });
+    const conn = new Connection({
+      url: csms.url,
+      socket: connectInMemory,
+      identity: 'CP1',
+      version: 'ocpp1.6',
+      clock,
+      chaos,
+    });
     open.push(conn);
     const fired: string[] = [];
     conn.on('chaos', (_rule, frame) => fired.push(String(frame.type)));

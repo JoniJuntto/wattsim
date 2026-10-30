@@ -7,7 +7,8 @@ import { Station, VirtualClock } from '@wattsim/core';
 import type { CallFrame, v16, v201 } from '@wattsim/protocol';
 import { FakeCsms } from '../../core/test/fake-csms';
 import type { ChaosFaultStmt, MeterStmt, NetStmt, RunEvent, RunOptions, RunResult, Stmt } from '../src/index';
-import { driveVirtual, EV_PROPS, evPropNames, format, isIdle, ParseError, parse, run } from '../src/index';
+import { driveVirtual, EV_PROPS, evPropNames, format, isIdle, ParseError, parse } from '../src/index';
+import { run } from './in-memory';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const HOUR = 3_600_000;

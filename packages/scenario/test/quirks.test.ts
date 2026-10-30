@@ -6,17 +6,8 @@ import type { StationConfig } from '@wattsim/core';
 import { Station, VirtualClock } from '@wattsim/core';
 import { FakeCsms, until } from '../../core/test/fake-csms';
 import type { RunEvent, RunOptions, Scenario } from '../src/index';
-import {
-  driveVirtual,
-  format,
-  isIdle,
-  link,
-  ParseError,
-  parse,
-  QuirkError,
-  quirkStatementError,
-  run,
-} from '../src/index';
+import { driveVirtual, format, isIdle, link, ParseError, parse, QuirkError, quirkStatementError } from '../src/index';
+import { run } from './in-memory';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const fixturePath = (name: string) => new URL(`./fixtures/${name}`, import.meta.url).pathname;

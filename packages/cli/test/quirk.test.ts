@@ -5,10 +5,12 @@ import { join } from 'node:path';
 import type { StationConfig } from '@wattsim/core';
 import { Station, VirtualClock } from '@wattsim/core';
 import type { RunEvent } from '@wattsim/scenario';
-import { driveVirtual, isIdle, link, parse, run } from '@wattsim/scenario';
+import { driveVirtual, isIdle, link, parse } from '@wattsim/scenario';
 import { parseTrace, Recorder, readTrace } from '@wattsim/trace';
 import { FakeCsms, until } from '../../core/test/fake-csms';
+import { run } from '../../scenario/test/in-memory';
 import { deriveQuirk, quirkFlags, triggerFor } from '../src/commands/quirk';
+import { MEMORY_CSMS, runInMemory } from './in-memory';
 
 const repoRoot = new URL('../../..', import.meta.url).pathname;
 const T0 = Date.parse('2026-01-01T00:00:00Z');
@@ -29,19 +31,8 @@ async function quirkCli(...args: string[]) {
   return { stdout, stderr, code };
 }
 
-async function wattsim(...args: string[]) {
-  const proc = Bun.spawn(['bun', 'packages/cli/src/index.ts', ...args], {
-    cwd: repoRoot,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { stdout, stderr, code };
-}
+/** `wattsim` in a child process whose stations reach its in-memory CSMS at `MEMORY_CSMS` (see in-memory.ts). */
+const wattsim = (...args: string[]) => runInMemory('packages/cli/src/index.ts', args);
 
 describe('quirkFlags', () => {
   test('collects every --quirk, files by their .ws extension', () => {
@@ -281,24 +272,19 @@ describe('wattsim run --quirk / check --quirk', () => {
       scenario,
       'wattsim 1\n\nstation "A" {\n  version 1.6\n  boot\n  wait 1min\n}\n\nstation "B" {\n  version 2.0.1\n  boot\n  wait 1min\n}\n',
     );
-    const csms = await FakeCsms.start();
-    try {
-      const r = await wattsim(
-        'run',
-        scenario,
-        '--csms',
-        csms.url,
-        '--virtual',
-        '--quirk',
-        join(repoRoot, 'quirks/chatty-heartbeat.ws'),
-      );
-      expect(r.stderr).toBe('');
-      expect(r.code).toBe(0);
-      expect(csms.callsFrom('A', 'Heartbeat').length).toBe(3);
-      expect(csms.callsFrom('B', 'Heartbeat').length).toBe(3);
-    } finally {
-      await csms.stop();
-    }
+    const r = await wattsim(
+      'run',
+      scenario,
+      '--csms',
+      MEMORY_CSMS,
+      '--virtual',
+      '--quirk',
+      join(repoRoot, 'quirks/chatty-heartbeat.ws'),
+    );
+    expect(r.stderr).toBe('');
+    expect(r.code).toBe(0);
+    expect(r.calls.A?.filter((a) => a === 'Heartbeat').length).toBe(3);
+    expect(r.calls.B?.filter((a) => a === 'Heartbeat').length).toBe(3);
     const unknown = await wattsim('run', scenario, '--csms', 'ws://127.0.0.1:1', '--quirk', 'nope');
     expect(unknown.code).toBe(2);
     expect(unknown.stderr).toBe('unknown quirk "nope" (no quirks declared)\n');

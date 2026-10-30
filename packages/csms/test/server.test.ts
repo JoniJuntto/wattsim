@@ -1,4 +1,7 @@
-/** The CSMS over real sockets, with raw WebSocket clients so every frame is under the test's control. */
+/**
+ * The CSMS with raw WebSocket clients so every frame is under the test's control. Clients connect in memory
+ * (memory.test.ts checks that transport against TCP), so no test here depends on free local ports.
+ */
 import { afterEach, describe, expect, test } from 'bun:test';
 import { VirtualClock } from '@wattsim/core';
 import type { CsmsOptions } from '../src/index';
@@ -7,6 +10,8 @@ import {
   CallTimeoutError,
   type Csms,
   CsmsCallError,
+  connectInMemory,
+  type MemorySocket,
   PayloadValidationError,
   startCsms,
   toJUnit,
@@ -24,12 +29,12 @@ afterEach(async () => {
 });
 
 function start(opts: CsmsOptions = {}): Csms {
-  csms = startCsms(opts);
+  csms = startCsms({ listen: false, ...opts });
   return csms;
 }
 
 type Client = {
-  ws: WebSocket;
+  ws: MemorySocket;
   inbox: unknown[][];
   send(frame: unknown[]): void;
   /** The next inbound frame not yet taken. */
@@ -43,7 +48,7 @@ async function connect(
   protocols: string[] = ['ocpp1.6'],
   headers: Record<string, string> = {},
 ): Promise<Client> {
-  const ws = new WebSocket(`${url}/${identity}`, { protocols, headers });
+  const ws = connectInMemory(`${url}/${identity}`, protocols, headers);
   const inbox: unknown[][] = [];
   let taken = 0;
   ws.onmessage = (ev) => inbox.push(JSON.parse(String(ev.data)));
@@ -65,19 +70,20 @@ async function connect(
   return client;
 }
 
-/** The HTTP status a WebSocket upgrade request gets. */
+/** The HTTP status a WebSocket upgrade request gets: 101 when it opens, else the status the refusal reports. */
 async function upgradeStatus(url: string, path: string, protocol: string, auth?: string): Promise<number> {
-  const res = await fetch(`${url.replace(/^ws/, 'http')}${path}`, {
-    headers: {
-      Upgrade: 'websocket',
-      Connection: 'Upgrade',
-      'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
-      'Sec-WebSocket-Version': '13',
-      'Sec-WebSocket-Protocol': protocol,
-      ...(auth ? { Authorization: auth } : {}),
-    },
+  const ws = connectInMemory(`${url}${path}`, [protocol], auth ? { Authorization: auth } : {});
+  return new Promise((resolve) => {
+    let status = 0;
+    ws.onopen = () => {
+      resolve(101);
+      ws.close();
+    };
+    ws.onerror = (ev) => {
+      status = Number(/status code: (\d+)/.exec(ev.message)?.[1] ?? 0);
+    };
+    ws.onclose = () => resolve(status);
   });
-  return res.status;
 }
 
 const basic = (user: string, pw: string) => `Basic ${btoa(`${user}:${pw}`)}`;

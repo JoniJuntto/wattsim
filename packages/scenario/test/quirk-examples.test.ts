@@ -10,7 +10,8 @@ import { Station, VirtualClock } from '@wattsim/core';
 import { MessageType } from '@wattsim/protocol';
 import { FakeCsms, until } from '../../core/test/fake-csms';
 import type { RunEvent, RunOptions } from '../src/index';
-import { driveVirtual, format, isIdle, link, parse, run } from '../src/index';
+import { driveVirtual, format, isIdle, link, parse } from '../src/index';
+import { run } from './in-memory';
 
 const QUIRKS_DIR = new URL('../../../quirks/', import.meta.url).pathname;
 const quirkFile = (name: string) => join(QUIRKS_DIR, `${name}.ws`);

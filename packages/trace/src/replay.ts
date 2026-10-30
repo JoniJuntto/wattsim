@@ -24,13 +24,15 @@
  * expected are not answered. CALLERRORs the proxy injected towards the station, and trace responses that answer no
  * CALL in the trace (orphans), are not expected from the CSMS.
  */
-import type { Clock } from '@wattsim/core';
+import type { Clock, SocketLike } from '@wattsim/core';
 import { WallClock } from '@wattsim/core';
 import type { Frame, OcppVersion } from '@wattsim/protocol';
 import { encodeFrame, MessageType } from '@wattsim/protocol';
 import { partialMatch } from '@wattsim/scenario';
 import type { TraceEntry } from './entry';
 import { correlate, decodeRaw, isCallLike } from './entry';
+
+const WS_OPEN = 1;
 
 export type ReplayOptions = {
   /** CSMS base URL; each identity is appended as the last path segment. */
@@ -52,6 +54,8 @@ export type ReplayOptions = {
   ignoreKeys?: readonly string[];
   /** How long to keep listening after the last entry for CSMS frames the trace does not have; default 1000 ms. */
   settleMs?: number;
+  /** Opens each identity's socket instead of `new WebSocket`, as `ConnectionOptions.socket` does. */
+  socket?: (url: string, protocols: string[], headers: Record<string, string>) => SocketLike;
 };
 
 /**
@@ -195,7 +199,7 @@ class Link {
   private closedWith: string | undefined;
 
   constructor(
-    readonly ws: WebSocket,
+    readonly ws: SocketLike,
     private readonly version: OcppVersion,
   ) {
     ws.onmessage = (ev) => {
@@ -239,10 +243,22 @@ class Link {
   }
 }
 
-function open(url: string, version: OcppVersion, headers: Record<string, string>, clock: Clock, timeoutMs: number) {
-  return new Promise<WebSocket>((resolve, reject) => {
-    const ws = new WebSocket(url, { protocols: [version], headers });
-    ws.binaryType = 'arraybuffer';
+function open(
+  url: string,
+  version: OcppVersion,
+  headers: Record<string, string>,
+  clock: Clock,
+  timeoutMs: number,
+  socket: ReplayOptions['socket'],
+) {
+  return new Promise<SocketLike>((resolve, reject) => {
+    let ws: SocketLike;
+    if (socket) ws = socket(url, [version], headers);
+    else {
+      const real = new WebSocket(url, { protocols: [version], headers });
+      real.binaryType = 'arraybuffer';
+      ws = real;
+    }
     let message = 'connection closed during the handshake';
     const timer = clock.setTimeout(() => {
       ws.close();
@@ -321,9 +337,9 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
     headers.Authorization = `Basic ${btoa(`${opts.basicAuth.user}:${opts.basicAuth.password}`)}`;
   }
   const url = `${opts.csmsUrl.replace(/\/+$/, '')}/${encodeURIComponent(mapIdentity(opts, identity))}`;
-  let ws: WebSocket;
+  let ws: SocketLike;
   try {
-    ws = await open(url, version, headers, clock, timeoutMs);
+    ws = await open(url, version, headers, clock, timeoutMs, opts.socket);
   } catch (err) {
     fail({ kind: 'connect', message: `cannot connect to ${url}: ${err instanceof Error ? err.message : String(err)}` });
     return;
@@ -375,7 +391,7 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
           if (liveId !== sent.id) raw = encodeFrame({ ...sent, id: liveId });
         }
       }
-      if (ws.readyState !== WebSocket.OPEN) break;
+      if (ws.readyState !== WS_OPEN) break;
       if (wire.after !== undefined) held.push({ remaining: wire.after, raw, copies: wire.copies, ...where });
       else transmit(raw, wire.copies);
       continue;
@@ -455,7 +471,7 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
     });
   }
   // Keep listening a little: a CSMS frame the trace does not have may come after its last entry.
-  if (ws.readyState === WebSocket.OPEN) await link.next(() => false, clock, opts.settleMs ?? DEFAULT_SETTLE_MS);
+  if (ws.readyState === WS_OPEN) await link.next(() => false, clock, opts.settleMs ?? DEFAULT_SETTLE_MS);
   for (const l of link.inbox) {
     if (l.used) continue;
     const what = l.frame
@@ -467,5 +483,5 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
       message: `unexpected ${what} from the CSMS (not in the trace)`,
     });
   }
-  if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'replay finished');
+  if (ws.readyState === WS_OPEN) ws.close(1000, 'replay finished');
 }

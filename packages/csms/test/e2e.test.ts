@@ -7,7 +7,7 @@ import type { StationConfig } from '@wattsim/core';
 import { ChaosEngine, Station, VirtualClock } from '@wattsim/core';
 import type { OcppVersion } from '@wattsim/protocol';
 import type { Csms, RuleId } from '../src/index';
-import { startCsms } from '../src/index';
+import { connectInMemory, startCsms } from '../src/index';
 import { until } from './until';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
@@ -25,13 +25,21 @@ afterEach(async () => {
 
 function startServer(): Csms {
   clock = new VirtualClock(T0);
-  csms = startCsms({ clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
+  csms = startCsms({ listen: false, clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
   return csms;
 }
 
 async function station(version: OcppVersion, id: string, cfg: Partial<StationConfig> = {}): Promise<Station> {
   const server = csms as Csms;
-  const st = new Station({ id, version, csmsUrl: server.url, clock, meterIntervalMs: MIN, ...cfg });
+  const st = new Station({
+    id,
+    version,
+    csmsUrl: server.url,
+    socket: connectInMemory,
+    clock,
+    meterIntervalMs: MIN,
+    ...cfg,
+  });
   st.on('error', () => {});
   stations.push(st);
   await st.connect();

@@ -8,11 +8,11 @@ import {
   ParseError,
   parse,
   type RunResult,
-  run,
   type SiteRun,
   siteSetup,
   toJUnit,
 } from '../src/index';
+import { run } from './in-memory';
 
 const SITE = `wattsim 1
 

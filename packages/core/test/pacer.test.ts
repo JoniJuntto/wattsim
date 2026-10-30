@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { ConnectPacer, pace, Station, VirtualClock } from '../src/index';
-import { FakeCsms, until } from './fake-csms';
+import { connectInMemory, FakeCsms, until } from './fake-csms';
 
 describe('ConnectPacer', () => {
   test('grants slots 1/rate apart in call order on the clock', async () => {
@@ -49,7 +49,7 @@ describe('pace', () => {
     const clock = new VirtualClock(0);
     const pacer = new ConnectPacer(clock, 1);
     const stations = ['P-1', 'P-2'].map((id) =>
-      pace(new Station({ id, version: 'ocpp1.6', csmsUrl: csms.url, clock }), pacer),
+      pace(new Station({ id, version: 'ocpp1.6', csmsUrl: csms.url, socket: connectInMemory, clock }), pacer),
     );
     const connecting = stations.map((s) => s.connect());
     await until(() => csms.isConnected('P-1'), 5000, 'P-1 connected');

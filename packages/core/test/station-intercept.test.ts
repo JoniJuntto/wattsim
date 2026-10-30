@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { Violation } from '@wattsim/protocol';
 import { Station, VirtualClock } from '../src/index';
-import { FakeCsms, until } from './fake-csms';
+import { connectInMemory, FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 
@@ -23,7 +23,7 @@ afterEach(async () => {
 });
 
 async function booted(): Promise<Station> {
-  const station = new Station({ id: 'CP1', version: 'ocpp1.6', csmsUrl: csms.url, clock });
+  const station = new Station({ id: 'CP1', version: 'ocpp1.6', csmsUrl: csms.url, socket: connectInMemory, clock });
   station.on('error', () => {});
   open.push(station);
   await station.connect();

@@ -10,7 +10,7 @@ import type { CallFrame, Frame, OcppVersion, v21, v201 } from '@wattsim/protocol
 import { MessageType, validatePayload } from '@wattsim/protocol';
 import type { EvConfig, MeterOptions, StationConfig, Tariff } from '../src/index';
 import { EvModel, MeterModel, ocpp201, PNC_OCSP_RESPONDER, Station, VirtualClock } from '../src/index';
-import { FakeCsms, until } from './fake-csms';
+import { connectInMemory, FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MIN = 60_000;
@@ -30,7 +30,15 @@ afterEach(async () => {
 });
 
 async function booted(version: OcppVersion, cfg: Partial<StationConfig> = {}): Promise<Station> {
-  const st = new Station({ id: 'CS1', version, csmsUrl: csms.url, clock, meterIntervalMs: MIN, ...cfg });
+  const st = new Station({
+    id: 'CS1',
+    version,
+    csmsUrl: csms.url,
+    socket: connectInMemory,
+    clock,
+    meterIntervalMs: MIN,
+    ...cfg,
+  });
   st.on('error', () => {});
   open.push(st);
   await st.connect();

@@ -45,6 +45,8 @@ import {
 } from './conformance';
 import { defaultReply } from './defaults';
 import { Emitter } from './emitter';
+import type { MemoryEndpoint, MemorySocket } from './memory';
+import { connectMemory, listenInMemory } from './memory';
 import type { ConformanceReport } from './report';
 import { addToReport, emptyReport } from './report';
 import type { ConformanceViolation } from './rules';
@@ -70,6 +72,11 @@ export type CertificateSigner = (req: {
 }) => string | Promise<string>;
 
 export type CsmsOptions = {
+  /**
+   * Default true: listen on TCP (`port`, `host`, `tls`). False: no socket is opened; stations reach this CSMS only in
+   * memory, through `connect` or `connectInMemory`, at a `ws://memory-N.invalid` URL. Either way `connect` works.
+   */
+  listen?: boolean;
   /** 0 (default) picks a free port. */
   port?: number;
   /** Default 127.0.0.1. */
@@ -180,7 +187,13 @@ export type CsmsEvents = {
 };
 
 type SocketData = { identity: string; version: OcppVersion };
-type Socket = Bun.ServerWebSocket<SocketData>;
+/** What the CSMS uses of a server-side socket: a `Bun.ServerWebSocket` or the in-memory transport's server end. */
+type Socket = {
+  readonly data: SocketData;
+  readonly readyState: number;
+  send(raw: string): unknown;
+  close(code?: number, reason?: string): void;
+};
 
 type PendingCall = {
   frame: CallFrame;
@@ -565,7 +578,15 @@ export class Csms extends Emitter<CsmsEvents> {
   /** The newest violations found (at most `maxViolations`), oldest first. `report()` counts every one. */
   readonly violations: ConformanceViolation[] = [];
 
-  private readonly server: Bun.Server<SocketData>;
+  /**
+   * A socket factory for `StationConfig.socket` / `ConnectionOptions.socket`: an in-memory connection to this CSMS,
+   * with the same handshake (identity, subprotocol, Basic auth) as over TCP. Ignores the URL's host.
+   */
+  readonly connect: (url: string, protocols?: string[], headers?: Record<string, string>) => MemorySocket;
+
+  private readonly server: Bun.Server<SocketData> | undefined;
+  private readonly unlisten: () => void;
+  private stopped = false;
   private readonly clock: Clock;
   private readonly bySession = new Map<string, Session>();
   private readonly responders = new Map<string, Responder>();
@@ -653,8 +674,93 @@ export class Csms extends Emitter<CsmsEvents> {
       },
     };
 
+    const upgrade = (url: URL, headers: Headers): SocketData | Response => {
+      let identity: string;
+      try {
+        identity = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() ?? '');
+      } catch {
+        return new Response('identity is not valid percent-encoding', { status: 400 });
+      }
+      if (!identity) return new Response('missing station identity in the URL path', { status: 400 });
+      const offered = (headers.get('sec-websocket-protocol') ?? '')
+        .split(',')
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const version = offered.find((p): p is OcppVersion => isOcppVersion(p) && versions.includes(p));
+      if (!version) {
+        return new Response(`unsupported subprotocol; this CSMS speaks ${versions.join(', ')}`, { status: 400 });
+      }
+      const auth = opts.basicAuth;
+      if (auth) {
+        const creds = basicCredentials(headers.get('authorization'));
+        const ok =
+          creds !== undefined &&
+          creds.user === identity &&
+          (typeof auth === 'function'
+            ? auth(identity, creds.password)
+            : Object.hasOwn(auth, identity) && auth[identity] === creds.password);
+        if (!ok) {
+          return new Response('unauthorized', {
+            status: 401,
+            headers: { 'WWW-Authenticate': 'Basic realm="wattsim"' },
+          });
+        }
+      }
+      return { identity, version };
+    };
+    const handlers = {
+      open: (ws: Socket) => {
+        const { identity, version } = ws.data;
+        this.forgetIdle();
+        let session = this.bySession.get(identity);
+        if (!session) {
+          session = new Session({ ...this.host, checker: checkerFor(identity) }, identity, version);
+          this.bySession.set(identity, session);
+        } else if (session.connected) {
+          // A station that reconnects replaces its old connection.
+          const old = session.socket();
+          session.close(1000, 'replaced by a new connection');
+          if (old) this.detach(session, old, 1000, 'replaced by a new connection');
+        }
+        session.attach(ws);
+        this.safeEmit('connected', session);
+      },
+      close: (ws: Socket, code: number, reason: string) => {
+        const session = this.bySession.get(ws.data.identity);
+        if (session) this.detach(session, ws, code, reason);
+        this.forgetIdle();
+      },
+      message: (ws: Socket, message: string | Buffer) => {
+        const session = this.bySession.get(ws.data.identity);
+        if (!session?.isSocket(ws)) return;
+        const raw = typeof message === 'string' ? message : Buffer.from(message).toString('utf8');
+        try {
+          session.onRaw(raw);
+        } catch (err) {
+          this.host.error(err);
+        }
+      },
+    };
+    const memory: MemoryEndpoint<SocketData> = {
+      upgrade: (req) => {
+        if (this.stopped) return null;
+        const r = upgrade(req.url, req.headers);
+        return r instanceof Response ? { status: r.status } : { data: r, protocol: r.version };
+      },
+      ...handlers,
+    };
+    this.connect = (url, protocols = [], headers = {}) => connectMemory(memory, url, protocols, headers);
+
     const tls = opts.tls;
     const host = opts.host ?? '127.0.0.1';
+    if (opts.listen === false) {
+      this.server = undefined;
+      this.port = 0;
+      const listening = listenInMemory(memory);
+      this.url = listening.url;
+      this.unlisten = listening.close;
+      return;
+    }
     this.server = Bun.serve<SocketData>({
       port: opts.port ?? 0,
       hostname: host,
@@ -671,80 +777,17 @@ export class Csms extends Emitter<CsmsEvents> {
           }
         : {}),
       fetch: (req, server) => {
-        const url = new URL(req.url);
-        let identity: string;
-        try {
-          identity = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() ?? '');
-        } catch {
-          return new Response('identity is not valid percent-encoding', { status: 400 });
-        }
-        if (!identity) return new Response('missing station identity in the URL path', { status: 400 });
-        const offered = (req.headers.get('sec-websocket-protocol') ?? '')
-          .split(',')
-          .map((p) => p.trim())
-          .filter(Boolean);
-        const version = offered.find((p): p is OcppVersion => isOcppVersion(p) && versions.includes(p));
-        if (!version) {
-          return new Response(`unsupported subprotocol; this CSMS speaks ${versions.join(', ')}`, { status: 400 });
-        }
-        const auth = opts.basicAuth;
-        if (auth) {
-          const creds = basicCredentials(req.headers.get('authorization'));
-          const ok =
-            creds !== undefined &&
-            creds.user === identity &&
-            (typeof auth === 'function'
-              ? auth(identity, creds.password)
-              : Object.hasOwn(auth, identity) && auth[identity] === creds.password);
-          if (!ok) {
-            return new Response('unauthorized', {
-              status: 401,
-              headers: { 'WWW-Authenticate': 'Basic realm="wattsim"' },
-            });
-          }
-        }
-        const upgraded = server.upgrade(req, {
-          data: { identity, version },
-          headers: { 'Sec-WebSocket-Protocol': version },
-        });
+        const data = upgrade(new URL(req.url), req.headers);
+        if (data instanceof Response) return data;
+        const upgraded = server.upgrade(req, { data, headers: { 'Sec-WebSocket-Protocol': data.version } });
         return upgraded ? undefined : new Response('expected a WebSocket upgrade', { status: 400 });
       },
-      websocket: {
-        open: (ws) => {
-          const { identity, version } = ws.data;
-          this.forgetIdle();
-          let session = this.bySession.get(identity);
-          if (!session) {
-            session = new Session({ ...this.host, checker: checkerFor(identity) }, identity, version);
-            this.bySession.set(identity, session);
-          } else if (session.connected) {
-            // A station that reconnects replaces its old connection.
-            const old = session.socket();
-            session.close(1000, 'replaced by a new connection');
-            if (old) this.detach(session, old, 1000, 'replaced by a new connection');
-          }
-          session.attach(ws);
-          this.safeEmit('connected', session);
-        },
-        close: (ws, code, reason) => {
-          const session = this.bySession.get(ws.data.identity);
-          if (session) this.detach(session, ws, code, reason);
-          this.forgetIdle();
-        },
-        message: (ws, message) => {
-          const session = this.bySession.get(ws.data.identity);
-          if (!session?.isSocket(ws)) return;
-          const raw = typeof message === 'string' ? message : Buffer.from(message).toString('utf8');
-          try {
-            session.onRaw(raw);
-          } catch (err) {
-            this.host.error(err);
-          }
-        },
-      },
+      websocket: handlers,
     });
     this.port = this.server.port ?? 0;
     this.url = `${tls ? 'wss' : 'ws'}://${urlHost(host)}:${this.port}`;
+    // Reachable in memory at its TCP URL too (`connectInMemory`), e.g. a CSMS a scenario's site starts itself.
+    this.unlisten = tls ? () => {} : listenInMemory(memory, this.url).close;
   }
 
   /** The session of a station that has connected at least once. */
@@ -789,8 +832,10 @@ export class Csms extends Emitter<CsmsEvents> {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     for (const session of this.bySession.values()) session.close(1001, 'CSMS stopping');
-    await this.server.stop(true);
+    this.unlisten();
+    await this.server?.stop(true);
   }
 
   /** Drop the sessions of stations disconnected for `forgetAfterMs` or longer. */

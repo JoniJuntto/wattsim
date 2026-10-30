@@ -11,7 +11,7 @@ let csms: FakeCsms;
 let proxy: OcppProxy | undefined;
 
 beforeEach(async () => {
-  csms = await FakeCsms.start();
+  csms = await FakeCsms.start({ listen: true });
 });
 afterEach(async () => {
   await proxy?.stop();
@@ -73,7 +73,7 @@ describe('pass-through', () => {
   });
 
   test('passes the Authorization header and mirrors the subprotocol upstream picks', async () => {
-    const strict = await FakeCsms.start({ version: 'ocpp2.0.1' });
+    const strict = await FakeCsms.start({ listen: true, version: 'ocpp2.0.1' });
     try {
       proxy = await startProxy({ listen: 0, upstream: strict.url });
       const ws = new WebSocket(`${proxy.url}/any/path/CP-AUTH`, {
@@ -93,7 +93,7 @@ describe('pass-through', () => {
   });
 
   test('an upstream refusal reaches the charger with the same HTTP status', async () => {
-    const strict = await FakeCsms.start({ version: 'ocpp2.0.1' });
+    const strict = await FakeCsms.start({ listen: true, version: 'ocpp2.0.1' });
     try {
       proxy = await startProxy({ listen: 0, upstream: strict.url });
       const refused: Array<[string, number]> = [];

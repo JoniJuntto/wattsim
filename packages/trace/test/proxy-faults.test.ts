@@ -17,7 +17,7 @@ let sclock: VirtualClock;
 let recorder: Recorder;
 
 beforeEach(async () => {
-  csms = await FakeCsms.start();
+  csms = await FakeCsms.start({ listen: true });
   pclock = new VirtualClock(T0);
   sclock = new VirtualClock(T0);
   recorder = new Recorder();

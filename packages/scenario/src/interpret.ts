@@ -186,6 +186,8 @@ export type RunOptions = {
   allowPlugins?: boolean;
   /** Overrides the site block's `controller` (`wattsim run --controller`). */
   siteController?: 'reference' | 'none';
+  /** The site's Modbus meters: on their ports (default), on free ports, or off (`SiteRunOptions.modbus`). */
+  siteModbus?: 'on' | 'free' | 'off';
   /** Called with the site runtime once it started (before any station), for live views and `--site-report`. */
   onSite?: (site: SiteRun) => void;
   /**
@@ -664,6 +666,8 @@ class Run {
         profiles: this.linked?.profiles ?? new Map(),
         ...(externalUrl !== undefined ? { externalUrl } : {}),
         ...(this.opts.siteController ? { controller: this.opts.siteController } : {}),
+        ...(this.opts.siteModbus ? { modbus: this.opts.siteModbus } : {}),
+        ...(this.wallClock && this.speed !== 1 ? { speed: this.speed } : {}),
         log: (message) => this.emit({ type: 'log', message, at: this.clock.now() }),
       });
       csmsUrl = this.site.csmsUrl;

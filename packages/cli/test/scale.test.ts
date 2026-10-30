@@ -1,26 +1,13 @@
 /** `wattsim run` flags for horizontal scale: --shard, --ids, --metrics-port-base and --connect-rate. */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FakeCsms } from '../../core/test/fake-csms';
 import { parseIds, parseShard } from '../src/load';
+import { type CliRun, MEMORY_CSMS, runInMemory } from './in-memory';
 
-const repoRoot = new URL('../../..', import.meta.url).pathname;
-
-async function cli(...args: string[]) {
-  const proc = Bun.spawn(['bun', 'packages/cli/src/index.ts', ...args], {
-    cwd: repoRoot,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { stdout, stderr, code };
-}
+/** `wattsim` in a child process with its own in-memory CSMS at `MEMORY_CSMS` (see in-memory.ts). */
+const cli = (...args: string[]) => runInMemory('packages/cli/src/index.ts', args);
 
 const scratch = await mkdtemp(join(tmpdir(), 'wattsim-scale-'));
 const fleet = join(scratch, 'fleet.ws');
@@ -50,18 +37,18 @@ describe('flag parsing', () => {
 });
 
 describe('wattsim run across processes', () => {
-  let csms: FakeCsms;
-  let csmsUrl: string;
-  beforeAll(async () => {
-    csms = await FakeCsms.start();
-    csmsUrl = `${csms.url}/ocpp`;
-  });
-  afterAll(() => csms.stop());
+  const csmsUrl = `${MEMORY_CSMS}/ocpp`;
 
-  const booted = () =>
-    Array.from({ length: 6 }, (_, k) => `CP-${k + 1}`).filter(
-      (id) => csms.callsFrom(id, 'BootNotification').length > 0,
-    );
+  /** BootNotifications per identity, over the CSMS of every run (each process has its own). */
+  const boots = (runs: CliRun[]) => {
+    const n: Record<string, number> = {};
+    for (const r of runs) {
+      for (const [id, actions] of Object.entries(r.calls)) {
+        n[id] = (n[id] ?? 0) + actions.filter((a) => a === 'BootNotification').length;
+      }
+    }
+    return n;
+  };
 
   test('three --shard processes boot every station exactly once between them', async () => {
     const runs = await Promise.all(
@@ -71,8 +58,7 @@ describe('wattsim run across processes', () => {
     expect(runs[1]?.stdout).toMatch(/^CP-2\s+ok/m);
     expect(runs[1]?.stdout).toMatch(/^CP-5\s+ok/m);
     expect(runs[1]?.stdout).toContain('2 stations, 0 failed');
-    for (const id of booted()) expect(csms.callsFrom(id, 'BootNotification')).toHaveLength(1);
-    expect(booted()).toHaveLength(6);
+    expect(boots(runs)).toEqual({ 'CP-1': 1, 'CP-2': 1, 'CP-3': 1, 'CP-4': 1, 'CP-5': 1, 'CP-6': 1 });
   });
 
   test('--ids keeps a range of the fleet and says so', async () => {

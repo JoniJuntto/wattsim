@@ -285,6 +285,7 @@ export const run = defineCommand({
       ...(siteController ? { siteController: siteController as 'reference' | 'none' } : {}),
       onSite: (s) => {
         site = s;
+        printer.write(`${s.describeStart()}\n`);
       },
       clock,
       csmsUrl: args.csms || undefined,

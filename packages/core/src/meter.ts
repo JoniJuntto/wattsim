@@ -117,9 +117,13 @@ export class MeterModel {
     return (this.powerKw * 1000) / (this.phasesInUse * this.voltageV);
   }
 
-  sample(clock: Clock, soc?: number): MeterSample {
+  /**
+   * A sample now. `atV` is the voltage at the meter when it is not the nominal one (a supply that drops under
+   * load); the current is derived from it, so power = voltage x current x phases in use holds in every sample.
+   */
+  sample(clock: Clock, soc?: number, atV: number = this.voltageV): MeterSample {
     const powerKw = this.jitter(this.powerKw);
-    const voltageV = this.jitter(this.voltageV);
+    const voltageV = this.jitter(atV);
     const currentA = (powerKw * 1000) / (this.phasesInUse * voltageV);
     const s: MeterSample = { energyWh: this.energyWh, powerKw, voltageV, currentA, timestamp: isoTimestamp(clock) };
     if (soc !== undefined) s.soc = soc;

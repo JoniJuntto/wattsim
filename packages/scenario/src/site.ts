@@ -59,6 +59,11 @@ export type SiteSetup = {
   controller?: ControllerStmt;
   /** Epoch ms of the site `time`, when given. */
   timeMs?: number;
+  /**
+   * Model time the site starts at: its `time`, else the `startMs` passed to `siteSetup`. Relative load profiles
+   * that do not loop (seconds or HH:MM rows) count from it. Undefined when neither was given.
+   */
+  startMs?: number;
   checks: SiteExpectStmt[];
 };
 
@@ -351,9 +356,13 @@ function fieldOf(type: SiteNode['type'], key: string): string {
  * The site block as a description. `read` returns a load profile's text (without it every profile reads as a flat
  * 0 W, which is how the parser validates without touching files). Throws `ParseError`.
  */
+/**
+ * The site block as a grid description. `startMs` is the model time the site starts at when the block has no
+ * `time` line (the run's start); relative load profiles without `loop` are anchored at the site's start.
+ */
 export function siteSetup(
   block: SiteBlock,
-  opts: { file?: string; read?: ProfileReader } = {},
+  opts: { file?: string; read?: ProfileReader; startMs?: number } = {},
 ): SiteSetup & {
   locs: Map<string, Loc>;
 } {
@@ -407,6 +416,8 @@ export function siteSetup(
       opts.file,
     );
   }
+  const startMs = timeMs ?? opts.startMs;
+  if (startMs !== undefined) anchorProfiles(nodes, startMs);
   const description: SiteDescription = { name, supply, nodes, ...(tolerance ? { tolerance } : {}) };
   return {
     name,
@@ -414,9 +425,22 @@ export function siteSetup(
     modbus: b.modbus,
     ...(controller ? { controller } : {}),
     ...(timeMs !== undefined ? { timeMs } : {}),
+    ...(startMs !== undefined ? { startMs } : {}),
     checks,
     locs: b.locs,
   };
+}
+
+/**
+ * Relative rows of a profile that does not loop count from `startMs` (as `load ... profile` in a station does from
+ * the moment it runs), not from the Unix epoch. Absolute and looped profiles ignore it.
+ */
+function anchorProfiles(nodes: readonly NodeDescription[], startMs: number): void {
+  for (const n of nodes) {
+    if (n.kind === 'load' && n.model?.type === 'profile' && n.model.startMs === undefined) n.model.startMs = startMs;
+    const children = (n as { children?: readonly NodeDescription[] }).children;
+    if (children) anchorProfiles(children, startMs);
+  }
 }
 
 /** Where a validation issue was written: its own path, else the nearest enclosing one, else the site block. */

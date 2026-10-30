@@ -29,6 +29,8 @@ export {
 } from './conformance';
 export type { DefaultContext } from './defaults';
 export { defaultReply } from './defaults';
+export type { MemoryEndpoint, MemoryServerSocket, MemoryUpgradeRequest } from './memory';
+export { connectInMemory, connectMemory, listenInMemory, listensInMemory, MemorySocket } from './memory';
 export type { ConformanceReport, Tally } from './report';
 export { addToReport, buildReport, emptyReport, toJUnit } from './report';
 export type { ConformanceViolation, RuleId, Severity } from './rules';

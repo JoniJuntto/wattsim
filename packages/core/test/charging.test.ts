@@ -8,7 +8,7 @@ import type { CallFrame, OcppVersion, v16, v201 } from '@wattsim/protocol';
 import { validatePayload } from '@wattsim/protocol';
 import type { ChargingEnv, ChargingProfile, StationConfig } from '../src/index';
 import { ProfileStore, Station, VirtualClock } from '../src/index';
-import { FakeCsms, until } from './fake-csms';
+import { connectInMemory, FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MINUTE = 60_000;
@@ -442,7 +442,7 @@ const open: Station[] = [];
 async function booted(version: OcppVersion, opts: Partial<StationConfig> = {}): Promise<Station> {
   for (let attempt = 0; attempt < 5; attempt++) {
     clock = new VirtualClock(T0);
-    const station = new Station({ id: 'CP1', version, csmsUrl: csms.url, clock, ...opts });
+    const station = new Station({ id: 'CP1', version, csmsUrl: csms.url, socket: connectInMemory, clock, ...opts });
     const errors: Error[] = [];
     station.on('error', (err) => errors.push(err));
     open.push(station);

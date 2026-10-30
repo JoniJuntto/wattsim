@@ -85,8 +85,11 @@ export type ConnectionOptions = {
    * `QueueOverflowError`; when every queued message is a transaction message, the oldest one goes.
    */
   maxQueue?: number;
-  /** Opens the socket instead of `new WebSocket` (an in-memory transport, e.g. a CSMS in the same page). */
-  socket?: (url: string, protocols: string[]) => SocketLike;
+  /**
+   * Opens the socket instead of `new WebSocket` (an in-memory transport, e.g. a CSMS in the same page). `headers`
+   * holds what the upgrade request would carry (`Authorization` for Basic auth); TLS settings do not apply.
+   */
+  socket?: (url: string, protocols: string[], headers: Record<string, string>) => SocketLike;
 };
 
 export type ConnectionEvents = {
@@ -433,7 +436,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   private open(): void {
     this.setState('Connecting');
     const ws: SocketLike = this.socket
-      ? this.socket(this.url, [this.version])
+      ? this.socket(this.url, [this.version], { ...this.headers })
       : this.tls
         ? new BunWebSocket(this.url, { protocols: [this.version], headers: this.headers, tls: this.tls })
         : new BunWebSocket(this.url, { protocols: [this.version], headers: this.headers });

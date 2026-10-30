@@ -4,7 +4,8 @@ import { Station, VirtualClock, WallClock } from '@wattsim/core';
 import type { v16 } from '@wattsim/protocol';
 import { CsmsCallError, FakeCsms, until } from '../../core/test/fake-csms';
 import type { RunEvent, RunOptions, RunResult, Scenario } from '../src/index';
-import { driveVirtual, isIdle, ParseError, parse, run } from '../src/index';
+import { driveVirtual, isIdle, ParseError, parse } from '../src/index';
+import { run } from './in-memory';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MINUTE = 60_000;

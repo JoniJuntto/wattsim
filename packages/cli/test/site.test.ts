@@ -2,23 +2,16 @@ import { expect, test } from 'bun:test';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { runInMemory } from './in-memory';
+
+// The depot example pins its Modbus meter to port 1502: the child runs listen on free ports instead.
+process.env.WATTSIM_MODBUS_FREE_PORTS = '1';
 
 const repoRoot = new URL('../../..', import.meta.url).pathname;
 const depot = join(repoRoot, 'examples/dlm-depot.ws');
 
-async function cli(...args: string[]) {
-  const proc = Bun.spawn(['bun', 'packages/cli/src/index.ts', ...args], {
-    cwd: repoRoot,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { stdout, stderr, code };
-}
+/** `wattsim` in a child process; the site's own CSMS is reached in memory (see in-memory.ts). */
+const cli = (...args: string[]) => runInMemory('packages/cli/src/index.ts', args);
 
 test('the depot under the reference controller: score table, site report and JUnit properties', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'wattsim-site-'));
@@ -33,7 +26,10 @@ test('the depot under the reference controller: score table, site report and JUn
   expect(json.format).toBe('wattsim-site-report');
   expect(json.leaves).toHaveLength(20);
   expect(json.series.t.length).toBeGreaterThan(100);
-  expect(json.allocations.length).toBeGreaterThan(100);
+  // Version 2: `allocations` holds the keyframes, `allocationSteps` every step (see `decodeAllocations`).
+  expect(json.version).toBe(2);
+  expect(json.allocationSteps.length).toBeGreaterThan(100);
+  expect(json.allocations.length).toBeGreaterThan(0);
   expect(json.score.trips).toBe(0);
   const xml = await Bun.file(junit).text();
   expect(xml).toContain('<property name="dlm.trips" value="0"/>');

@@ -7,7 +7,8 @@ import type { StationConfig } from '@wattsim/core';
 import { Station, VirtualClock } from '@wattsim/core';
 import { FakeCsms } from '../../core/test/fake-csms';
 import type { FleetSelection, RunEvent, RunResult } from '../src/index';
-import { driveVirtual, isIdle, ParseError, parse, run, selectionProblem } from '../src/index';
+import { driveVirtual, isIdle, ParseError, parse, selectionProblem } from '../src/index';
+import { run } from './in-memory';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 
