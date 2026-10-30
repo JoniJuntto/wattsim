@@ -11,8 +11,12 @@ import { decodeFrame, MessageType } from '@wattsim/protocol';
  */
 export type TraceDirection = 'out' | 'in';
 
-/** What a proxy chaos rule did to a frame. The frame itself is recorded as its sender sent it. */
-export type ChaosNote = { rule?: string; effect: string; delayMs?: number };
+/**
+ * What a proxy chaos rule did to a frame. The frame itself is recorded as its sender sent it; what reached the other
+ * side is `delivered` when the rule changed the text (corrupt, wrongId, callError on a CALLRESULT, mutate), sent
+ * `copies` times when not once (duplicate). A dropped frame (drop, noResponse, callError on a CALL) reached nothing.
+ */
+export type ChaosNote = { rule?: string; effect: string; delayMs?: number; copies?: number; delivered?: string };
 
 export type TraceEntry = {
   /** Epoch milliseconds when the message was observed. */
@@ -83,55 +87,85 @@ export function isCallLike(f: Frame): f is Extract<Frame, { action: string }> {
   return f.type === MessageType.Call || f.type === MessageType.Send;
 }
 
+/** Default bound on the CALLs a streaming `Correlator` keeps waiting for an answer. */
+export const MAX_PENDING_CALLS = 1000;
+
+type OpenCall = { index: number; action: string };
+
 /**
  * Streaming correlation, the Open OCPP Trace rule (conformance/README.md) scoped to one identity: a CALLRESULT or
  * CALLERROR answers the most recent preceding CALL with the same message id, sent in the opposite direction, that
  * nothing has answered yet. A 2.1 SEND is never answered and a CALLRESULTERROR answers a CALLRESULT, so neither
  * takes part.
+ *
+ * Memory is bounded for long proxy and recorder sessions: a CALL is forgotten once it is answered, and at most
+ * `maxPending` unanswered CALLs are kept; past that the oldest is dropped, so a very late answer to it no longer
+ * correlates.
  */
 export class Correlator {
-  private readonly open = new Map<string, number[]>();
-  private readonly actions: string[] = [];
+  /** Unanswered CALLs by identity, direction and id; the last element is the most recent. */
+  private readonly open = new Map<string, OpenCall[]>();
+  /** The same CALLs by feed index, oldest first, for eviction. */
+  private readonly pending = new Map<number, string>();
+  private fed = 0;
+
+  constructor(readonly maxPending: number = MAX_PENDING_CALLS) {}
+
+  /** Unanswered CALLs held right now. */
+  get pendingCalls(): number {
+    return this.pending.size;
+  }
 
   /**
    * Feed the next entry. Returns its effective action (a CALL's own action, or the action of the CALL a response
    * answers) and, for a correlated response, the index (in feed order) of its CALL.
    */
   observe(e: TraceEntry): { action?: string; callIndex?: number } {
-    const index = this.actions.length;
+    const index = this.fed++;
     const f = e.frame;
-    if (!f) {
-      this.actions.push('');
-      return {};
-    }
+    if (!f) return {};
     if (isCallLike(f)) {
-      this.actions.push(f.action);
       if (f.type === MessageType.Call) {
         const key = `${e.identity}\0${e.dir}\0${f.id}`;
         const stack = this.open.get(key);
-        if (stack) stack.push(index);
-        else this.open.set(key, [index]);
+        if (stack) stack.push({ index, action: f.action });
+        else this.open.set(key, [{ index, action: f.action }]);
+        this.pending.set(index, key);
+        if (this.pending.size > this.maxPending) this.evictOldest();
       }
       return { action: f.action };
     }
     if (f.type === MessageType.CallResult || f.type === MessageType.CallError) {
       const key = `${e.identity}\0${opposite(e.dir)}\0${f.id}`;
       const stack = this.open.get(key);
-      const callIndex = stack?.pop();
+      const call = stack?.pop();
       if (stack && stack.length === 0) this.open.delete(key);
-      if (callIndex !== undefined) {
-        const action = this.actions[callIndex] as string;
-        this.actions.push(action);
-        return { action, callIndex };
+      if (call) {
+        this.pending.delete(call.index);
+        return { action: call.action, callIndex: call.index };
       }
     }
-    this.actions.push('');
     return {};
+  }
+
+  private evictOldest(): void {
+    const first = this.pending.entries().next();
+    if (first.done) return;
+    const [index, key] = first.value;
+    this.pending.delete(index);
+    const stack = this.open.get(key);
+    if (!stack) return;
+    const at = stack.findIndex((c) => c.index === index);
+    if (at >= 0) stack.splice(at, 1);
+    if (stack.length === 0) this.open.delete(key);
   }
 }
 
-/** Effective action and correlated CALL index for every entry, in order. */
+/**
+ * Effective action and correlated CALL index for every entry, in order. The whole trace is in memory already, so
+ * nothing is evicted here.
+ */
 export function correlate(entries: readonly TraceEntry[]): Array<{ action?: string; callIndex?: number }> {
-  const c = new Correlator();
+  const c = new Correlator(Number.POSITIVE_INFINITY);
   return entries.map((e) => c.observe(e));
 }

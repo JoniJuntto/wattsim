@@ -1,9 +1,21 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { VirtualClock } from '@wattsim/core';
-import { CsmsCallError, FakeCsms } from '../../core/test/fake-csms';
+import { ChaosEngine, VirtualClock } from '@wattsim/core';
+import { CsmsCallError, FakeCsms, until } from '../../core/test/fake-csms';
 import type { ReplayReport, TraceEntry } from '../src/index';
-import { correlate, loosen, parseTrace, Recorder, readTrace, replay } from '../src/index';
-import { recordSession16, T0, tmpPath } from './helpers';
+import {
+  correlate,
+  DEFAULT_IGNORE_KEYS,
+  ignoreMatcher,
+  loosen,
+  makeEntry,
+  parseChaosRules,
+  parseTrace,
+  Recorder,
+  readTrace,
+  replay,
+  startProxy,
+} from '../src/index';
+import { newStation, recordSession16, settle, T0, tmpPath } from './helpers';
 
 /** A CSMS that sends GetConfiguration right after answering the first MeterValues, as in the recorded session. */
 async function csmsWithTrigger(opts: { authorize?: unknown } = {}): Promise<{ csms: FakeCsms; answers: unknown[] }> {
@@ -182,7 +194,7 @@ describe('pacing', () => {
 
 describe('loose comparison', () => {
   test('ids and timestamps are ignored, everything else counts', () => {
-    const ignore = new Set(['transactionId']);
+    const ignore = ignoreMatcher(['transactionId']);
     expect(
       loosen({ transactionId: 4, currentTime: '2026-01-01T00:00:00.000Z', n: [1, '2026-01-01T00:00:00Z'] }, ignore),
     ).toEqual({
@@ -202,5 +214,246 @@ describe('loose comparison', () => {
     );
     const report = await replay(raw, { csmsUrl: csms.url, virtual: true });
     expect(report).toMatchObject({ ok: true, sent: 1, expectations: 1, matched: 1 });
+  });
+});
+
+/** A 1.6 entry for identity `R` at T0 + `ms`, with extra fields (chaos, injected). */
+function entry(ms: number, dir: 'in' | 'out', raw: string, extra: Partial<TraceEntry> = {}): TraceEntry {
+  return Object.assign(makeEntry({ ts: T0 + ms, dir, identity: 'R', version: 'ocpp1.6', raw }), extra);
+}
+
+describe('chaos in the trace: replay sends what reached the CSMS', () => {
+  test('a trace recorded through a chaos proxy replays cleanly against the same CSMS', async () => {
+    const csms = await FakeCsms.start();
+    targets.push(csms);
+    const path = await tmpPath('chaos.jsonl');
+    const proxy = await startProxy({
+      listen: 0,
+      upstream: csms.url,
+      record: path,
+      chaos: () => {
+        const engine = new ChaosEngine();
+        for (const rule of parseChaosRules('drop out Heartbeat nth 1')) engine.add(rule);
+        return engine;
+      },
+    });
+    const clock = new VirtualClock(T0);
+    const station = newStation(`${proxy.url}/ocpp`, clock);
+    await station.connect();
+    await station.boot();
+    await settle(station, clock);
+    void station.sendHeartbeat().catch(() => {}); // dropped by the proxy, never answered
+    await Bun.sleep(50);
+    await station.disconnect();
+    await proxy.stop();
+    const recorded = await readTrace(path);
+    expect(recorded.filter((e) => e.chaos).map((e) => e.chaos?.effect)).toEqual(['drop']);
+    const report = await replay(recorded, { csmsUrl: csms.url, virtual: true, timeoutMs: 1000, settleMs: 100 });
+    expect(report.mismatches).toEqual([]);
+    expect(report.ok).toBe(true);
+    await Bun.sleep(50); // let anything sent reach the CSMS
+    expect(csms.callsFrom('CP-REC', 'Heartbeat').length).toBe(0);
+  });
+
+  test('a dropped station frame is not sent', async () => {
+    const csms = await FakeCsms.start();
+    targets.push(csms);
+    const report = await replay(
+      [
+        entry(0, 'out', '[2,"h1","Heartbeat",{}]', { chaos: { rule: 'chaos-1', effect: 'drop' } }),
+        entry(1, 'out', '[2,"h2","Heartbeat",{}]'),
+        entry(2, 'in', '[3,"h2",{"currentTime":"2026-01-01T00:00:00Z"}]'),
+      ],
+      { csmsUrl: csms.url, virtual: true, timeoutMs: 1000, settleMs: 100 },
+    );
+    expect(report).toMatchObject({ ok: true, sent: 1, matched: 1, notes: [] });
+    expect(csms.callsFrom('R').map((c) => c.id)).toEqual(['h2']);
+  });
+
+  test('a corrupted frame is sent as delivered, or skipped with a note when the trace lacks the bytes', async () => {
+    const csms = await FakeCsms.start();
+    targets.push(csms);
+    const raw = '[2,"h1","Heartbeat",{}]';
+    const report = await replay(
+      [
+        entry(0, 'out', raw, { chaos: { effect: 'corrupt', delivered: raw.slice(0, -1) } }),
+        entry(1, 'out', '[2,"h2","Heartbeat",{}]', { chaos: { rule: 'r2', effect: 'corrupt' } }),
+      ],
+      { csmsUrl: csms.url, virtual: true, timeoutMs: 1000, settleMs: 100 },
+    );
+    expect(csms.invalid).toEqual([raw.slice(0, -1)]);
+    expect(csms.callsFrom('R')).toEqual([]);
+    expect(report.ok).toBe(true);
+    expect(report.sent).toBe(1);
+    expect(report.notes).toEqual([
+      {
+        identity: 'R',
+        index: 1,
+        message:
+          "not sent: the proxy's chaos (corrupt, rule r2) changed this frame and the trace does not record what it passed on",
+      },
+    ]);
+  });
+
+  test('a station answer the proxy turned into a CALLERROR is sent as that CALLERROR, re-addressed', async () => {
+    const csms = await FakeCsms.start();
+    targets.push(csms);
+    const outcome: unknown[] = [];
+    csms.respondWith('Heartbeat', (_p, id) => {
+      setTimeout(() => {
+        csms.call(id, 'GetConfiguration', {}).then(
+          (a) => outcome.push(a),
+          (e: Error) => outcome.push(e.message),
+        );
+      }, 0);
+      return { currentTime: new Date().toISOString() };
+    });
+    const report = await replay(
+      [
+        entry(0, 'out', '[2,"h1","Heartbeat",{}]'),
+        entry(1, 'in', '[3,"h1",{"currentTime":"2026-01-01T00:00:00Z"}]'),
+        entry(2, 'in', '[2,"g1","GetConfiguration",{}]'),
+        entry(3, 'out', '[3,"g1",{"configurationKey":[]}]', {
+          chaos: {
+            effect: 'callError',
+            delivered: '[4,"g1","InternalError","injected by chaos",{}]',
+          },
+        }),
+      ],
+      { csmsUrl: csms.url, virtual: true, timeoutMs: 1000, settleMs: 100 },
+    );
+    expect(report.mismatches).toEqual([]);
+    expect(outcome).toEqual(['CALLERROR InternalError: injected by chaos']);
+  });
+
+  test('the CALLERROR the proxy injected for a CSMS CALL is sent; one injected for a station CALL is not expected', async () => {
+    const csms = await FakeCsms.start();
+    targets.push(csms);
+    const outcome: unknown[] = [];
+    csms.respondWith('Heartbeat', (_p, id) => {
+      setTimeout(() => {
+        csms.call(id, 'Reset', { type: 'Soft' }).then(
+          (a) => outcome.push(a),
+          (e: Error) => outcome.push(e.message),
+        );
+      }, 0);
+      return { currentTime: new Date().toISOString() };
+    });
+    const report = await replay(
+      [
+        entry(0, 'out', '[2,"a1","Authorize",{"idTag":"T"}]', { chaos: { effect: 'callError' } }),
+        entry(0, 'in', '[4,"a1","InternalError","injected by chaos",{}]', { injected: true }),
+        entry(1, 'out', '[2,"h1","Heartbeat",{}]'),
+        entry(2, 'in', '[3,"h1",{"currentTime":"2026-01-01T00:00:00Z"}]'),
+        entry(3, 'in', '[2,"r1","Reset",{"type":"Soft"}]', { chaos: { effect: 'callError' } }),
+        entry(3, 'out', '[4,"r1","InternalError","injected by chaos",{}]', { injected: true }),
+      ],
+      { csmsUrl: csms.url, virtual: true, timeoutMs: 1000, settleMs: 100 },
+    );
+    expect(report.mismatches).toEqual([]);
+    expect(report).toMatchObject({ ok: true, sent: 2, expectations: 2, matched: 2 });
+    expect(csms.callsFrom('R').map((c) => c.action)).toEqual(['Heartbeat']);
+    expect(outcome).toEqual(['CALLERROR InternalError: injected by chaos']);
+  });
+
+  test('a duplicated station frame is sent as many times as the proxy passed it on', async () => {
+    const csms = await FakeCsms.start();
+    targets.push(csms);
+    const report = await replay(
+      [entry(0, 'out', '[2,"d1","DataTransfer",{"vendorId":"v"}]', { chaos: { effect: 'duplicate', copies: 3 } })],
+      { csmsUrl: csms.url, virtual: true, timeoutMs: 1000, settleMs: 0 },
+    );
+    expect(report.sent).toBe(3);
+    await until(() => csms.callsFrom('R').length === 3, 1000, 'three copies');
+  });
+});
+
+describe('settle window', () => {
+  test('a CSMS frame that arrives after the last trace entry is reported', async () => {
+    const csms = await FakeCsms.start();
+    targets.push(csms);
+    csms.respondWith('Heartbeat', (_p, id) => {
+      setTimeout(() => void csms.call(id, 'Reset', { type: 'Hard' }).catch(() => {}), 5);
+      return { currentTime: new Date().toISOString() };
+    });
+    const report = await replay(
+      [entry(0, 'out', '[2,"h1","Heartbeat",{}]'), entry(1, 'in', '[3,"h1",{"currentTime":"2026-01-01T00:00:00Z"}]')],
+      { csmsUrl: csms.url, virtual: true, timeoutMs: 1000 },
+    );
+    expect(report.ok).toBe(false);
+    expect(report.mismatches.map((m) => [m.kind, m.message])).toEqual([
+      ['unexpected', 'unexpected CALL Reset from the CSMS (not in the trace)'],
+    ]);
+  });
+});
+
+describe('ignore keys are paths', () => {
+  test('the defaults drop CSMS-assigned ids and keep evse.id, connectorId and evseId', () => {
+    const ignore = ignoreMatcher(DEFAULT_IGNORE_KEYS);
+    expect(
+      loosen(
+        {
+          id: 7,
+          evseId: 1,
+          evse: { id: 2, connectorId: 1 },
+          connectorId: 3,
+          transactionId: 'tx',
+          remoteStartId: 4,
+          chargingProfile: { id: 9, stackLevel: 0, chargingSchedule: [{ id: 5, chargingRateUnit: 'A' }] },
+          message: { id: 6, priority: 'NormalCycle' },
+          nested: { requestId: 8, reservationId: 9, chargingProfileId: 10, id: 11 },
+        },
+        ignore,
+      ),
+    ).toEqual({
+      evseId: 1,
+      evse: { id: 2, connectorId: 1 },
+      connectorId: 3,
+      chargingProfile: { stackLevel: 0, chargingSchedule: [{ chargingRateUnit: 'A' }] },
+      message: { priority: 'NormalCycle' },
+      nested: { id: 11 },
+    });
+  });
+
+  test('a path matches the end of a key path, array positions left out; $. anchors at the root', () => {
+    const m = ignoreMatcher(['a.b', '$.c']);
+    expect(m(['a', 'b'])).toBe(true);
+    expect(m(['x', 'a', 'b'])).toBe(true);
+    expect(m(['b'])).toBe(false);
+    expect(m(['c'])).toBe(true);
+    expect(m(['x', 'c'])).toBe(false);
+    expect(loosen({ a: [{ b: 1, k: 2 }] }, m)).toEqual({ a: [{ k: 2 }] });
+  });
+
+  test('a CSMS that triggers the wrong EVSE no longer matches', async () => {
+    const csms = await FakeCsms.start({ version: 'ocpp2.0.1' });
+    targets.push(csms);
+    csms.respondWith('Heartbeat', (_p, id) => {
+      setTimeout(
+        () =>
+          void csms
+            .call(id, 'TriggerMessage', { requestedMessage: 'StatusNotification', evse: { id: 2, connectorId: 1 } })
+            .catch(() => {}),
+        0,
+      );
+      return { currentTime: new Date().toISOString() };
+    });
+    const e = (ms: number, dir: 'in' | 'out', raw: string) =>
+      makeEntry({ ts: T0 + ms, dir, identity: 'E', version: 'ocpp2.0.1', raw });
+    const report = await replay(
+      [
+        e(0, 'out', '[2,"h1","Heartbeat",{}]'),
+        e(1, 'in', '[3,"h1",{"currentTime":"2026-01-01T00:00:00Z"}]'),
+        e(
+          2,
+          'in',
+          '[2,"c1","TriggerMessage",{"requestedMessage":"StatusNotification","evse":{"id":1,"connectorId":1}}]',
+        ),
+        e(3, 'out', '[3,"c1",{"status":"Accepted"}]'),
+      ],
+      { csmsUrl: csms.url, virtual: true, timeoutMs: 1000, settleMs: 100 },
+    );
+    expect(report.ok).toBe(false);
+    expect(report.mismatches.map((m) => [m.kind, m.action])).toEqual([['payload', 'TriggerMessage']]);
   });
 });

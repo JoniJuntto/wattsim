@@ -3,18 +3,24 @@
  *
  * Each identity gets its own WebSocket. Walking that identity's entries in order:
  *
- * - a station frame (`out`) is sent verbatim, paced by the recorded timestamps divided by `speed` (default 1), or at
- *   once with `virtual`. A station response to a CSMS CALL is re-addressed to the id the live CSMS used for that
- *   CALL; it is not sent when the live CSMS never sent the CALL.
+ * - a station frame (`out`) is sent as it reached the CSMS when the trace was made, paced by the recorded timestamps
+ *   divided by `speed` (default 1), or at once with `virtual`. Usually that is the recorded text; for a trace made
+ *   through the chaos proxy it is what the proxy passed on: nothing for a dropped frame (drop, noResponse, callError
+ *   on a CALL), the `delivered` text of a changed one (corrupt, wrongId, callError on a CALLRESULT, mutate), `copies`
+ *   sends of a duplicated one, later by `delayMs` for a delayed one. A changed frame whose delivered text the trace
+ *   lacks is skipped with a note. The CALLERROR the proxy itself sent to the CSMS for a CSMS CALL is sent too. A
+ *   station response to a CSMS CALL is re-addressed to the id the live CSMS used for that CALL; it is not sent when
+ *   the live CSMS never sent the CALL.
  * - a CSMS frame (`in`) is an expectation, awaited for up to `timeoutMs`. A CALL (or 2.1 SEND) matches the first
  *   live CALL of the same action not matched yet; a response matches the live response to the station CALL it
  *   answered (same id: station CALLs keep their recorded ids). Payloads are compared with scenario's `partialMatch`
- *   after removing timestamps and ids from both sides (`ignoreKeys`, and every string that is an ISO 8601
- *   timestamp); a CALLERROR is compared by its code.
+ *   after removing CSMS-assigned ids and timestamps from both sides (`ignoreKeys`, and every string that is an ISO
+ *   8601 timestamp); a CALLERROR is compared by its code.
  *
- * Live CSMS frames that no expectation used are reported as unexpected once the identity's entries are done; live
- * CALLs nobody expected are not answered. Entries the proxy injected, and trace responses that answer no CALL in the
- * trace (orphans), are skipped.
+ * After the last entry the connection stays open for `settleMs` (default 1000 ms), and live CSMS frames that no
+ * expectation used, including those that arrive in that window, are reported as unexpected; live CALLs nobody
+ * expected are not answered. CALLERRORs the proxy injected towards the station, and trace responses that answer no
+ * CALL in the trace (orphans), are not expected from the CSMS.
  */
 import type { Clock } from '@wattsim/core';
 import { WallClock } from '@wattsim/core';
@@ -40,19 +46,51 @@ export type ReplayOptions = {
   /** How long to wait for each expected CSMS frame; default 30000 ms. */
   timeoutMs?: number;
   basicAuth?: { user: string; password: string };
-  /** Payload keys left out of the comparison; default `DEFAULT_IGNORE_KEYS`. */
+  /** Payload keys left out of the comparison (see `ignoreMatcher`); default `DEFAULT_IGNORE_KEYS`. */
   ignoreKeys?: readonly string[];
+  /** How long to keep listening after the last entry for CSMS frames the trace does not have; default 1000 ms. */
+  settleMs?: number;
 };
 
-/** CSMS-assigned identifiers: they differ from run to run, so they never decide a match. */
+/**
+ * CSMS-assigned identifiers: they differ from run to run, so they never decide a match. `id` only where the CSMS
+ * assigns it: at the top of a payload (ReserveNow, ClearDisplayMessage, GetDisplayMessages,
+ * ClearVariableMonitoring) and in charging profiles, charging schedules and display messages. `evse.id`,
+ * `connectorId` and `evseId` are always compared.
+ */
 export const DEFAULT_IGNORE_KEYS: readonly string[] = [
-  'id',
   'transactionId',
   'requestId',
   'remoteStartId',
   'reservationId',
   'chargingProfileId',
+  '$.id',
+  'chargingProfile.id',
+  'chargingSchedule.id',
+  'message.id',
 ];
+
+/** True for a payload key path (object keys from the root; array positions are left out) that is ignored. */
+export type IgnoreMatcher = (path: readonly string[]) => boolean;
+
+/**
+ * Compile ignore keys. Each is a dotted key path matched against the end of a key's path, array positions left
+ * out: `transactionId` is that key anywhere, `chargingProfile.id` an `id` directly inside a `chargingProfile` object
+ * (or inside the elements of a `chargingProfile` array). A leading `$.` anchors the path at the payload root: `$.id`
+ * is a top-level `id` only.
+ */
+export function ignoreMatcher(keys: readonly string[]): IgnoreMatcher {
+  const patterns = keys.map((k) => {
+    const anchored = k.startsWith('$.');
+    return { anchored, parts: (anchored ? k.slice(2) : k).split('.') };
+  });
+  return (path) =>
+    patterns.some(({ anchored, parts }) => {
+      if (anchored ? path.length !== parts.length : path.length < parts.length) return false;
+      const off = path.length - parts.length;
+      return parts.every((p, i) => path[off + i] === p);
+    });
+}
 
 export type ReplayMismatchKind = 'connect' | 'missing' | 'type' | 'payload' | 'unexpected';
 
@@ -77,23 +115,59 @@ export type ReplayReport = {
   expectations: number;
   matched: number;
   mismatches: ReplayMismatch[];
+  /** Things the replay did differently from a plain resend that do not fail it (a chaos-changed frame skipped). */
+  notes: ReplayNote[];
   durationMs: number;
 };
 
+export type ReplayNote = { identity: string; index: number; line?: number; message: string };
+
 const DEFAULT_TIMEOUT_MS = 30_000;
-const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/i;
+const DEFAULT_SETTLE_MS = 1000;
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}(:?\d{2})?)?$/i;
 const TIMESTAMP = '<timestamp>';
 
 /** A payload with the ignored keys removed and every timestamp string replaced by a placeholder. */
-export function loosen(value: unknown, ignore: ReadonlySet<string>): unknown {
+export function loosen(value: unknown, ignore: IgnoreMatcher, path: readonly string[] = []): unknown {
   if (typeof value === 'string') return ISO_TIMESTAMP.test(value) ? TIMESTAMP : value;
-  if (Array.isArray(value)) return value.map((v) => loosen(v, ignore));
+  if (Array.isArray(value)) return value.map((v) => loosen(v, ignore, path));
   if (value === null || typeof value !== 'object') return value;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (!ignore.has(k)) out[k] = loosen(v, ignore);
+    const at = [...path, k];
+    if (!ignore(at)) out[k] = loosen(v, ignore, at);
   }
   return out;
+}
+
+/**
+ * What a recorded station frame put on the CSMS's wire: the text, how many times and how much later than recorded,
+ * or nothing (with the reason when the trace cannot say what was sent).
+ */
+function onTheWire(e: TraceEntry): { raw: string; copies: number; delayMs: number } | { skip: string | undefined } {
+  const c = e.chaos;
+  if (!c) return { raw: e.raw, copies: 1, delayMs: 0 };
+  const delayMs = c.delayMs ?? 0;
+  const copies = c.copies ?? (c.effect === 'duplicate' ? 2 : 1);
+  if (c.delivered !== undefined) return { raw: c.delivered, copies, delayMs };
+  switch (c.effect) {
+    case 'drop':
+    case 'noResponse':
+      return { skip: undefined };
+    case 'callError':
+      if (e.frame?.type === MessageType.Call) return { skip: undefined }; // the proxy answered it; the CSMS never saw it
+      if (e.frame?.type === MessageType.CallResult) break;
+      return { raw: e.raw, copies, delayMs };
+    case 'corrupt':
+    case 'wrongId':
+    case 'mutate':
+      break;
+    default:
+      return { raw: e.raw, copies, delayMs };
+  }
+  return {
+    skip: `not sent: the proxy's chaos (${c.effect}${c.rule ? `, rule ${c.rule}` : ''}) changed this frame and the trace does not record what it passed on`,
+  };
 }
 
 const KIND_NAMES: Record<number, string> = {
@@ -184,7 +258,15 @@ function open(url: string, version: OcppVersion, headers: Record<string, string>
 export async function replay(trace: readonly TraceEntry[], opts: ReplayOptions): Promise<ReplayReport> {
   const clock = opts.clock ?? new WallClock();
   const started = clock.now();
-  const report: ReplayReport = { ok: true, sent: 0, expectations: 0, matched: 0, mismatches: [], durationMs: 0 };
+  const report: ReplayReport = {
+    ok: true,
+    sent: 0,
+    expectations: 0,
+    matched: 0,
+    mismatches: [],
+    notes: [],
+    durationMs: 0,
+  };
   const links = correlate(trace);
   const t0 = trace.reduce((m, e) => Math.min(m, e.ts), Number.POSITIVE_INFINITY);
   const byIdentity = new Map<string, number[]>();
@@ -219,7 +301,7 @@ function mapIdentity(opts: ReplayOptions, identity: string): string {
 async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Promise<void> {
   const { trace, links, opts, clock, report } = ctx;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const ignore = new Set(opts.ignoreKeys ?? DEFAULT_IGNORE_KEYS);
+  const ignore = ignoreMatcher(opts.ignoreKeys ?? DEFAULT_IGNORE_KEYS);
   const fail = (m: Omit<ReplayMismatch, 'identity'>) => report.mismatches.push({ identity, ...m });
   const version = trace[indexes[0] as number]?.version ?? opts.version;
   if (!version) {
@@ -246,27 +328,35 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
   const liveIds = new Map<string, string>();
   for (const i of indexes) {
     const e = trace[i] as TraceEntry;
-    if (e.injected) continue;
+    // A CALLERROR the proxy sent the station never came from the CSMS; one it sent the CSMS is a station frame.
+    if (e.injected && e.dir === 'in') continue;
     const f = e.frame;
     const where = { index: i, ...(e.line !== undefined ? { line: e.line } : {}) };
     if (e.dir === 'out') {
+      const wire = onTheWire(e);
+      if ('skip' in wire) {
+        if (wire.skip) report.notes.push({ identity, ...where, message: wire.skip });
+        continue;
+      }
       if (!opts.virtual) {
-        const due = ctx.liveStart + (e.ts - ctx.t0) / (opts.speed ?? 1);
+        const due = ctx.liveStart + (e.ts + wire.delayMs - ctx.t0) / (opts.speed ?? 1);
         const wait = due - clock.now();
         if (wait > 0) await clock.sleep(wait);
       }
-      let raw = e.raw;
-      if (f && (f.type === MessageType.CallResult || f.type === MessageType.CallError)) {
+      let raw = wire.raw;
+      const sent = raw === e.raw ? f : decodeRaw(raw, version).frame;
+      if (sent && (sent.type === MessageType.CallResult || sent.type === MessageType.CallError)) {
         const callIndex = links[i]?.callIndex;
-        if (callIndex !== undefined) {
+        // Re-address an answer to a CSMS CALL, unless chaos gave it another id on purpose (wrongId).
+        if (callIndex !== undefined && sent.id === f?.id) {
           const liveId = liveIds.get((trace[callIndex] as TraceEntry).frame?.id ?? '');
           if (liveId === undefined) continue; // the live CSMS never sent that CALL; already reported missing
-          if (liveId !== f.id) raw = encodeFrame({ ...f, id: liveId });
+          if (liveId !== sent.id) raw = encodeFrame({ ...sent, id: liveId });
         }
       }
       if (ws.readyState !== WebSocket.OPEN) break;
-      ws.send(raw);
-      report.sent++;
+      for (let k = 0; k < wire.copies; k++) ws.send(raw);
+      report.sent += wire.copies;
       continue;
     }
     // A CSMS frame: an expectation.
@@ -334,6 +424,8 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
     }
     report.matched++;
   }
+  // Keep listening a little: a CSMS frame the trace does not have may come after its last entry.
+  if (ws.readyState === WebSocket.OPEN) await link.next(() => false, clock, opts.settleMs ?? DEFAULT_SETTLE_MS);
   for (const l of link.inbox) {
     if (l.used) continue;
     const what = l.frame

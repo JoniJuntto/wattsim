@@ -226,4 +226,39 @@ describe('chaos', () => {
     expect(injected[0]?.frame?.type).toBe(4);
     await station.disconnect();
   });
+
+  test('the chaos note says what reached the other side: delivered text and copies', async () => {
+    const clock = new VirtualClock(T0);
+    const recorder = new Recorder();
+    proxy = await startProxy({
+      listen: 0,
+      upstream: csms.url,
+      record: recorder,
+      clock,
+      chaos: engineFor('corrupt out Heartbeat nth 1; callError out GetConfiguration; duplicate out DataTransfer'),
+    });
+    const station = await connected(clock, { id: 'CP-NOTE' });
+    void station.sendRaw('DataTransfer', { vendorId: 'v' }).catch(() => {});
+    await until(() => csms.callsFrom('CP-NOTE', 'DataTransfer').length === 2, 1000, 'duplicated DataTransfer');
+    await settle(station, clock);
+    await expect(csms.call('CP-NOTE', 'GetConfiguration', {})).rejects.toThrow('CALLERROR InternalError');
+    void station.sendHeartbeat().catch(() => {});
+    await until(() => csms.invalid.length === 1, 1000, 'corrupted heartbeat');
+    const noted = recorder.entries.filter((e) => e.chaos);
+    expect(noted[0]?.chaos).toEqual({ rule: expect.any(String), effect: 'duplicate', copies: 2 });
+    const heartbeat = noted[2] as TraceEntry;
+    expect(heartbeat.chaos).toEqual({ rule: expect.any(String), effect: 'corrupt', delivered: csms.invalid[0] });
+    expect(heartbeat.raw.slice(0, -1)).toBe(csms.invalid[0] as string);
+    const answer = noted[1] as TraceEntry;
+    expect(answer.frame?.type).toBe(3);
+    expect(JSON.parse(answer.chaos?.delivered as string)).toEqual([
+      4,
+      answer.frame?.id,
+      'InternalError',
+      'injected by chaos',
+      {},
+    ]);
+    await clock.advance(30_000);
+    await station.disconnect();
+  });
 });

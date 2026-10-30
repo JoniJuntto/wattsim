@@ -5,10 +5,10 @@
  * upstream refusal is answered with the same HTTP status (502 when there is none, 504 on timeout).
  *
  * Frames go both ways unchanged, text as text and binary as binary, unless a chaos rule matches them. Every frame is
- * recorded as its sender sent it; a chaos rule that matched is noted on the entry (`chaos`), and a frame the proxy
- * makes up itself (the CALLERROR of `callError` on a CALL) is recorded with `injected`. Frames that do not decode are
- * forwarded and recorded with their decode error, and chaos does not see them. The proxy never queues or reorders:
- * keeping one CALL in flight is the endpoints' job.
+ * recorded as its sender sent it; a chaos rule that matched is noted on the entry (`chaos`, with what it passed on),
+ * and a frame the proxy makes up itself (the CALLERROR of `callError` on a CALL) is recorded with `injected`.
+ * Frames that do not decode are forwarded and recorded with their decode error, and chaos does not see them. The
+ * proxy never queues or reorders: keeping one CALL in flight is the endpoints' job.
  *
  * Chaos directions are station-relative, as in the DSL: `out` is charger to CSMS, `in` CSMS to charger.
  */
@@ -84,6 +84,38 @@ function chaosCallError(id: string, code: string | undefined): CallErrorFrame {
   };
 }
 
+/** What a chaos effect puts on the wire: the frames passed on, in order, and a CALLERROR for the sender, if any. */
+type ChaosOutcome = { forward: Data[]; back?: string };
+
+/**
+ * Decided when the frame arrives, so the trace entry can say what actually reached the other side (`copies`,
+ * `delivered`) before it is recorded, even when the effect itself runs after a delay.
+ */
+function chaosOutcome(frame: Frame, data: Data, effect: ChaosEffect): ChaosOutcome {
+  switch (effect.kind) {
+    case 'drop':
+    case 'noResponse':
+      return { forward: [] };
+    case 'delay':
+      return { forward: [data] };
+    case 'duplicate':
+      return { forward: Array.from({ length: (effect.count ?? 1) + 1 }, () => data) };
+    case 'corrupt':
+      // As core's Connection does: drop the closing bracket so the text is no longer JSON.
+      return { forward: [text(data).slice(0, -1)] };
+    case 'wrongId':
+      return { forward: [encodeFrame({ ...frame, id: newMessageId() })] };
+    case 'callError':
+      if (frame.type === MessageType.Call)
+        return { forward: [], back: encodeFrame(chaosCallError(frame.id, effect.code)) };
+      if (frame.type === MessageType.CallResult)
+        return { forward: [encodeFrame(chaosCallError(frame.id, effect.code))] };
+      return { forward: [data] };
+    case 'mutate':
+      return { forward: ['payload' in frame ? encodeFrame({ ...frame, payload: effect.fn(frame.payload) }) : data] };
+  }
+}
+
 class Session {
   charger: ServerSocket | undefined;
   /** Frames for the charger that arrived before its socket opened. */
@@ -126,61 +158,42 @@ class Session {
       return;
     }
     const { effect, rule, delayed } = decision;
+    const outcome = chaosOutcome(frame, data, effect);
     entry.chaos = { rule: rule.id, effect: effect.kind };
     if (effect.kind === 'delay') entry.chaos.delayMs = effect.ms;
+    if (outcome.forward.length > 1) entry.chaos.copies = outcome.forward.length;
+    const passed = outcome.forward[0];
+    if (passed !== undefined && passed !== data) entry.chaos.delivered = text(passed);
     if (delayed) {
       entry.chaos.delayMs = delayed.ms;
       this.proxy.emit('chaos', this.identity, delayed.rule, entry);
     }
     this.proxy.recordEntry(entry);
     this.proxy.emit('chaos', this.identity, rule, entry);
-    if (delayed) this.proxy.clock.setTimeout(() => this.apply(dir, frame, data, effect), delayed.ms);
-    else this.apply(dir, frame, data, effect);
+    const apply = () => this.apply(dir, outcome, effect.kind === 'delay' ? effect.ms : 0);
+    if (delayed) this.proxy.clock.setTimeout(apply, delayed.ms);
+    else apply();
   }
 
-  private apply(dir: TraceDirection, frame: Frame, data: Data, effect: ChaosEffect): void {
-    switch (effect.kind) {
-      case 'drop':
-      case 'noResponse':
-        return;
-      case 'delay':
-        this.proxy.clock.setTimeout(() => this.deliver(dir, data), effect.ms);
-        return;
-      case 'duplicate':
-        for (let i = 0; i <= (effect.count ?? 1); i++) this.deliver(dir, data);
-        return;
-      case 'corrupt':
-        // As core's Connection does: drop the closing bracket so the text is no longer JSON.
-        this.deliver(dir, text(data).slice(0, -1));
-        return;
-      case 'wrongId':
-        this.deliver(dir, encodeFrame({ ...frame, id: newMessageId() }));
-        return;
-      case 'callError':
-        if (frame.type === MessageType.Call) {
-          // The CALL goes no further; its sender gets the CALLERROR from the proxy.
-          const raw = encodeFrame(chaosCallError(frame.id, effect.code));
-          const back = opposite(dir);
-          const injected = makeEntry({
-            ts: this.proxy.clock.now(),
-            dir: back,
-            identity: this.identity,
-            version: this.version,
-            raw,
-          });
-          injected.injected = true;
-          this.correlator.observe(injected);
-          this.proxy.recordEntry(injected);
-          this.deliver(back, raw);
-        } else if (frame.type === MessageType.CallResult) {
-          this.deliver(dir, encodeFrame(chaosCallError(frame.id, effect.code)));
-        } else {
-          this.deliver(dir, data);
-        }
-        return;
-      case 'mutate':
-        this.deliver(dir, 'payload' in frame ? encodeFrame({ ...frame, payload: effect.fn(frame.payload) }) : data);
-        return;
+  private apply(dir: TraceDirection, outcome: ChaosOutcome, delayMs: number): void {
+    if (outcome.back !== undefined) {
+      // A CALL that goes no further: its sender gets the CALLERROR from the proxy.
+      const back = opposite(dir);
+      const injected = makeEntry({
+        ts: this.proxy.clock.now(),
+        dir: back,
+        identity: this.identity,
+        version: this.version,
+        raw: outcome.back,
+      });
+      injected.injected = true;
+      this.correlator.observe(injected);
+      this.proxy.recordEntry(injected);
+      this.deliver(back, outcome.back);
+    }
+    for (const data of outcome.forward) {
+      if (delayMs > 0) this.proxy.clock.setTimeout(() => this.deliver(dir, data), delayMs);
+      else this.deliver(dir, data);
     }
   }
 

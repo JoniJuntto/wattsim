@@ -28,7 +28,7 @@ function parseIdentityMap(raw: string, identities: string[]): Record<string, str
   return map;
 }
 
-function where(file: string, m: ReplayMismatch): string {
+function where(file: string, m: Pick<ReplayMismatch, 'line' | 'identity' | 'message'>): string {
   return `${file}${m.line !== undefined ? `:${m.line}` : ''}: ${m.identity}: ${m.message}`;
 }
 
@@ -53,6 +53,10 @@ export const replay = defineCommand({
     version: { type: 'string', description: 'OCPP version for trace lines that carry none (1.6, 2.0.1, 2.1)' },
     auth: { type: 'string', description: 'HTTP Basic credentials user:password for the handshake' },
     timeout: { type: 'string', description: 'Seconds to wait for each expected CSMS frame (default 30)' },
+    settle: {
+      type: 'string',
+      description: 'Seconds to keep listening after the last trace entry for CSMS frames the trace lacks (default 1)',
+    },
     export: {
       type: 'string',
       description: 'Write the trace as a .ws scenario to this file (- for stdout) instead of replaying',
@@ -94,6 +98,10 @@ export const replay = defineCommand({
     if (timeoutS !== undefined && !(Number.isFinite(timeoutS) && timeoutS > 0)) {
       await badInput(`invalid --timeout: ${args.timeout}`);
     }
+    const settleS = args.settle === undefined ? undefined : Number(args.settle);
+    if (settleS !== undefined && !(Number.isFinite(settleS) && settleS >= 0)) {
+      await badInput(`invalid --settle: ${args.settle}`);
+    }
     let basicAuth: { user: string; password: string } | undefined;
     if (args.auth !== undefined) {
       const i = args.auth.indexOf(':');
@@ -116,8 +124,12 @@ export const replay = defineCommand({
       version,
       basicAuth,
       timeoutMs: timeoutS === undefined ? undefined : Math.round(timeoutS * 1000),
+      settleMs: settleS === undefined ? undefined : Math.round(settleS * 1000),
     });
-    const lines = report.mismatches.map((m) => where(args.trace, m));
+    const lines = [
+      ...report.notes.map((n) => `${where(args.trace, n)} (note)`),
+      ...report.mismatches.map((m) => where(args.trace, m)),
+    ];
     lines.push(
       `${report.sent} station frames sent, ${report.matched}/${report.expectations} CSMS frames matched, ` +
         `${report.mismatches.length} mismatch${report.mismatches.length === 1 ? '' : 'es'}; ${(report.durationMs / 1000).toFixed(1)}s`,

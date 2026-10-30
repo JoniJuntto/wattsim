@@ -131,3 +131,122 @@ describe('toScenario', () => {
     expect(toScenario(trace, { version: 'ocpp1.6', timing: false })).toContain('heartbeat');
   });
 });
+
+/** Run converted `.ws` text against `csms` on a virtual clock starting at `t0`. */
+async function runScenario(ws: string, csms: FakeCsms, t0: number) {
+  const clock = new VirtualClock(t0);
+  const stations: Station[] = [];
+  const running = run(parse(ws), {
+    clock,
+    csmsUrl: csms.url,
+    stationFactory: (cfg: StationConfig) => {
+      const s = new Station(cfg);
+      stations.push(s);
+      return s;
+    },
+  });
+  return driveVirtual(clock, running, { idle: () => stations.every(isIdle), maxMs: 3_600_000 });
+}
+
+/** A station CALL as compared here: its action, and for StatusNotification the connector or EVSE it is about. */
+function callKey(action: string, payload: unknown): string {
+  if (action !== 'StatusNotification') return action;
+  const p = payload as { connectorId?: number; evseId?: number };
+  return `${action}#${p.connectorId ?? p.evseId}`;
+}
+
+function recordedStationCalls(trace: readonly TraceEntry[], identity: string): string[] {
+  return trace.flatMap((e) =>
+    e.identity === identity && e.dir === 'out' && e.frame?.type === 2 ? [callKey(e.frame.action, e.frame.payload)] : [],
+  );
+}
+
+function liveStationCalls(csms: FakeCsms, identity: string): string[] {
+  return csms.callsFrom(identity).map((c) => callKey(c.action, c.payload));
+}
+
+describe('the converted scenario sends the station CALLs of the trace, in order, and no others', () => {
+  const fixtures = join(import.meta.dir, '../schemas/open-ocpp-trace/fixtures');
+  const names = readdirSync(fixtures, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name)
+    .sort();
+
+  test.each(names)('vendored fixture %s', async (name) => {
+    const trace = await readTrace(join(fixtures, name, 'trace.jsonl'));
+    const csms = await FakeCsms.start();
+    csmss.push(csms);
+    await runScenario(toScenario(trace), csms, trace[0]?.ts ?? T0);
+    const identity = trace[0]?.identity as string;
+    expect(liveStationCalls(csms, identity)).toEqual(recordedStationCalls(trace, identity));
+  });
+
+  test('1.6 connector 0 status after boot is sent, not replaced by the status boot would send', async () => {
+    // normal-session: Boot, SN connector 0, SN connector 1. `boot` alone would send connector 1 first.
+    const trace = await readTrace(join(fixtures, 'normal-session', 'trace.jsonl'));
+    const ws = toScenario(trace);
+    expect(ws).not.toContain('\n  boot\n');
+    expect(ws).toContain('  send BootNotification {');
+    expect(ws).toContain('  send StatusNotification {connectorId: 0,');
+  });
+
+  test('boot Pending then Accepted: two BootNotifications, not three', async () => {
+    const e = (s: number, dir: 'in' | 'out', raw: string) =>
+      makeEntry({ ts: T0 + s * 1000, dir, identity: 'P', version: 'ocpp1.6', raw });
+    const trace = [
+      e(0, 'out', '[2,"1","BootNotification",{"chargePointVendor":"v","chargePointModel":"m"}]'),
+      e(0.1, 'in', '[3,"1",{"status":"Pending","interval":10,"currentTime":"2026-01-01T00:00:00Z"}]'),
+      e(10.1, 'out', '[2,"2","BootNotification",{"chargePointVendor":"v","chargePointModel":"m"}]'),
+      e(10.2, 'in', '[3,"2",{"status":"Accepted","interval":300,"currentTime":"2026-01-01T00:00:10Z"}]'),
+      e(10.3, 'out', '[2,"3","StatusNotification",{"connectorId":1,"status":"Available","errorCode":"NoError"}]'),
+      e(10.4, 'in', '[3,"3",{}]'),
+    ];
+    const ws = toScenario(trace);
+    // The Pending boot is a plain send, so the station arms no retry of its own; the Accepted one is `boot`, whose
+    // StatusNotification for EVSE 1 is the trace's.
+    expect(ws).toContain('  send BootNotification {chargePointVendor: "v", chargePointModel: "m"}\n');
+    expect(ws).toContain('  wait 10s\n  boot\n  expect result BootNotification {status: "Accepted", interval: 300}\n');
+    const csms = await FakeCsms.start();
+    csmss.push(csms);
+    let n = 0;
+    csms.respondWith('BootNotification', () => {
+      n++;
+      return {
+        status: n === 1 ? 'Pending' : 'Accepted',
+        interval: n === 1 ? 10 : 300,
+        currentTime: '2026-01-01T00:00:00Z',
+      };
+    });
+    const res = await runScenario(ws, csms, T0);
+    expect(liveStationCalls(csms, 'P')).toEqual(recordedStationCalls(trace, 'P'));
+    expect(res.ok).toBe(true);
+  });
+
+  test('a trace that opens with a CSMS CALL connects before expecting it', async () => {
+    const e = (s: number, dir: 'in' | 'out', raw: string) =>
+      makeEntry({ ts: T0 + s * 1000, dir, identity: 'Q', version: 'ocpp2.0.1', raw });
+    const trace = [
+      e(0, 'in', '[2,"c1","TriggerMessage",{"requestedMessage":"Heartbeat"}]'),
+      e(0.1, 'out', '[3,"c1",{"status":"Accepted"}]'),
+      e(0.2, 'out', '[2,"1","Heartbeat",{}]'),
+      e(0.3, 'in', '[3,"1",{"currentTime":"2026-01-01T00:00:00Z"}]'),
+    ];
+    const ws = toScenario(trace);
+    expect(ws).toContain('  connect\n  expect call TriggerMessage {requestedMessage: "Heartbeat"}\n');
+    const csms = await FakeCsms.start({ version: 'ocpp2.0.1' });
+    csmss.push(csms);
+    // Send the CALL as soon as the station is connected (setImmediate polling keeps pace with driveVirtual).
+    const answers: unknown[] = [];
+    const poll = () => {
+      if (csms.isConnected('Q'))
+        void csms.call('Q', 'TriggerMessage', { requestedMessage: 'Heartbeat' }).then((a) => answers.push(a));
+      else setImmediate(poll);
+    };
+    poll();
+    const res = await runScenario(ws, csms, T0);
+    expect(res.stations[0]?.asserts.filter((a) => !a.ok)).toEqual([]);
+    expect(res.ok).toBe(true);
+    expect(answers).toEqual([{ status: 'Accepted' }]);
+    expect(liveStationCalls(csms, 'Q')).toEqual(['Heartbeat']);
+  });
+});

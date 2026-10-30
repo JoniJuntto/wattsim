@@ -3,14 +3,19 @@
  *
  * - One station block per identity, in order of first appearance, with `version`, and `vendor` / `model` /
  *   `serial` taken from the first BootNotification.
- * - Station CALLs become the DSL primitive that sends exactly that message where one exists (`boot`, bare
- *   `heartbeat` for an empty Heartbeat, `authorize` when the payload is what the station would build), otherwise
- *   `send ACTION {payload}` with the recorded payload. Before the first of them comes `connect` unless it is `boot`.
- * - `boot` also sends one StatusNotification per EVSE once Accepted, so the StatusNotifications for EVSEs 1..N that
- *   directly follow an Accepted boot in the trace are left to it and `evses N` is set.
- * - `heartbeat 24h` keeps the station's own heartbeat timer out of the replayed traffic (the station's configured
- *   interval wins over the CSMS's), and the station never runs a transaction itself (transaction messages are
- *   `send`s), so no MeterValues appear that the trace does not have.
+ * - Station CALLs become the DSL primitive that sends exactly that message where one exists (bare `heartbeat` for
+ *   an empty Heartbeat, `authorize` when the payload is what the station would build), otherwise
+ *   `send ACTION {payload}` with the recorded payload. Before the first station CALL, or the first CSMS CALL when the
+ *   CSMS speaks first, comes `connect` unless it is `boot`.
+ * - The converted scenario sends the station CALLs of the trace and nothing else, in the same order. The station's
+ *   own traffic is kept out: `boot` sends one StatusNotification per EVSE (1..N, in order) once Accepted and retries
+ *   by itself after Pending or Rejected, so a BootNotification becomes `boot` (with `evses N`) only when the CSMS
+ *   accepted it and the next station CALLs in the trace are exactly those StatusNotifications, which are then left
+ *   to it. Every other BootNotification is `send BootNotification {payload}`, which has neither side effect.
+ *   `heartbeat 24h` keeps the station's heartbeat timer quiet (the configured interval wins over the CSMS's), the
+ *   station never runs a transaction itself (transaction messages are `send`s), so no MeterValues appear that the
+ *   trace does not have, and the station's answers to CSMS CALLs are scripted `on` handlers, which have no side
+ *   effects.
  * - CSMS replies become `expect result ACTION {payload}` or `expect error ACTION CODE`; CSMS CALLs become
  *   `expect call ACTION {payload}`. Expected payloads leave out ids and timestamps, as replay does.
  * - The station's answers to CSMS CALLs become one-shot `on ACTION { reply ... }` / `{ error ... }` handlers,
@@ -28,7 +33,8 @@ import { CALL_ERROR_CODES, MessageType } from '@wattsim/protocol';
 import { format, formatDuration, parse } from '@wattsim/scenario';
 import type { TraceEntry } from './entry';
 import { correlate, isCallLike } from './entry';
-import { DEFAULT_IGNORE_KEYS, loosen } from './replay';
+import type { IgnoreMatcher } from './replay';
+import { DEFAULT_IGNORE_KEYS, ignoreMatcher, loosen } from './replay';
 
 export type ToScenarioOptions = {
   /** Adds a `csms` line. */
@@ -78,7 +84,7 @@ function dslJson(v: unknown): string {
  * `expect` compares arrays element by element, so a timestamp inside an array fails the whole array: such an array
  * is dropped from the pattern.
  */
-function pattern(payload: unknown, ignore: ReadonlySet<string>): unknown {
+function pattern(payload: unknown, ignore: IgnoreMatcher): unknown {
   const strip = (v: unknown): unknown => {
     if (v === TIMESTAMP) return undefined;
     if (Array.isArray(v)) {
@@ -147,9 +153,58 @@ function bootConfig(version: OcppVersion, payload: unknown): string[] {
   return out;
 }
 
+/**
+ * Which BootNotifications become `boot`, and the StatusNotifications left to it. `boot` sends StatusNotification
+ * for EVSE 1..N once Accepted, N being the station's `evses`, one value for the whole station: it is the length of
+ * that run of StatusNotifications after the first Accepted boot that has one. A boot qualifies when the CSMS
+ * accepted it and at least N such StatusNotifications are the next station CALLs; its first N are skipped.
+ */
+function planBoots(
+  trace: readonly TraceEntry[],
+  links: ReturnType<typeof correlate>,
+  indexes: readonly number[],
+  version: OcppVersion,
+): { bootIndexes: Set<number>; skipped: Set<number>; evses: number | undefined } {
+  const answer = new Map<number, TraceEntry>();
+  for (const i of indexes) {
+    const callIndex = links[i]?.callIndex;
+    if (callIndex !== undefined) answer.set(callIndex, trace[i] as TraceEntry);
+  }
+  const stationCalls = indexes.filter((i) => {
+    const e = trace[i] as TraceEntry;
+    return e.dir === 'out' && !e.injected && e.frame?.type === MessageType.Call;
+  });
+  /** Station CALL positions in `stationCalls` of the StatusNotifications for EVSE 1, 2, ... after each boot. */
+  const bursts: Array<{ boot: number; statuses: number[] }> = [];
+  stationCalls.forEach((i, pos) => {
+    const f = (trace[i] as TraceEntry).frame;
+    if (f?.type !== MessageType.Call || f.action !== 'BootNotification') return;
+    const res = answer.get(i)?.frame;
+    if (res?.type !== MessageType.CallResult || !isObject(res.payload) || res.payload.status !== 'Accepted') return;
+    const statuses: number[] = [];
+    for (let k = pos + 1; k < stationCalls.length; k++) {
+      const s = (trace[stationCalls[k] as number] as TraceEntry).frame;
+      if (s?.type !== MessageType.Call || s.action !== 'StatusNotification') break;
+      if (statusEvse(version, s.payload) !== statuses.length + 1) break;
+      statuses.push(stationCalls[k] as number);
+    }
+    bursts.push({ boot: i, statuses });
+  });
+  const evses = bursts.find((b) => b.statuses.length > 0)?.statuses.length;
+  const bootIndexes = new Set<number>();
+  const skipped = new Set<number>();
+  if (evses === undefined) return { bootIndexes, skipped, evses };
+  for (const b of bursts) {
+    if (b.statuses.length < evses) continue;
+    bootIndexes.add(b.boot);
+    for (const i of b.statuses.slice(0, evses)) skipped.add(i);
+  }
+  return { bootIndexes, skipped, evses };
+}
+
 /** Convert a trace to canonical `.ws` text. Throws when an identity has no OCPP version and none is given. */
 export function toScenario(trace: readonly TraceEntry[], opts: ToScenarioOptions = {}): string {
-  const ignore = new Set(opts.ignoreKeys ?? DEFAULT_IGNORE_KEYS);
+  const ignore = ignoreMatcher(opts.ignoreKeys ?? DEFAULT_IGNORE_KEYS);
   const links = correlate(trace);
   const t0 = trace.reduce((m, e) => Math.min(m, e.ts), Number.POSITIVE_INFINITY);
   const identities: string[] = [];
@@ -165,15 +220,10 @@ export function toScenario(trace: readonly TraceEntry[], opts: ToScenarioOptions
     const config: string[] = [`version ${DSL_VERSION[version]}`];
     const handlers: string[] = [];
     const body: string[] = [];
-    /** Indexes of station CALLs left to `boot`, whose CSMS answers are not asserted either. */
-    const skipped = new Set<number>();
+    const { bootIndexes, skipped, evses } = planBoots(trace, links, indexes, version);
     let connected = false;
     let configured = false;
     let lastTs = t0;
-    let evses = 0;
-    /** After an Accepted boot: the EVSE ids whose StatusNotification `boot` sends, in order, until another CALL. */
-    let burst: { next: number } | undefined;
-
     const wait = (ts: number) => {
       if (opts.timing === false) return;
       const gap = Math.round(ts - lastTs);
@@ -199,20 +249,14 @@ export function toScenario(trace: readonly TraceEntry[], opts: ToScenarioOptions
       const link = links[i] ?? {};
       if (e.dir === 'out') {
         if (f.type === MessageType.Call) {
-          if (burst && f.action === 'StatusNotification' && statusEvse(version, f.payload) === burst.next) {
-            skipped.add(i);
-            evses = Math.max(evses, burst.next);
-            burst.next++;
-            continue;
-          }
-          burst = undefined;
+          if (skipped.has(i)) continue;
           if (!configured && f.action === 'BootNotification') {
             config.push(...bootConfig(version, f.payload));
             configured = true;
           }
           wait(e.ts);
           lastTs = e.ts;
-          if (f.action === 'BootNotification') {
+          if (bootIndexes.has(i)) {
             body.push('boot');
             connected = true;
             continue;
@@ -254,6 +298,12 @@ export function toScenario(trace: readonly TraceEntry[], opts: ToScenarioOptions
       }
       // CSMS frames: assertions.
       if (isCallLike(f)) {
+        if (!connected) {
+          // The CSMS speaks first (a reconnect without a boot): the station must be connected to hear it.
+          wait(e.ts);
+          body.push('connect');
+          connected = true;
+        }
         lastTs = e.ts;
         body.push(`expect call ${f.action}${payloadSuffix(pattern(f.payload, ignore))}`);
         continue;
@@ -265,16 +315,6 @@ export function toScenario(trace: readonly TraceEntry[], opts: ToScenarioOptions
           continue;
         }
         if (skipped.has(callIndex)) continue;
-        const bootCall = (trace[callIndex] as TraceEntry).frame;
-        if (
-          f.type === MessageType.CallResult &&
-          bootCall?.type === MessageType.Call &&
-          bootCall.action === 'BootNotification' &&
-          isObject(f.payload) &&
-          f.payload.status === 'Accepted'
-        ) {
-          burst = { next: 1 };
-        }
         lastTs = e.ts;
         if (f.type === MessageType.CallResult) {
           body.push(`expect result ${link.action}${payloadSuffix(pattern(f.payload, ignore))}`);
@@ -285,7 +325,7 @@ export function toScenario(trace: readonly TraceEntry[], opts: ToScenarioOptions
       }
       body.push(comment(`${at}: CSMS CALLRESULTERROR not checked`));
     }
-    if (evses > 1) config.push(`evses ${evses}`);
+    if (evses !== undefined && evses > 1) config.push(`evses ${evses}`);
     config.push('heartbeat 24h');
     out.push('', `station ${dslString(identity)} {`, ...[...config, ...handlers, ...body].map((l) => `  ${l}`), '}');
   }

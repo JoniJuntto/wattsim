@@ -10,6 +10,7 @@
 import type { OcppVersion } from '@wattsim/protocol';
 import { MessageType } from '@wattsim/protocol';
 import { z } from 'zod';
+import { parseDateTime } from './datetime';
 import type { ChaosNote, TraceDirection, TraceEntry } from './entry';
 import { DEFAULT_IDENTITY, isCallLike, makeEntry, normalizeVersion, opposite } from './entry';
 import { stationInitiated } from './initiator';
@@ -162,7 +163,7 @@ function framesEntry(obj: Record<string, unknown>, line: number, opts: ReadOptio
   let ts = lastTs;
   if (typeof l.ts === 'number') ts = l.ts;
   else if (typeof l.ts === 'string') {
-    ts = Date.parse(l.ts);
+    ts = parseDateTime(l.ts) ?? Date.parse(l.ts);
     if (Number.isNaN(ts)) throw new TraceFormatError(`invalid ts ${JSON.stringify(l.ts)}`, line);
   }
   let version = opts.version;

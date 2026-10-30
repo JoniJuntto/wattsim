@@ -8,6 +8,7 @@
 import type { Frame } from '@wattsim/protocol';
 import { encodeFrame, MessageType } from '@wattsim/protocol';
 import { z } from 'zod';
+import { parseDateTime } from './datetime';
 import type { ChaosNote, TraceEntry } from './entry';
 import { DEFAULT_IDENTITY, makeEntry, normalizeVersion, shortVersion } from './entry';
 
@@ -48,7 +49,7 @@ const errorSchema = z.looseObject({
 export const ootRecordSchema = z
   .looseObject({
     schemaVersion: z.string(),
-    timestamp: z.iso.datetime({ offset: true }),
+    timestamp: z.string().refine((s) => parseDateTime(s) !== undefined, 'Invalid RFC 3339 date-time'),
     ocppVersion: z.string().optional(),
     transport: z.enum(['json', 'soap']),
     chargePointId: z.string().optional(),
@@ -200,7 +201,7 @@ export function fromOotRecord(r: OotRecord, opts: FromOotOptions = {}): TraceEnt
   if (meta) delete meta.wattsim;
   const ours = typeof wattsim === 'object' && wattsim !== null ? (wattsim as Record<string, unknown>) : {};
   const entry = makeEntry({
-    ts: Date.parse(r.timestamp),
+    ts: parseDateTime(r.timestamp) ?? Date.parse(r.timestamp),
     dir: r.direction === 'cp-to-csms' ? 'out' : 'in',
     identity: r.chargePointId ?? opts.identity ?? DEFAULT_IDENTITY,
     version: normalizeVersion(r.ocppVersion) ?? opts.version,

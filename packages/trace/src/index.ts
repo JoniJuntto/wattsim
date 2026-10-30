@@ -1,4 +1,5 @@
 export * from './chaos-text';
+export { parseDateTime } from './datetime';
 export type { ChaosNote, TraceDirection, TraceEntry } from './entry';
 export { Correlator, correlate, DEFAULT_IDENTITY, decodeRaw, makeEntry, normalizeVersion } from './entry';
 export { stationInitiated } from './initiator';

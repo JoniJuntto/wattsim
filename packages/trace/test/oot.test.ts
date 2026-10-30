@@ -9,6 +9,7 @@ import {
   formatTrace,
   makeEntry,
   OOT_SCHEMA_VERSION,
+  parseDateTime,
   parseTrace,
   toOotRecord,
   validateOotRecord,
@@ -42,6 +43,32 @@ const base = {
   direction: 'cp-to-csms',
 };
 
+/** RFC 3339 spellings on both sides of Ajv's `date-time` format, which the vendored schema uses. */
+const TIMESTAMPS = [
+  '2026-01-01t00:00:00z',
+  '2026-01-01 00:00:00Z',
+  '2026-01-01\t00:00:00Z',
+  '2026-01-01T00:00:00+0200',
+  '2026-01-01T00:00:00+02',
+  '2026-01-01T00:00:00-05:30',
+  '2026-01-01T00:00:00.123456789Z',
+  '2026-12-31T23:59:60Z',
+  '2027-01-01T01:59:60+02:00',
+  '2026-12-31T23:59:60.5Z',
+  '2026-06-30T12:59:60Z',
+  '2024-02-29T00:00:00Z',
+  '2026-02-29T00:00:00Z',
+  '2026-02-30T00:00:00Z',
+  '2026-13-01T00:00:00Z',
+  '2026-01-01T24:00:00Z',
+  '2026-01-01T00:00Z',
+  '2026-01-01T00:00:00+24:00',
+  '2026-01-01T00:00:00+02:60',
+  '2026-01-01TT00:00:00Z',
+  '2026-01-01T00:00:00 Z',
+  '0001-01-01T00:00:00Z',
+];
+
 /** Records on both sides of every rule in trace-v1.schema.json. */
 const SAMPLES: Array<[string, unknown]> = [
   ['minimal CALL', { ...base, messageType: 'CALL', action: 'Heartbeat' }],
@@ -55,6 +82,10 @@ const SAMPLES: Array<[string, unknown]> = [
   ['timestamp with offset', { ...base, timestamp: '2026-01-01T02:00:00+02:00', messageType: 'CALL', action: 'X' }],
   ['timestamp without zone', { ...base, timestamp: '2026-01-01T00:00:00', messageType: 'CALL', action: 'X' }],
   ['timestamp as date only', { ...base, timestamp: '2026-01-01', messageType: 'CALL', action: 'X' }],
+  ...TIMESTAMPS.map((ts): [string, unknown] => [
+    `timestamp ${JSON.stringify(ts)}`,
+    { ...base, timestamp: ts, messageType: 'CALL', action: 'X' },
+  ]),
   ['soap transport', { ...base, transport: 'soap', messageType: 'CALL', action: 'X' }],
   ['bad transport', { ...base, transport: 'http', messageType: 'CALL', action: 'X' }],
   ['bad direction', { ...base, direction: 'up', messageType: 'CALL', action: 'X' }],
@@ -82,6 +113,39 @@ describe('vendored schema vs the Zod mirror', () => {
         expect(ajvValidate(r)).toBe(true);
         expect(validateOotRecord(r)).toEqual([]);
       }
+    }
+  });
+});
+
+describe('timestamps', () => {
+  test('a record the schema accepts is read, at the instant its timestamp names', () => {
+    const at = (ts: string) =>
+      parseTrace(
+        JSON.stringify({
+          ...base,
+          timestamp: ts,
+          messageType: 'CALL',
+          action: 'Heartbeat',
+          raw: '[2,"1","Heartbeat",{}]',
+        }),
+      )[0]?.ts;
+    const midnight = Date.parse('2026-01-01T00:00:00Z');
+    expect(at('2026-01-01t00:00:00z')).toBe(midnight);
+    expect(at('2026-01-01 00:00:00Z')).toBe(midnight);
+    expect(at('2026-01-01T02:00:00+0200')).toBe(midnight);
+    expect(at('2026-01-01T02:00:00+02')).toBe(midnight);
+    expect(at('2025-12-31T18:30:00-05:30')).toBe(midnight);
+    expect(at('2026-01-01T00:00:00.123456789Z')).toBe(midnight + 123);
+    // A leap second sorts after the second before it: it reads as the next minute's first instant.
+    expect(at('2025-12-31T23:59:60Z')).toBe(midnight);
+    expect(at('2026-01-01T01:59:60+02:00')).toBe(midnight);
+    expect(at('0001-01-01T00:00:00Z')).toBe(Date.parse('0001-01-01T00:00:00Z'));
+  });
+
+  test('parseDateTime accepts exactly what Ajv accepts', () => {
+    for (const ts of TIMESTAMPS) {
+      const rec = { ...base, timestamp: ts, messageType: 'CALL', action: 'X' };
+      expect([ts, parseDateTime(ts) !== undefined]).toEqual([ts, ajvValidate(rec) as boolean]);
     }
   });
 });
