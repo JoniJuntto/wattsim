@@ -229,22 +229,35 @@ function formatStmtLines(s: Stmt, depth: number, pad: string): string[] {
     case 'log':
     case 'fail':
       return line(`${s.kind} ${strExpr(s.message)}`);
+    case 'use':
+      return line(`use ${s.target} ${str(s.name)}`);
   }
 }
 
 /**
- * Canonical formatting: 2-space indent, one statement per line, `csms` and `let`s grouped under the header, a blank
- * line before every proc and station block. Comments stay with the declaration or statement they precede, or trail.
+ * Canonical formatting: 2-space indent, one statement per line, `import`s grouped under the header, then `csms` and
+ * `let`s as one group, a blank line before every quirk, proc and station block. Comments stay with the declaration or
+ * statement they precede, or trail.
  */
 export function format(s: Scenario): string {
   const c = s.comments;
   const out: string[] = withComments(['wattsim 1'], c?.header, '');
+  if (s.imports.length) {
+    out.push('');
+    for (const i of s.imports) out.push(...withComments([`import ${str(i.path)}`], i.comments, ''));
+  }
   const preamble: string[] = [];
   if (s.csms) preamble.push(...withComments([`csms ${strExpr(s.csms)}`], c?.csms, ''));
   for (const l of s.lets) preamble.push(...withComments([`let ${l.name} = ${formatExpr(l.value)}`], l.comments, ''));
   if (preamble.length) {
     out.push('');
     out.push(...preamble);
+  }
+  for (const q of s.quirks) {
+    out.push('');
+    out.push(
+      ...withComments([`quirk ${str(q.name)} {`, ...formatBlock(q.body, 1, q.endComments), '}'], q.comments, ''),
+    );
   }
   for (const p of s.procs) {
     out.push('');

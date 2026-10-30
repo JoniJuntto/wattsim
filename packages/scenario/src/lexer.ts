@@ -61,6 +61,9 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   'call',
   'log',
   'fail',
+  'use',
+  'quirk',
+  'import',
 ]);
 
 const PUNCT2 = ['..'];

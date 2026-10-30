@@ -4,10 +4,10 @@
  * stations own those through `@wattsim/core`. Local-first, no auth (DESIGN.md §3).
  */
 import { resolve } from 'node:path';
-import { validatePayload } from '@wattsim/protocol';
-import { Elysia } from 'elysia';
 import { type Csms, startCsms } from '@wattsim/csms';
 import { createTestCa, signCsr } from '@wattsim/pki';
+import { validatePayload } from '@wattsim/protocol';
+import { Elysia } from 'elysia';
 import pkg from '../package.json' with { type: 'json' };
 import { buildMeta } from './meta';
 import { Conflict, FRAMES_PER_STATION, NotFound, Registry } from './registry';

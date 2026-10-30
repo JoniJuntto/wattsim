@@ -21,7 +21,7 @@ station "CP-1" {
 }
 ```
 
-Order of the top-level declarations is free, but the formatter always emits them in this order: header, `csms`, `let`s, procs, stations.
+Order of the top-level declarations is free, but the formatter always emits them in this order: header, `import`s, `csms`, `let`s, quirks, procs, stations. See [Quirk profiles](#quirk-profiles) for `import` and `quirk`.
 
 ### Lexical rules
 
@@ -111,9 +111,93 @@ The station name is its OCPP identity, so every instance needs its own:
 - A template name must use its loop variable: `station "CP-1" for i in 1..3` is a parse error at the name, `station name "CP-1" does not use the loop variable {i}: every instance of the range would get the same name`.
 - Two blocks must not produce the same name. Two literal names (`station "CP-1"` twice) are a parse error. Names that depend on `let`s or ranges are compared when the run starts, before anything connects: `station "CP-{i}" for i in 1..3` next to `station "CP-{n}" for n in 3..4` fails `wattsim run` with `file:7:9: duplicate station name "CP-3": the station block at 3:1 has it` and exit code 2.
 
+## Quirk profiles
+
+A quirk profile is a named bundle of station behaviour: configuration, fault rules and scripted replies that make a simulated station act like a particular kind of real one. It describes how the station behaves; it never drives a session.
+
+```
+wattsim 1
+
+import "../quirks/late-status.ws"
+
+quirk "refuses-reset" {
+  heartbeat 10min
+  on Reset always {
+    error NotSupported "no resets"
+  }
+  chaos delay 2s out MeterValues
+}
+
+station "CP-1" {
+  version 1.6
+  use quirk "late-status"
+  use quirk "refuses-reset"
+  boot
+}
+```
+
+### `quirk`
+
+`quirk "NAME" { ... }` is a top-level declaration, in the scenario file itself or in a separate quirk file. The name is a plain string (no `{interpolation}`) and must be unique across everything a run loads. A quirk block takes these statements and no others:
+
+| Statement | Notes |
+|---|---|
+| `heartbeat <dur>`, `meterInterval <dur>` | Bare `heartbeat` sends a Heartbeat and is not allowed. |
+| `vendor`, `model`, `serial`, `evses`, `connectors`, `auth` | Not `version`: the scenario picks the protocol, a quirk works with any. |
+| `chaos ...` | Any fault rule. |
+| `on ACTION ... { ... }` | Scripted answers to CSMS CALLs. |
+| `clock skew <dur>`, `clock drift N ppm` | Not `clock set`, `freeze`, `resume` or `speed`, which act at a moment or on the run. |
+| `log "..."` | |
+| `use quirk "..."`, `use plugin "..."` | A quirk may build on others. |
+
+Anything that acts (`boot`, `connect`, `ev`, `start`, `send`, `expect`, `wait`, `at`, `repeat`, `net`, ...) is a parse error at the statement, for example `q.ws:3:3: 'boot' is not allowed in a quirk: a quirk describes how a station behaves, it does not drive a session (allowed: heartbeat <duration>, meterInterval, vendor, model, serial, evses, connectors, auth, chaos, on, clock skew, clock drift, log and use)`.
+
+### `import`
+
+`import "PATH"` at the top level makes the quirks declared in another file available. The path is a plain string, relative to the file the `import` is in (absolute paths work too). An imported file starts with `wattsim 1` and holds only `import` and `quirk` declarations; a `station`, `proc`, `let` or `csms` in it is an error in that file. Imports are transitive, and a file reached twice is read once, so two libraries may import a third and imports may be circular.
+
+### `use quirk` and `use plugin`
+
+`use quirk "NAME"` is a statement (in a station block, a proc or another quirk) that runs the quirk's statements at that point, as if they were written there. The order is therefore the order of the statements:
+
+- Configuration is last-writer-wins. A station statement after `use quirk` overrides the quirk (`use quirk "chatty"` then `heartbeat 30s` gives 30 s); one before it is overridden by it.
+- `chaos` rules and `on` handlers accumulate in the order they run, quirk rules included. For `on`, the first installed handler that matches answers, so a quirk used before the station's own `on` for the same action wins; for `chaos`, the usual first-match rule applies (see [`chaos`](#chaos)).
+- The usual placement rules hold inside a quirk too: configuration and `clock skew` / `clock drift` from a quirk used after `boot` fail the station (`'vendor' must appear before 'connect'/'boot' (station already created)`). Put `use quirk` before `boot`.
+- Each time a `use quirk` statement runs, the quirk applies again: inside `repeat 3 { ... }` its chaos rules are added three times.
+
+`wattsim run --quirk FILE.ws` and `--quirk NAME` (repeatable) apply quirks to every station, as if `use quirk` statements were the first statements of every station block, so the scenario's own statements override them. A value ending in `.ws` is a quirk file: it is loaded like an `import`, and when no name is given every quirk the file itself declares is applied, in file order. Names pick the quirks to apply, in command-line order, from the scenario, its imports and the `--quirk` files. `wattsim check --quirk ...` checks the same combination without running it.
+
+Names are checked before anything connects: `use quirk "nope"` with no such quirk is `file:line:col: unknown quirk "nope" (known: "slow-boot", ...)` from `check` (exit 1) and from `run` (exit 2), and so are a quirk that uses itself (`quirk "a" uses itself: "a" -> "b" -> "a"`), the same name declared twice, an unreadable import and a missing plugin file.
+
+### Plugins: code-level quirks
+
+Behaviour the DSL cannot express goes in a TypeScript or JavaScript module:
+
+```
+station "CP-1" {
+  version 2.0.1
+  use plugin "./quirks/firmware-reboot.ts"
+  boot
+}
+```
+
+```ts
+import type { QuirkPlugin } from '@wattsim/scenario';
+
+const plugin: QuirkPlugin = (station, { clock, log }) => {
+  const off = station.on('frame', (direction, frame) => {
+    if (direction === 'in' && frame.type === 2 && frame.action === 'UpdateFirmware') log('firmware update requested');
+  });
+  return () => off(); // cleanup, optional
+};
+export default plugin;
+```
+
+The path is resolved like an `import`: relative to the file the `use plugin` statement is in, which for a quirk from a quirk file is that file. The module's default export is `(station: Station, ctx: { clock, log }) => void | (() => void)`. `station` is the core `Station` (its events, `interceptCall`, setters and actions), `ctx.clock` is the station's clock (skewed when the station's is) and `ctx.log(message)` emits a log line for the station. Plugins are imported when the run starts, before any station connects; `check` only verifies the file exists and never runs it. The function is called when the station is created (at its first `connect`, `boot` or other statement that needs it), in statement order together with `on` handlers, or at once when `use plugin` runs after that. The function it returns is called when the run disconnects the station, last plugin first. A plugin that throws fails its station with the statement's `line:col`. A plugin is code you run with your own permissions, like the scenario that names it; see DECISIONS.md.
+
 ## Statements
 
-All statements live inside a `station` or `proc` block. One per line.
+All statements live inside a `station`, `proc` or `quirk` block (a quirk takes only some of them). One per line.
 
 ### Configuration
 
@@ -386,7 +470,7 @@ The formatter emits payloads on one line.
 
 ## Formatting
 
-`wattsim fmt file.ws` prints the canonical form. `--write` rewrites files in place (one or several), and `--check` prints the path of every file that is not canonical, one per line, and changes nothing: `wattsim fmt --check examples/*.ws` is the CI form. Canonical form is: two-space indent, one statement per line, a blank line after the header when `csms` or `let`s follow, a blank line before every `proc` and `station` and before comments that end the file, `at`/`repeat`/`choose`/`on` bodies on their own lines, EV property blocks and payloads on one line, durations as described under [Durations](#durations), comments as described under [Lexical rules](#lexical-rules). Formatting is idempotent: `fmt` of `fmt` output is the same text.
+`wattsim fmt file.ws` prints the canonical form. `--write` rewrites files in place (one or several), and `--check` prints the path of every file that is not canonical, one per line, and changes nothing: `wattsim fmt --check examples/*.ws` is the CI form. Canonical form is: two-space indent, one statement per line, a blank line after the header when `csms` or `let`s follow, a blank line before every `proc` and `station` and before comments that end the file, `at`/`repeat`/`choose`/`on` bodies on their own lines, EV property blocks and payloads on one line, durations as described under [Durations](#durations), comments as described under [Lexical rules](#lexical-rules), `import`s together right under the header, and a blank line before every `quirk` block, which comes before the procs. Formatting is idempotent: `fmt` of `fmt` output is the same text.
 
 ## Error messages
 
@@ -407,7 +491,7 @@ Errors found while running (a variable of the wrong type, a negative `wait`) fai
 
 | Command | 0 | 1 | 2 |
 |---|---|---|---|
-| `wattsim check` | file parses | parse error (printed as `file:line:col: message`) | |
+| `wattsim check` | file parses and its quirks resolve | parse or quirk error (printed as `file:line:col: message`) | |
 | `wattsim fmt` | already canonical, or rewritten with `--write` | not canonical (printing or `--check`), or a parse error | `--check` with `--write`, or several files without either |
 | `wattsim run` | every assertion passed and no station failed | at least one failed `expect`, `fail` or station error | parse error, or a scenario error found as the run starts (a range bound that is not an integer, duplicate station names); nothing connected |
 

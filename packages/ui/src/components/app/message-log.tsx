@@ -81,7 +81,14 @@ function WireGlyph({ ex, bad }: { ex: Exchange; bad: boolean }) {
     const c = color(f);
     return (
       <g key={f.seq} stroke={c} fill={c}>
-        <line x1={x1} y1={y} x2={x2 - dir * 6} y2={y} strokeWidth={1.75} strokeDasharray={dashed ? '3.5 2.5' : undefined} />
+        <line
+          x1={x1}
+          y1={y}
+          x2={x2 - dir * 6}
+          y2={y}
+          strokeWidth={1.75}
+          strokeDasharray={dashed ? '3.5 2.5' : undefined}
+        />
         <path d={`M${x2},${y} l${-dir * 6},-4 v8 z`} stroke="none" />
         <circle cx={x1} cy={y} r={2.5} stroke="none" />
       </g>
@@ -398,7 +405,10 @@ export function MessageLog({ stationId, className }: { stationId: string; classN
   const filtered = visible.length !== exchanges.length;
 
   return (
-    <section aria-label="Message log" className={cn('@container flex min-h-0 flex-col rounded-md border bg-card', className)}>
+    <section
+      aria-label="Message log"
+      className={cn('@container flex min-h-0 flex-col rounded-md border bg-card', className)}
+    >
       <div className="flex flex-col gap-2 border-b p-2">
         <div className="flex items-center gap-2">
           <h2 className="font-semibold text-sm">Message log</h2>

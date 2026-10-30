@@ -156,6 +156,11 @@ export type ClockStmt =
 export type CallStmt = { kind: 'call'; proc: string; loc: Loc };
 export type LogStmt = { kind: 'log'; message: StrExpr; loc: Loc };
 export type FailStmt = { kind: 'fail'; message: StrExpr; loc: Loc };
+/**
+ * `use quirk "name"` runs a quirk's statements at this point; `use plugin "path"` loads a code-level quirk module.
+ * `name` is a string literal without interpolation: a quirk name, or a path relative to the file the statement is in.
+ */
+export type UseStmt = { kind: 'use'; target: 'quirk' | 'plugin'; name: StringExpr; loc: Loc };
 
 export type Stmt = (
   | VersionStmt
@@ -189,6 +194,7 @@ export type Stmt = (
   | CallStmt
   | LogStmt
   | FailStmt
+  | UseStmt
 ) & { comments?: Comments };
 
 export type StmtKind = Stmt['kind'];
@@ -216,10 +222,28 @@ export type StationBlock = {
   endComments?: string[];
 };
 
+/** `import "lib.ws"`: makes the quirks of another file available. `path` is a literal, relative to this file. */
+export type ImportDecl = { kind: 'import'; path: StringExpr; loc: Loc; comments?: Comments };
+
+/**
+ * `quirk "name" { ... }`: a named bundle of station behaviour (configuration, `chaos`, `on`, `clock skew|drift`,
+ * `log`, `use`). It never drives a session, so the parser rejects statements that act (`boot`, `wait`, ...).
+ */
+export type QuirkDecl = {
+  kind: 'quirk';
+  name: StringExpr;
+  body: Stmt[];
+  loc: Loc;
+  comments?: Comments;
+  endComments?: string[];
+};
+
 export type Scenario = {
   version: 1;
   csms?: StrExpr;
+  imports: ImportDecl[];
   lets: LetDecl[];
+  quirks: QuirkDecl[];
   procs: ProcDecl[];
   stations: StationBlock[];
   /** Comments on the header line and the `csms` line, and comments after the last declaration. */

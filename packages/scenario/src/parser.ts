@@ -16,6 +16,7 @@ import type {
   ExpectFrame,
   ExpectStmt,
   Expr,
+  ImportDecl,
   JsonEntry,
   JsonValue,
   LetDecl,
@@ -28,6 +29,7 @@ import type {
   ProcDecl,
   Prop,
   PropValue,
+  QuirkDecl,
   RepeatStmt,
   Scenario,
   StationBlock,
@@ -63,6 +65,44 @@ const CHAOS_FAULTS: ReadonlySet<string> = new Set([
 ]);
 const CHAOS_TAIL_WORDS: ReadonlySet<string> = new Set(['nth', 'every', 'from', 'probability', 'once']);
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** What a quirk block may hold: statements that describe behaviour. Everything else acts on the session. */
+const QUIRK_STMTS: ReadonlySet<string> = new Set([
+  'heartbeat',
+  'meterInterval',
+  'vendor',
+  'model',
+  'serial',
+  'evses',
+  'connectors',
+  'auth',
+  'chaos',
+  'on',
+  'clock',
+  'log',
+  'use',
+]);
+const QUIRK_ALLOWED =
+  'heartbeat <duration>, meterInterval, vendor, model, serial, evses, connectors, auth, chaos, on, clock skew, clock drift, log and use';
+
+/**
+ * Why `stmt` cannot appear in a quirk block, or undefined when it can. A quirk describes how a station behaves; it
+ * does not drive a session, so anything that sends, waits or asserts is out, and so is `version` (the scenario
+ * picks the protocol).
+ */
+export function quirkStatementError(stmt: Stmt): string | undefined {
+  const allowed = QUIRK_STMTS.has(stmt.kind);
+  if (allowed && stmt.kind === 'heartbeat' && !stmt.interval) {
+    return "bare 'heartbeat' sends a Heartbeat now and is not allowed in a quirk; give an interval: 'heartbeat 30s'";
+  }
+  if (allowed && stmt.kind === 'clock' && stmt.mode !== 'skew' && stmt.mode !== 'drift') {
+    return `'clock ${stmt.mode}' is not allowed in a quirk; only 'clock skew' and 'clock drift' describe a station's clock`;
+  }
+  if (allowed) return undefined;
+  if (stmt.kind === 'version') {
+    return "'version' is not allowed in a quirk: the scenario picks the OCPP version, a quirk works with any";
+  }
+  return `'${stmt.kind}' is not allowed in a quirk: a quirk describes how a station behaves, it does not drive a session (allowed: ${QUIRK_ALLOWED})`;
+}
 
 /** Parse a scenario source into its AST. Throws `ParseError` with a 1-based location. */
 export function parse(src: string, file?: string): Scenario {
@@ -372,7 +412,7 @@ class Parser {
     this.attach(header, headLeading);
     this.endStmt('wattsim header');
 
-    const scenario: Scenario = { version: 1, lets: [], procs: [], stations: [] };
+    const scenario: Scenario = { version: 1, imports: [], lets: [], quirks: [], procs: [], stations: [] };
     const comments: NonNullable<Scenario['comments']> = {};
     if (header.comments) comments.header = header.comments;
     for (;;) {
@@ -395,6 +435,17 @@ class Parser {
         case 'let':
           scenario.lets.push(this.parseLet(leading));
           break;
+        case 'import':
+          scenario.imports.push(this.parseImport(leading));
+          break;
+        case 'quirk': {
+          const quirk = this.parseQuirk(leading);
+          const name = Parser.literal(quirk.name);
+          const first = scenario.quirks.find((q) => Parser.literal(q.name) === name);
+          if (first) this.fail(`duplicate quirk "${name}" (first declared at line ${first.loc.line})`, quirk.name.loc);
+          scenario.quirks.push(quirk);
+          break;
+        }
         case 'proc':
           scenario.procs.push(this.parseProc(leading));
           break;
@@ -431,6 +482,37 @@ class Parser {
     const node: LetDecl = { kind: 'let', name, value, loc: Parser.loc(kw) };
     this.attach(node, leading);
     this.endStmt('let');
+    return node;
+  }
+
+  /** A string literal without interpolation: a quirk name or a file path. */
+  private expectPlain(what: string): StringExpr {
+    const s = this.expectString(what);
+    if (Parser.literal(s) === undefined) this.fail(`${what} must be a plain string without {interpolation}`, s.loc);
+    if (Parser.literal(s) === '') this.fail(`${what} must not be empty`, s.loc);
+    return s;
+  }
+
+  private parseImport(leading: string[]): ImportDecl {
+    const kw = this.advance();
+    const path = this.expectPlain("file path after 'import'");
+    const node: ImportDecl = { kind: 'import', path, loc: Parser.loc(kw) };
+    this.attach(node, leading);
+    this.endStmt('import');
+    return node;
+  }
+
+  private parseQuirk(leading: string[]): QuirkDecl {
+    const kw = this.advance();
+    const name = this.expectPlain("quirk name after 'quirk'");
+    this.expectPunct('{', `to open quirk "${name.raw}"`);
+    const [body, end] = this.parseBlockBody('quirk', kw);
+    for (const stmt of body) {
+      const problem = quirkStatementError(stmt);
+      if (problem) this.fail(problem, stmt.loc);
+    }
+    const node = withEnd<QuirkDecl>({ kind: 'quirk', name, body, loc: Parser.loc(kw) }, end);
+    this.attach(node, leading);
     return node;
   }
 
@@ -657,6 +739,16 @@ class Parser {
       case 'fail': {
         this.advance();
         return { kind: t.value, message: this.parseStr(`message after '${t.value}'`), loc };
+      }
+      case 'use': {
+        this.advance();
+        const what = this.peek();
+        if (!this.atWord('quirk') && !this.atWord('plugin')) {
+          this.fail(`expected 'quirk' or 'plugin' after 'use', got ${Parser.describe(what)}`);
+        }
+        const target = this.advance().value as 'quirk' | 'plugin';
+        const name = this.expectPlain(target === 'quirk' ? "quirk name after 'use quirk'" : "path after 'use plugin'");
+        return { kind: 'use', target, name, loc };
       }
       default:
         return this.fail(`unknown statement '${t.value}'`);

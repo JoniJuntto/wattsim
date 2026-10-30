@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@wattsim/core": "workspace:*",
+    "@wattsim/csms": "workspace:*",
     "@wattsim/mcp": "workspace:*",
     "@wattsim/protocol": "workspace:*",
     "@wattsim/scenario": "workspace:*",

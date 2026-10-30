@@ -60,7 +60,17 @@
  *   EVSE, no active transaction, ...) marks the station `failed` with the message and stops that station only.
  * - `fail "x"` fails the station with `x`; `log` emits a `log` event. The station stays connected until every
  *   station has finished; then `run` disconnects them all and resolves.
+ * - Quirks (see quirks.ts): the run resolves imports and quirk names before anything connects, so an unknown quirk
+ *   or a missing file rejects `run` with a `ParseError` or `QuirkError`. `use quirk "q"` runs q's statements at that
+ *   point as if they were written there (configuration after the station exists fails it, as usual), so later
+ *   statements override earlier ones and `chaos` / `on` rules accumulate in the order they run. Quirks given in
+ *   `RunOptions.quirks` / `quirkFiles` run first in every station, before its own statements.
+ * - `use plugin "p"` modules are imported when the run starts. The module's default export is called with the
+ *   station when it is created (at once when it already exists), in statement order with `on` handlers; the
+ *   function it returns is called, last plugin first, when the run disconnects the station. A plugin that throws
+ *   fails the station.
  */
+import { resolve } from 'node:path';
 import type {
   CallAnswer,
   ChaosEffect,
@@ -104,9 +114,12 @@ import type {
   Stmt,
   StrExpr,
   StringExpr,
+  UseStmt,
 } from './ast';
 import { formatDuration, formatDurExpr } from './format';
 import { ParseError } from './lexer';
+import type { Linked, QuirkPlugin, QuirkSource } from './quirks';
+import { link, loadPlugins } from './quirks';
 
 // ---- public types ----------------------------------------------------------------------------------------------
 
@@ -124,6 +137,12 @@ export type RunOptions = {
   stationFactory?: (cfg: StationConfig) => Station;
   /** Aborting fails every running station with `aborted` and lets `run` resolve. */
   signal?: AbortSignal;
+  /** The scenario's file: `import` and `use plugin` paths resolve against its directory (default: the cwd). */
+  file?: string;
+  /** Quirk files loaded as if imported; without `quirks`, every quirk they declare applies to every station. */
+  quirkFiles?: string[];
+  /** Quirks applied to every station before its own statements, in this order. */
+  quirks?: string[];
 };
 
 export type RunEvent =
@@ -139,9 +158,18 @@ export type RunResult = { ok: boolean; stations: StationResult[]; violations: Vi
 
 export const DEFAULT_EXPECT_TIMEOUT_MS = 30_000;
 
+/**
+ * Resolving quirks and loading plugins reads files, which takes event-loop turns; `driveVirtual` waits for it so the
+ * virtual clock does not move before the stations start.
+ */
+const preparing = new WeakMap<Promise<RunResult>, Promise<unknown>>();
+
 /** Run a parsed scenario. Resolves once every station instance has finished and been disconnected. */
-export async function run(scenario: Scenario, opts: RunOptions): Promise<RunResult> {
-  return new Run(scenario, opts).execute();
+export function run(scenario: Scenario, opts: RunOptions): Promise<RunResult> {
+  const r = new Run(scenario, opts);
+  const running = r.execute();
+  preparing.set(running, r.ready);
+  return running;
 }
 
 // ---- driving a virtual clock -----------------------------------------------------------------------------------
@@ -200,6 +228,7 @@ export async function driveVirtual(
   );
   // Handled at `return done`; without this a run that rejects while the loop yields is reported as unhandled.
   done.catch(() => {});
+  await preparing.get(running)?.catch(() => {});
   const start = clock.now();
   while (!settled) {
     for (let i = 0; i < SETTLE_YIELDS && !settled; i++) await yieldToEventLoop();
@@ -446,8 +475,11 @@ function bump(scope: DrawScope, key: string): number {
   return n;
 }
 
-/** Everything the `at` cursor, block timing and random draws need per sequential branch. */
-type Branch = { cursor: number; scope: DrawScope };
+/**
+ * Everything the `at` cursor, block timing and random draws need per sequential branch. `dir` is what `use plugin`
+ * paths resolve against: the scenario's directory, or the quirk file's inside a quirk from another file.
+ */
+type Branch = { cursor: number; scope: DrawScope; dir: string };
 
 // ---- the run ---------------------------------------------------------------------------------------------------
 
@@ -460,6 +492,10 @@ class Run {
   private readonly barriers = new Barriers();
   private readonly violations: Violation[] = [];
   private readonly runners: InstanceRunner[] = [];
+  private linked: Linked | undefined;
+  private plugins = new Map<string, QuirkPlugin>();
+  /** Quirk resolution and plugin loading, started at construction. */
+  readonly ready: Promise<void>;
 
   constructor(scenario: Scenario, opts: RunOptions) {
     this.scenario = scenario;
@@ -467,11 +503,20 @@ class Run {
     this.clock = opts.clock;
     for (const p of scenario.procs) this.procs.set(p.name, p.body);
     for (const l of scenario.lets) this.lets.set(l.name, l);
+    this.ready = this.prepare();
+    this.ready.catch(() => {}); // rethrown by execute()
+  }
+
+  private async prepare(): Promise<void> {
+    const { file, quirkFiles, quirks } = this.opts;
+    this.linked = await link(this.scenario, { file, quirkFiles, quirks });
+    this.plugins = await loadPlugins(this.linked);
   }
 
   async execute(): Promise<RunResult> {
     const csmsUrl = this.opts.csmsUrl ?? this.scenarioCsms();
     if (!csmsUrl) throw new Error('scenario has no csms URL: add `csms "ws://..."` or pass RunOptions.csmsUrl');
+    await this.ready;
     const start = this.clock.now();
     const instances = this.expand();
     for (const inst of instances) {
@@ -525,6 +570,22 @@ class Run {
 
   proc(name: string): Stmt[] | undefined {
     return this.procs.get(name);
+  }
+
+  get dir(): string {
+    return this.linked?.dir ?? process.cwd();
+  }
+
+  get appliedQuirks(): QuirkSource[] {
+    return this.linked?.applied ?? [];
+  }
+
+  quirk(name: string): QuirkSource | undefined {
+    return this.linked?.quirks.get(name);
+  }
+
+  plugin(abs: string): QuirkPlugin | undefined {
+    return this.plugins.get(abs);
   }
 
   emit(e: RunEvent): void {
@@ -731,8 +792,10 @@ class InstanceRunner {
   private rejectAbort: ((err: Error) => void) | undefined;
   private readonly aborted: Promise<never>;
   private callDepth = 0;
-  /** `on` handlers seen before the station existed; installed by `ensureStation`. */
-  private readonly pendingOn: OnStmt[] = [];
+  /** `on` handlers and plugins seen before the station existed; installed by `ensureStation`, in order. */
+  private readonly pendingInstall: ((station: Station) => void)[] = [];
+  /** What the plugins returned, called on shutdown. */
+  private readonly cleanups: { name: string; fn: () => void }[] = [];
 
   constructor(run: Run, inst: Instance, csmsUrl: string) {
     this.run = run;
@@ -753,7 +816,12 @@ class InstanceRunner {
     const start = this.clock.now();
     this.emit({ type: 'station', station: this.name, status: 'started', at: start });
     try {
-      await this.runBlock(this.inst.block.body, { cursor: 0, scope: { path: '', counts: new Map() } });
+      const branch: Branch = { cursor: 0, scope: { path: '', counts: new Map() }, dir: this.run.dir };
+      for (const q of this.run.appliedQuirks) {
+        const scope = this.subScope(branch, `quirk:${q.decl.name.raw}`, q.decl.loc);
+        await this.applyQuirk(q, { ...branch, scope }, q.decl.name.raw);
+      }
+      await this.runBlock(this.inst.block.body, branch);
       await this.awaitBranches();
     } catch (err) {
       this.abort(toError(err));
@@ -775,6 +843,14 @@ class InstanceRunner {
   }
 
   async shutdown(): Promise<void> {
+    for (const { name, fn } of this.cleanups.splice(0).reverse()) {
+      try {
+        fn();
+      } catch (err) {
+        const message = `error: plugin ${name} cleanup: ${toError(err).message}`;
+        this.emit({ type: 'log', station: this.name, message, at: this.clock.now() });
+      }
+    }
     await this.station?.disconnect();
   }
 
@@ -814,7 +890,7 @@ class InstanceRunner {
    * compound statement's start: for a following `expect` the compound statement is a single statement.
    */
   private nested(branch: Branch): Branch {
-    return { cursor: branch.cursor, scope: branch.scope };
+    return { cursor: branch.cursor, scope: branch.scope, dir: branch.dir };
   }
 
   /** A new draw path under `branch` for the `kind` statement at `loc` (an `at` branch or a proc call). */
@@ -932,7 +1008,7 @@ class InstanceRunner {
         const scope = this.subScope(branch, 'at', stmt.loc);
         const task = (async () => {
           await this.sleep(Math.max(0, due - this.clock.now()));
-          await this.runBlock(body, { cursor: this.log.nextSeq, scope });
+          await this.runBlock(body, { cursor: this.log.nextSeq, scope, dir: branch.dir });
         })();
         task.catch((err: unknown) => this.abort(toError(err)));
         this.branches.push(task);
@@ -965,7 +1041,10 @@ class InstanceRunner {
         return;
       case 'on':
         if (this.station) this.intercept(this.station, stmt);
-        else this.pendingOn.push(stmt);
+        else this.pendingInstall.push((station) => this.intercept(station, stmt));
+        return;
+      case 'use':
+        await this.use(stmt, branch);
         return;
       case 'chaos':
         this.addChaos(stmt, branch.scope);
@@ -979,7 +1058,8 @@ class InstanceRunner {
         if (this.callDepth > 32) throw new StationFailure(`proc '${stmt.proc}' recurses too deeply`);
         this.callDepth++;
         try {
-          await this.runBlock(body, { cursor: branch.cursor, scope: this.subScope(branch, 'call', stmt.loc) });
+          const scope = this.subScope(branch, 'call', stmt.loc);
+          await this.runBlock(body, { cursor: branch.cursor, scope, dir: this.run.dir });
         } finally {
           this.callDepth--;
         }
@@ -1137,7 +1217,7 @@ class InstanceRunner {
     };
     const station = this.run.stationFactory(config);
     this.station = station;
-    for (const stmt of this.pendingOn.splice(0)) this.intercept(station, stmt);
+    for (const install of this.pendingInstall.splice(0)) install(station);
     station.on('frame', (direction, frame) => this.onFrame(direction, frame));
     station.on('violation', (v) => {
       this.run.recordViolation(v);
@@ -1197,6 +1277,45 @@ class InstanceRunner {
         return { error: ['InternalError', e.message] };
       }
     });
+  }
+
+  /** `use quirk` runs the quirk's statements here; `use plugin` installs the preloaded module (see the module comment). */
+  private async use(stmt: UseStmt, branch: Branch): Promise<void> {
+    const name = stmt.name.parts.join('');
+    if (stmt.target === 'quirk') {
+      const q = this.run.quirk(name);
+      if (!q) throw new StationFailure(`${at(stmt.name.loc)}: unknown quirk "${name}"`);
+      await this.applyQuirk(q, { ...branch, scope: this.subScope(branch, 'use', stmt.loc) }, name);
+      return;
+    }
+    const abs = resolve(branch.dir, name);
+    const plugin = this.run.plugin(abs);
+    if (!plugin) throw new StationFailure(`${at(stmt.name.loc)}: plugin ${name} was not loaded`);
+    const install = (station: Station) => {
+      let cleanup: unknown;
+      try {
+        cleanup = plugin(station, {
+          clock: station.clock,
+          log: (message) => this.emit({ type: 'log', station: this.name, message, at: this.clock.now() }),
+        });
+      } catch (err) {
+        throw new StationFailure(`${at(stmt.loc)}: plugin ${name} failed: ${toError(err).message}`);
+      }
+      if (typeof cleanup === 'function') this.cleanups.push({ name, fn: cleanup as () => void });
+    };
+    if (this.station) install(this.station);
+    else this.pendingInstall.push(install);
+  }
+
+  /** Run a quirk's statements in `branch`'s place, with its own directory for `use plugin`. */
+  private async applyQuirk(q: QuirkSource, branch: Branch, name: string): Promise<void> {
+    if (this.callDepth > 32) throw new StationFailure(`quirk "${name}" nests too deeply`);
+    this.callDepth++;
+    try {
+      await this.runBlock(q.decl.body, { cursor: branch.cursor, scope: branch.scope, dir: q.dir });
+    } finally {
+      this.callDepth--;
+    }
   }
 
   private async ev(stmt: EvStmt): Promise<void> {

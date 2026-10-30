@@ -4,7 +4,7 @@ A spec-strict, scriptable OCPP 1.6/2.0.1/2.1 simulator for every side of the wir
 
 ## Status
 
-A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. Security profiles 1 to 3 and the full certificate lifecycle work against a built-in test CA. It also ships a CSMS simulator that checks any charger's traffic for spec conformance, and an MCP server so AI agents can drive it. A proxy records real charger traffic in the Open OCPP Trace format, injects faults into it, and replays or converts recordings to scenarios. Vendor quirk profiles are in progress. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
+A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. Security profiles 1 to 3 and the full certificate lifecycle work against a built-in test CA. It also ships a CSMS simulator that checks any charger's traffic for spec conformance, and an MCP server so AI agents can drive it. A proxy records real charger traffic in the Open OCPP Trace format, injects faults into it, and replays or converts recordings to scenarios. Quirk profiles bundle a charger's oddities (config, faults, scripted replies) into a reusable file, and can be drafted from a recording. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
 
 ## Quick start
 
@@ -28,6 +28,7 @@ bun packages/cli/src/index.ts run examples/basic.ws --csms ws://localhost:9000/o
 | `--junit <out.xml>` | Write a JUnit report, one test case per station |
 | `--seed <n>` | Seed for `choose` and probabilistic chaos, so fleet runs are reproducible |
 | `--quiet` | Summary only, no per-frame lines |
+| `--quirk <file.ws\|name>` | Apply quirk profiles to every station before its own statements; repeatable |
 
 `wattsim fmt <file>` prints the canonical formatting and exits 1 when the file is not already canonical. `wattsim fmt --write <files...>` rewrites files in place; `wattsim fmt --check <files...>` lists the files that are not canonical and exits 1 if there are any, which makes it the CI check.
 
@@ -250,6 +251,24 @@ A frame a chaos rule touches is still recorded as its sender sent it, with the r
 
 From TypeScript (`@wattsim/trace`): `new Recorder({ path }).attach(station)` records a core `Station`, `startProxy(...)` runs the proxy, `replay(entries, { csmsUrl, virtual })` returns a report, `toScenario(entries)` returns `.ws` text, and `readTrace`, `parseTrace`, `formatTrace` and `writeTrace` handle the files.
 
+## Quirk profiles
+
+Real chargers bend the spec in ways a CSMS has to survive: a heartbeat every 15 seconds, StatusNotifications that lag the state they report, a remote stop answered Accepted and then ignored. A quirk profile packs one such behaviour into a named block of the scenario DSL, so any simulated station can borrow it.
+
+```sh
+wattsim run fleet.ws --virtual --quirk quirks/chatty-heartbeat.ws      # every station, every quirk in the file
+wattsim run fleet.ws --virtual --quirk lib.ws --quirk late-status      # only the named quirk from lib.ws
+wattsim quirk derive session.jsonl -o draft.ws                          # draft a profile from a recording
+```
+
+A quirk is a top-level `quirk "name" { ... }` holding configuration (`heartbeat`, `meterInterval`, `vendor`, `model`, `serial`, `evses`, `connectors`, `auth`), `chaos` rules, `on` replies, `clock skew` / `clock drift` and `log`. Statements that act, such as `boot` or `wait`, are a parse error inside one. A station applies it with `use quirk "name"`, and `import "lib.ws"` loads the quirks of another file, relative to the importing file. The quirk's statements run where `use` stands, so a later `heartbeat 30s` in the station overrides the quirk's, and chaos rules and `on` replies pile up in the order they run. `--quirk` on `run` (repeatable) applies quirks to every station before its own statements: a `.ws` value loads a file and, with no names given, applies every quirk it declares; any other value names a quirk. `check` takes the same flag and reports unknown names, cycles and missing files as `file:line:col: message`.
+
+Code-level quirks are plugins. `use plugin "./my-quirk.ts"` imports the module when the run starts and calls its default export, `(station, { clock, log }) => cleanup?`, when the station is created. It gets the core `Station`, so it can listen to frames, intercept CALLs or drive the station. A plugin is local code that runs with your permissions, like the scenario that loads it.
+
+`wattsim quirk derive <trace> [--version 1.6] [--name n] [-o out.ws]` reads a recording (any format `replay` reads), runs it through the CSMS simulator's conformance checker and writes a draft profile. The draft lists every finding as a comment with its spec reference and trace line. It infers `vendor` / `model` / `serial`, the heartbeat and meter intervals, and the clock offset and drift. It writes `on` replies for CSMS CALLs the station refused or answered with an invalid payload, plus `chaos` rules for CALLs it never answered, CALLs it sent twice and meter samples missing from a regular series. Any other finding becomes a `// TODO`. The draft passes `check` and `fmt --check`.
+
+`quirks/` holds six generic examples (`slow-boot`, `lossy-meter`, `chatty-heartbeat`, `ignores-remote-stop`, `clock-drift`, `late-status`) and [how to contribute one](quirks/README.md). The project ships no profiles named after vendors.
+
 ## Development
 
 ```sh
@@ -268,7 +287,7 @@ Packages, all Bun workspaces under `packages/`:
 - `csms`: the CSMS simulator and conformance checker
 - `mcp`: the MCP server for AI agents (`wattsim mcp`)
 - `trace`: Open OCPP Trace reading and writing, the recording proxy, replay, and trace-to-scenario conversion
-- `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`, `mcp`, `proxy`, `replay`)
+- `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`, `mcp`, `proxy`, `replay`, `quirk`)
 
 Style is Biome with two-space indent and single quotes; lefthook runs lint and typecheck on commit. Tests are `bun test` and never touch the network except through the in-repo fake CSMS.
 

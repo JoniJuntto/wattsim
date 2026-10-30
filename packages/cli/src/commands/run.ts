@@ -4,9 +4,10 @@ import { attachMetrics, Station, serveMetrics, VirtualClock, WallClock } from '@
 import type { Frame } from '@wattsim/protocol';
 import { MessageType } from '@wattsim/protocol';
 import type { RunEvent, RunOptions, RunResult } from '@wattsim/scenario';
-import { driveVirtual, isIdle, ParseError, run as runScenario, toJUnit } from '@wattsim/scenario';
+import { driveVirtual, isIdle, ParseError, QuirkError, run as runScenario, toJUnit } from '@wattsim/scenario';
 import { defineCommand } from 'citty';
 import { err, loadScenario, out } from '../load';
+import { quirkFlags } from './quirk';
 
 const MAX_VIRTUAL_MS = 24 * 3_600_000;
 const JSON_WIDTH = 120;
@@ -142,9 +143,15 @@ export const run = defineCommand({
     junit: { type: 'string', description: 'Write a JUnit XML report to this path' },
     seed: { type: 'string', description: 'Seed for deterministic chaos and choose blocks' },
     quiet: { type: 'boolean', description: 'Suppress per-event output' },
+    quirk: {
+      type: 'string',
+      description:
+        'Quirk file (.ws) or quirk name applied to every station before its own statements; repeatable. Files alone apply all their quirks, names pick',
+    },
   },
-  async run({ args }) {
+  async run({ args, rawArgs }) {
     const { scenario } = await loadScenario(args.file, 2);
+    const quirks = quirkFlags(rawArgs);
     if (!args.csms && !scenario.csms) await badFlag('no CSMS URL: pass --csms or add a csms line');
     const speed = await parseNumber('speed', args.speed, (n) => n > 0);
     const seed = await parseNumber('seed', args.seed, Number.isInteger);
@@ -182,6 +189,9 @@ export const run = defineCommand({
       seed,
       signal: controller.signal,
       stationFactory,
+      file: args.file,
+      quirkFiles: quirks.files,
+      quirks: quirks.names,
       onEvent: args.quiet ? undefined : (e) => printer.write(formatter.format(e)),
     };
 
@@ -203,9 +213,14 @@ export const run = defineCommand({
     } catch (e) {
       await printer.flush();
       if (e instanceof ParseError) {
-        // A scenario error found once the lets are resolved (range bounds, duplicate station names): nothing connected.
-        e.file = args.file;
+        // A scenario error found once the lets are resolved (range bounds, duplicate station names, quirks): nothing
+        // connected. Quirk errors already name the file they are in.
+        e.file ??= args.file;
         await err(`${String(e)}\n`);
+        process.exit(2);
+      }
+      if (e instanceof QuirkError) {
+        await err(`${e.message}\n`);
         process.exit(2);
       }
       await err(`run failed: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`);
