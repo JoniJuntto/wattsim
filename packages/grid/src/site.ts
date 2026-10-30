@@ -13,9 +13,9 @@
  * (V_out,k = V_in,k - Z_phase I_k - Z_neutral (I_1 + I_2 + I_3) for a cable).
  */
 
-import { type CheckIssue, checkCompiled } from './checks';
+import { type CheckIssue, checkCompiled, type SelectivityResult, selectivityPairs } from './checks';
 import { type CNode, type CompiledSite, compileSite, SiteValidationError } from './compile';
-import type { TripCause, TripCurve } from './curves';
+import { heatAfter, type TripCause, type TripCurve, timeToTrip } from './curves';
 import { createLoadModel, type LoadModel } from './loads';
 import { currentPhasor, PHASE_ANGLE, PHASES, type Phase, type Triple } from './phases';
 import { type Draws, type LeafDraw, type NodeKind, type SiteDescription, SUPPLY_ID } from './types';
@@ -261,6 +261,11 @@ export class Site {
   /** Static checks: selectivity, cable protection coordination, ratings. */
   check(): CheckIssue[] {
     return checkCompiled(this.c);
+  }
+
+  /** Selectivity of every pair of protective devices in series: total or partial, with the limit current Is. */
+  selectivity(): SelectivityResult[] {
+    return selectivityPairs(this.c);
   }
 
   /** Draws of every leaf with a model at `t`. Merge with the EVSE draws before `evaluate`. */
@@ -514,9 +519,8 @@ export class Site {
       let phases: Kx[] = [];
       let cause: TripCause = 'thermal';
       for (const k of closed) {
-        const T = curve.thermalTime(mag[k] / curve.ratingA);
-        if (!Number.isFinite(T)) continue;
-        const dt = Math.max(0, 1 - d.heat[k]) * T;
+        const dt = timeToTrip(curve, mag[k] / curve.ratingA, d.heat[k]);
+        if (!Number.isFinite(dt)) continue;
         if (dt < best - 1e-12) {
           best = dt;
           phases = [k];
@@ -555,8 +559,7 @@ export class Site {
           anyClosed = true;
           mMax = Math.max(mMax, m);
         }
-        const T = closed ? curve.thermalTime(m) : Number.POSITIVE_INFINITY;
-        d.heat[k] = Number.isFinite(T) ? Math.min(1, d.heat[k] + dtS / T) : d.heat[k] * Math.exp(-dtS / curve.coolingS);
+        d.heat[k] = heatAfter(curve, m, d.heat[k], dtS);
       }
       curve.elements.forEach((e, j) => {
         d.timers[j] = anyClosed && mMax >= e.m ? (d.timers[j] ?? 0) + dtS : 0;

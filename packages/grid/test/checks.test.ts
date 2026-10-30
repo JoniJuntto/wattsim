@@ -10,7 +10,7 @@ const evse: NodeDescription = { kind: 'evse', id: 'CP' };
 const of = (d: SiteDescription, kind: string) => checkSite(d).filter((i) => i.kind === kind);
 
 describe('selectivity', () => {
-  test('C20 above C16 is not selective at the C16 magnetic threshold', () => {
+  test('C20 above C16 is partially selective, up to the C20 median magnetic threshold', () => {
     const d = desc([
       {
         kind: 'breaker',
@@ -27,13 +27,14 @@ describe('selectivity', () => {
         severity: 'warning',
         nodeId: 'Q0',
         relatedId: 'Q1',
-        currentA: 160,
-        message: '"Q0" (C20) trips in 0.01 s at 160 A, no later than "Q1" (C16) (0.01 s): not selective',
+        currentA: 150,
+        message:
+          '"Q0" (C20) over "Q1" (C16): partial selectivity, Is 150 A below the prospective fault current 6 kA; at Is "Q0" (C20) trips in 0.01 s, "Q1" (C16) trips in 0.01 s',
       },
     ]);
   });
 
-  test('a gG 63 A fuse above a B16 MCB is selective', () => {
+  test('a gG 63 A fuse above a B16 MCB is selective up to 1.42 kA, where the fuse melts within 10 ms', () => {
     const d = desc([
       {
         kind: 'fuse',
@@ -42,7 +43,10 @@ describe('selectivity', () => {
         children: [{ kind: 'breaker', id: 'Q', type: 'mcb', curve: 'B', ratingA: 16, children: [evse] }],
       },
     ]);
-    expect(of(d, 'selectivity')).toEqual([]);
+    expect(of(d, 'selectivity')).toEqual([
+      expect.objectContaining({ nodeId: 'F', relatedId: 'Q', currentA: expect.closeTo(450 * Math.sqrt(10), 3) }),
+    ]);
+    expect(of({ ...d, supply: { ...d.supply, faultCurrentA: 1000 } }, 'selectivity')).toEqual([]);
   });
 
   test('gG fuses: 63 over 25 is selective, 63 over 50 is not (ratio under 1.6)', () => {
@@ -55,14 +59,15 @@ describe('selectivity', () => {
   });
 
   test('every protective ancestor is compared, and an MCCB short-time delay can restore selectivity', () => {
-    const tree = (tsd?: number) =>
-      desc([
+    const tree = (tsd?: number): SiteDescription => ({
+      supply: { phases: 3, voltageV: 400, faultCurrentA: 4000 },
+      nodes: [
         {
           kind: 'breaker',
           id: 'M',
           type: 'mccb',
           ratingA: 400,
-          isd: 2,
+          isd: 10,
           ...(tsd !== undefined ? { tsd } : {}),
           children: [
             {
@@ -73,7 +78,8 @@ describe('selectivity', () => {
             },
           ],
         },
-      ]);
+      ],
+    });
     const pairs = (d: SiteDescription) => of(d, 'selectivity').map((i) => `${i.nodeId}>${i.relatedId}`);
     expect(pairs(tree(0.01))).toEqual(['M>F', 'M>Q']);
     expect(pairs(tree(0.3))).toEqual([]);

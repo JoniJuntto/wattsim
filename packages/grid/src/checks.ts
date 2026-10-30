@@ -2,11 +2,15 @@
  * Static checks of a valid site, reported as warnings and notes rather than errors: a site that breaks them can
  * still be simulated, and often that is the point of the test.
  *
- * - Selectivity: at the current where a downstream device is sure to operate fast (top of an MCB's magnetic
- *   range, MCCB short-time / instantaneous pickup +20 %, gG fuse Imax(0.1 s)), an upstream device that trips no
- *   later than it is not selective. Worst case across the tolerance bands: the upstream device at its fast edge,
- *   the downstream one at its slow edge. Time-current curves only; energy-based selectivity tables from
- *   manufacturers are out of scope.
+ * - Selectivity, per pair of protective devices in series, in IEC 60947-2 Annex A terms: over every current from
+ *   the downstream device's setting up to the prospective fault current at it, the downstream device must clear
+ *   before the upstream one operates. Up to the current where the downstream device is sure to operate fast (top
+ *   of an MCB's magnetic range, MCCB short-time / instantaneous pickup +20 %, gG fuse Imax(0.1 s)), the overload
+ *   zone, both devices are compared at their median curves. From there up, the short-circuit zone, the worst case
+ *   across the tolerance bands: the upstream device at its fast edge against the downstream one at its slow edge.
+ *   The lowest current where that fails is the selectivity limit current Is: selectivity is partial when Is is
+ *   below the prospective fault current, total otherwise. Time-current curves only; energy-based selectivity
+ *   tables from manufacturers are out of scope.
  * - Cable coordination, IEC 60364-4-43 §433.1: Ib <= In <= Iz and I2 <= 1.45 Iz, with In and I2 of the nearest
  *   protective device upstream (In <= Iz itself is a validation error). Ib is the sum of the declared leaf ratings
  *   below the cable, skipped when a leaf has none.
@@ -34,6 +38,8 @@ export function checkSite(desc: SiteDescription): CheckIssue[] {
 }
 
 const fmt = (x: number) => (Math.abs(x) >= 100 ? x.toFixed(0) : x.toPrecision(3).replace(/\.?0+$/, ''));
+const fmtT = (t: number) => (Number.isFinite(t) ? `trips in ${fmt(t)} s` : 'does not trip');
+const fmtA = (a: number) => (a >= 1000 ? `${fmt(a / 1000)} kA` : `${fmt(a)} A`);
 
 function describe(n: CNode): string {
   const d = n.desc;
@@ -70,6 +76,128 @@ function curveAtBand(n: CNode, band: number): TripCurve | undefined {
 }
 
 const FAST_EDGE = 1e-9;
+const MEDIAN = 0.5;
+
+/** Prospective short-circuit current at the supply point when the description gives none and no transformer. */
+export const DEFAULT_FAULT_CURRENT_A = 6000;
+
+/**
+ * Prospective short-circuit current at a node's input terminals, A: the phase voltage over the impedance of the
+ * source and of every transformer and cable above the node. A three-phase bolted fault where the node carries
+ * three phases, else a phase-to-neutral fault through the phase and neutral conductors. The source is
+ * `supply.faultCurrentA` (default 6 kA) as a pure reactance, which gives the most current with resistive cables,
+ * or nothing when the path runs through a transformer and the supply gives no fault current.
+ */
+export function prospectiveFaultA(c: CompiledSite, index: number): number {
+  const node = c.nodes[index] as CNode;
+  const loop = node.carried.length < 3;
+  let r = 0;
+  let x = 0;
+  let transformer = false;
+  for (let p = node.parent; p >= 0; p = (c.nodes[p] as CNode).parent) {
+    const a = c.nodes[p] as CNode;
+    if (a.kind === 'transformer') transformer = true;
+    if (!a.z) continue;
+    r += a.z.r + (loop ? a.z.rn : 0);
+    x += a.z.x + (loop ? a.z.xn : 0);
+  }
+  const ik0 = c.faultCurrentA ?? (transformer ? Number.POSITIVE_INFINITY : DEFAULT_FAULT_CURRENT_A);
+  x += c.phaseVoltage / ik0;
+  const z = Math.hypot(r, x);
+  return z > 0 ? c.phaseVoltage / z : Number.POSITIVE_INFINITY;
+}
+
+export type SelectivityResult = {
+  upId: string;
+  downId: string;
+  /** Total: selective up to the prospective fault current. Partial: only up to `limitA`. */
+  selectivity: 'total' | 'partial';
+  /** Selectivity limit current Is, A: the lowest current at which the upstream device may operate first. */
+  limitA?: number;
+  /** Prospective fault current at the downstream device, A. */
+  faultCurrentA: number;
+  /** Partial only: the trip times at Is of the upstream and downstream devices as compared, s. */
+  upTimeS?: number;
+  downTimeS?: number;
+};
+
+/** Ratio between neighbouring scan currents. */
+const SCAN_STEP = 1.01;
+
+/** Selectivity of every pair of protective devices in series, downstream devices in tree order, nearest first. */
+export function selectivityPairs(c: CompiledSite): SelectivityResult[] {
+  const out: SelectivityResult[] = [];
+  for (const down of c.nodes) {
+    if (!down.curve) continue;
+    for (let p = down.parent; p >= 0; p = (c.nodes[p] as CNode).parent) {
+      const up = c.nodes[p] as CNode;
+      if (!up.curve) continue;
+      const r = pairSelectivity(c, up, down);
+      if (r) out.push(r);
+    }
+  }
+  return out;
+}
+
+function pairSelectivity(c: CompiledSite, up: CNode, down: CNode): SelectivityResult | undefined {
+  const upMed = curveAtBand(up, MEDIAN);
+  const upFast = curveAtBand(up, FAST_EDGE);
+  const downMed = curveAtBand(down, MEDIAN);
+  const downSlow = curveAtBand(down, 1);
+  if (!upMed || !upFast || !downMed || !downSlow) return undefined;
+  const ik = prospectiveFaultA(c, down.index);
+  // Scan no further than 1 MA: far beyond any low-voltage fault level, and finite.
+  const hi = Math.min(ik, 1e6);
+  const lo = downSlow.settingA;
+  const zone = faultThresholdA(down) ?? lo;
+  const base = { upId: up.id, downId: down.id, faultCurrentA: ik };
+
+  // Times compared at current i: [upstream, downstream], and whether the upstream device may operate first.
+  const compare = (i: number): { up: number; down: number; lost: boolean } => {
+    if (i < zone) {
+      const u = upMed.tripTime(i / upMed.ratingA);
+      const d = downMed.tripTime(i / downMed.ratingA);
+      return { up: u, down: d, lost: Number.isFinite(u) && u <= d };
+    }
+    const m = i / upFast.ratingA;
+    const d = downSlow.tripTime(i / downSlow.ratingA);
+    let element = Number.POSITIVE_INFINITY;
+    for (const e of upFast.elements) if (m >= e.m) element = Math.min(element, e.delayS);
+    const thermal = upFast.thermalTime(m);
+    // A definite-time release that operates no later than the downstream device clears opens with it. An
+    // inverse-time edge that touches the downstream slow edge does not: the fast edge is a non-operating limit,
+    // and the IEC 60269 gates are built so that gG fuses 1.6:1 apart touch exactly.
+    return { up: Math.min(element, thermal), down: d, lost: element <= d || thermal < d * (1 - 1e-9) };
+  };
+
+  if (!(hi > lo)) return { ...base, selectivity: 'total' };
+  // Log-spaced currents from the downstream setting to the fault current, plus every threshold in between.
+  const points = new Set<number>([zone]);
+  for (const curve of [upMed, upFast, downMed, downSlow]) {
+    for (const e of curve.elements) points.add(e.m * curve.ratingA);
+  }
+  const n = Math.ceil(Math.log(hi / lo) / Math.log(SCAN_STEP));
+  for (let k = 0; k <= n; k++) points.add(lo * (hi / lo) ** (k / n));
+  const scan = [...points].filter((i) => i >= lo && i <= hi).sort((a, b) => a - b);
+  let prev: number | undefined;
+  for (const i of scan) {
+    if (compare(i).lost) {
+      let a = prev ?? i;
+      let b = i;
+      if (prev !== undefined) {
+        for (let it = 0; it < 60 && b - a > 1e-9 * b; it++) {
+          const mid = (a + b) / 2;
+          if (compare(mid).lost) b = mid;
+          else a = mid;
+        }
+      }
+      const at = compare(b);
+      return { ...base, selectivity: 'partial', limitA: b, upTimeS: at.up, downTimeS: at.down };
+    }
+    prev = i;
+  }
+  return { ...base, selectivity: 'total' };
+}
 
 /** Sum of declared leaf maxima below a node, per site phase, A; `known` is false when a leaf declares none. */
 export function designCurrent(c: CompiledSite, index: number): { perPhase: Triple; known: boolean } {
@@ -110,27 +238,19 @@ export function checkCompiled(c: CompiledSite): CheckIssue[] {
   };
 
   // Selectivity.
-  for (const down of nodes) {
-    if (!down.curve) continue;
-    const i = faultThresholdA(down);
-    const slow = curveAtBand(down, 1);
-    if (i === undefined || !slow) continue;
-    const tDown = slow.tripTime(i / slow.ratingA);
-    for (const up of ancestors(down)) {
-      const fast = up.curve ? curveAtBand(up, FAST_EDGE) : undefined;
-      if (!fast) continue;
-      const tUp = fast.tripTime(i / fast.ratingA);
-      if (tUp <= tDown) {
-        out.push({
-          kind: 'selectivity',
-          severity: 'warning',
-          nodeId: up.id,
-          relatedId: down.id,
-          currentA: i,
-          message: `${describe(up)} trips in ${fmt(tUp)} s at ${fmt(i)} A, no later than ${describe(down)} (${fmt(tDown)} s): not selective`,
-        });
-      }
-    }
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  for (const r of selectivityPairs(c)) {
+    if (r.selectivity !== 'partial' || r.limitA === undefined) continue;
+    const up = byId.get(r.upId) as CNode;
+    const down = byId.get(r.downId) as CNode;
+    out.push({
+      kind: 'selectivity',
+      severity: 'warning',
+      nodeId: up.id,
+      relatedId: down.id,
+      currentA: r.limitA,
+      message: `${describe(up)} over ${describe(down)}: partial selectivity, Is ${fmtA(r.limitA)} below the prospective fault current ${fmtA(r.faultCurrentA)}; at Is ${describe(up)} ${fmtT(r.upTimeS ?? 0)}, ${describe(down)} ${fmtT(r.downTimeS ?? 0)}`,
+    });
   }
 
   // Cable coordination.

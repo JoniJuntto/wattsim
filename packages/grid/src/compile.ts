@@ -82,6 +82,8 @@ export type CompiledSite = {
   frequencyHz: number;
   imbalanceLimitA: number;
   ratingA?: number;
+  /** Prospective short-circuit current at the supply point, A, when given. */
+  faultCurrentA?: number;
 };
 
 const positive = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0;
@@ -103,6 +105,9 @@ export function compileSite(desc: SiteDescription): { site?: CompiledSite; issue
   const frequencyHz = s.frequencyHz ?? 50;
   if (frequencyHz !== 50 && frequencyHz !== 60) add('supply.frequencyHz', `must be 50 or 60, got ${frequencyHz}`);
   if (s.ratingA !== undefined && !positive(s.ratingA)) add('supply.ratingA', 'must be a positive number');
+  if (s.faultCurrentA !== undefined && !positive(s.faultCurrentA)) {
+    add('supply.faultCurrentA', 'must be a positive number');
+  }
   if (s.imbalanceLimitA !== undefined && !positive(s.imbalanceLimitA)) {
     add('supply.imbalanceLimitA', 'must be a positive number');
   }
@@ -430,6 +435,7 @@ export function compileSite(desc: SiteDescription): { site?: CompiledSite; issue
       frequencyHz,
       imbalanceLimitA: s.imbalanceLimitA ?? 16,
       ...(s.ratingA !== undefined ? { ratingA: s.ratingA } : {}),
+      ...(s.faultCurrentA !== undefined ? { faultCurrentA: s.faultCurrentA } : {}),
     },
     issues,
   };

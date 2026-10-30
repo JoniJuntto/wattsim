@@ -8,9 +8,9 @@
  *
  * A curve has two parts:
  *   - `thermalTime(m)`: the inverse-time part with thermal memory (bimetal, fuse element, long-time release).
- *     Infinity below the pickup. `Site` integrates it as heat += dt / thermalTime(m) and cools it exponentially
- *     with `coolingS` while it is not heating; it trips when heat reaches 1, so from cold it trips at exactly
- *     thermalTime(m), and in the adiabatic region (thermalTime ∝ 1/m²) heat is I²t normalised by the curve.
+ *     Infinity below the pickup. The thermal memory (`heatRate`, `heatAfter`, `timeToTrip` below) trips when
+ *     heat reaches 1, from cold at exactly thermalTime(m); in the adiabatic region (thermalTime ∝ 1/m²) heat is
+ *     I²t normalised by the curve.
  *   - `elements`: memoryless definite-time releases (magnetic, short-time, instantaneous): trip once the current
  *     has been at or above `m` for `delayS` without interruption.
  *
@@ -38,6 +38,8 @@ export interface TripCurve {
   readonly conventionalTimeS: number;
   /** Exponential cooling time constant of the thermal memory, s. */
   readonly coolingS: number;
+  /** Pickup of the inverse-time part as a multiple of In: `thermalTime` is Infinity below it. */
+  readonly pickup: number;
   thermalTime(m: number): number;
   readonly elements: readonly DefiniteElement[];
   /** Trip time from cold at a constant m × In, s; Infinity when it never trips. */
@@ -63,11 +65,13 @@ function bandOf(opts: BandOptions): number {
 const lerp = (a: number, b: number, p: number) => a + (b - a) * p;
 const geo = (a: number, b: number, p: number) => a ** (1 - p) * b ** p;
 
+export type InverseTime = ((m: number) => number) & { readonly pickup: number };
+
 /**
  * An inverse-time curve through `anchors` ([m, seconds], m increasing, time decreasing), with an asymptotic
  * approach to the pickup before the first anchor, I²t = constant after the last, and an optional time floor.
  */
-export function inverseTime(anchors: ReadonlyArray<readonly [number, number]>, floorS = 0): (m: number) => number {
+export function inverseTime(anchors: ReadonlyArray<readonly [number, number]>, floorS = 0): InverseTime {
   if (anchors.length < 2) throw new RangeError('an inverse-time curve needs at least two anchors');
   for (let i = 1; i < anchors.length; i++) {
     const [ma, ta] = anchors[i - 1] as readonly [number, number];
@@ -81,7 +85,7 @@ export function inverseTime(anchors: ReadonlyArray<readonly [number, number]>, f
   const x = s0 < -2.2 ? s0 / (s0 + 2) : 11;
   const k = m0 / Math.sqrt(x);
   const last = anchors[anchors.length - 1] as readonly [number, number];
-  return (m: number) => {
+  const fn = (m: number) => {
     if (!(m > k)) return Number.POSITIVE_INFINITY;
     let t: number;
     if (m <= m0) {
@@ -101,6 +105,7 @@ export function inverseTime(anchors: ReadonlyArray<readonly [number, number]>, f
     }
     return Math.max(t, floorS);
   };
+  return Object.assign(fn, { pickup: k });
 }
 
 function finish(c: Omit<TripCurve, 'tripTime'>): TripCurve {
@@ -166,6 +171,7 @@ export function mcbCurve(characteristic: McbCharacteristic, ratingA: number, opt
     i2: 1.45,
     conventionalTimeS,
     coolingS: opts.coolingS ?? MCB_DEFAULT_COOLING_S,
+    pickup: thermalTime.pickup,
     thermalTime,
     elements: [{ m: lerp(lo, hi, p), delayS: INSTANTANEOUS_S, cause: 'instantaneous' }],
   });
@@ -301,6 +307,7 @@ export function gGCurve(ratingA: number, opts: BandOptions = {}): TripCurve {
   const anchors = [conv.timeS, 10, 5, 0.1].map(
     (t) => [lerp(edgeCurrentAt(fast, t), edgeCurrentAt(slow, t), p), t] as [number, number],
   );
+  const thermalTime = inverseTime(anchors);
   return finish({
     device: 'gG',
     ratingA,
@@ -309,7 +316,8 @@ export function gGCurve(ratingA: number, opts: BandOptions = {}): TripCurve {
     i2: conv.fusing,
     conventionalTimeS: conv.timeS,
     coolingS: opts.coolingS ?? (ratingA <= 63 ? 120 : 600),
-    thermalTime: inverseTime(anchors),
+    pickup: thermalTime.pickup,
+    thermalTime,
     elements: [],
   });
 }
@@ -368,10 +376,106 @@ export function mccbCurve(ratingA: number, settings: MccbSettings = {}, opts: Ba
     i2: 1.3 * ir,
     conventionalTimeS: ratingA <= 63 ? 3600 : 7200,
     coolingS: opts.coolingS ?? MCCB_DEFAULT_COOLING_S,
+    pickup: pickup * ir,
     thermalTime: (m: number) => {
       const mr = m / ir;
       return mr >= pickup ? (trEff * 36) / (mr * mr) : Number.POSITIVE_INFINITY;
     },
     elements,
   });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Thermal memory: heat h in [0, 1], trip at 1. With m = I / In, T = thermalTime(m), k = pickup, τ = coolingS and
+// H = PICKUP_HEAT:
+//
+//   below the pickup (T infinite):  dh/dt = (H (m/k)² - h) / τ
+//   at or above it:                 dh/dt = max((H - h) / τ, r(m))
+//
+// Below the pickup the release relaxes towards a steady heat proportional to I², which stays below H < 1, so a
+// constant current below the pickup never trips, however long it flows. Without load the steady heat is 0: plain
+// exponential cooling.
+// Above the pickup the heat relaxes towards H as below it, but never rises slower than the crawl rate r(m), the
+// one rate for which a cold device trips at exactly T: from 0 it relaxes to h* = H - r τ in τ ln(H / (r τ)) and
+// crawls the rest at r, so T = τ ln(H / (r τ)) + (1 - H) / r + τ. Where T <= τ / H the relaxation never beats
+// r = 1 / T, and the heat rises linearly by dt / T, as I²t. The rate rises with m and with H (m/k)², so more
+// current never leaves the device cooler, and the steady heat is continuous at the pickup.
+// Every step and the time to trip are closed-form.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Steady heat a device approaches at its pickup current (and above it, before it crawls on to 1). */
+export const PICKUP_HEAT = 0.8;
+
+/**
+ * Crawl rate r(m) of the thermal memory above the pickup, 1/s; 0 below it. r = 1 / T where T <= τ / H, else the
+ * solution of T = τ ln(H / (r τ)) + (1 - H) / r + τ.
+ */
+export function crawlRate(curve: TripCurve, m: number): number {
+  const T = curve.thermalTime(m);
+  if (!Number.isFinite(T)) return 0;
+  const tau = curve.coolingS;
+  const H = PICKUP_HEAT;
+  if (T <= tau / H) return 1 / T;
+  // With u = r τ / H and s = -ln u: s + a e^s = b, a = (1 - H) / H, b = T / τ - 1. Convex and increasing in s,
+  // with the root at or below ln(b / a): Newton from there converges monotonically.
+  const a = (1 - H) / H;
+  const b = T / tau - 1;
+  let s = Math.log(b / a);
+  for (let i = 0; i < 100; i++) {
+    const e = a * Math.exp(s);
+    const step = (s + e - b) / (1 + e);
+    s -= step;
+    if (Math.abs(step) <= 1e-15 * Math.max(1, s)) break;
+  }
+  return (H * Math.exp(-s)) / tau;
+}
+
+/** Steady heat below the pickup, H (m / k)². */
+function steadyHeat(curve: TripCurve, m: number): number {
+  const x = Math.min(1, m / curve.pickup);
+  return PICKUP_HEAT * x * x;
+}
+
+/** dh/dt of the thermal memory at a constant m × In, 1/s. */
+export function heatRate(curve: TripCurve, m: number, heat: number): number {
+  const relax = (steadyHeat(curve, m) - heat) / curve.coolingS;
+  return Number.isFinite(curve.thermalTime(m)) ? Math.max(relax, crawlRate(curve, m)) : relax;
+}
+
+/** Heat after `dtS` seconds at a constant m × In from `heat`, capped at 1. */
+export function heatAfter(curve: TripCurve, m: number, heat: number, dtS: number): number {
+  if (dtS <= 0) return heat;
+  const tau = curve.coolingS;
+  const T = curve.thermalTime(m);
+  if (!Number.isFinite(T)) {
+    const hs = steadyHeat(curve, m);
+    return hs + (heat - hs) * Math.exp(-dtS / tau);
+  }
+  const H = PICKUP_HEAT;
+  if (T <= tau / H) return Math.min(1, heat + dtS / T);
+  const r = crawlRate(curve, m);
+  const hStar = H - r * tau;
+  let h = heat;
+  let dt = dtS;
+  if (h < hStar) {
+    const t1 = tau * Math.log((H - h) / (r * tau));
+    if (dt <= t1) return H - (H - h) * Math.exp(-dt / tau);
+    h = hStar;
+    dt -= t1;
+  }
+  return Math.min(1, h + r * dt);
+}
+
+/** Seconds until the heat reaches 1 at a constant m × In from `heat`; Infinity when it never does. */
+export function timeToTrip(curve: TripCurve, m: number, heat: number): number {
+  const T = curve.thermalTime(m);
+  if (!Number.isFinite(T)) return Number.POSITIVE_INFINITY;
+  if (heat >= 1) return 0;
+  const tau = curve.coolingS;
+  const H = PICKUP_HEAT;
+  if (T <= tau / H) return (1 - heat) * T;
+  const r = crawlRate(curve, m);
+  const hStar = H - r * tau;
+  if (heat >= hStar) return (1 - heat) / r;
+  return tau * Math.log((H - heat) / (r * tau)) + (1 - hStar) / r;
 }

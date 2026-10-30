@@ -1,15 +1,19 @@
 import { describe, expect, test } from 'bun:test';
 import {
   buildSite,
+  crawlRate,
   currentPhasor,
   type Draws,
+  heatAfter,
   magnitude,
   mcbCurve,
   type NodeDescription,
   neutralCurrent,
+  PICKUP_HEAT,
   type SiteEvent,
   SUPPLY_ID,
   siteBuilder,
+  timeToTrip,
 } from '../src/index';
 
 const VPH = 400 / Math.sqrt(3);
@@ -205,16 +209,17 @@ describe('thermal memory', () => {
   test('repeated near-limit pulses trip although none would alone', () => {
     const T = curve.thermalTime(1.5);
     expect(T).toBeGreaterThan(300);
-    // Analytic: heat after each 300 s pulse, then 60 s of cooling.
+    // Closed form: heat after each 300 s pulse, then 60 s of cooling.
     let heat = 0;
     let expectedTrip = Number.NaN;
     for (let k = 0; k < 50; k++) {
       const start = k * 360;
-      if (heat + 300 / T >= 1) {
-        expectedTrip = start + (1 - heat) * T;
+      const toTrip = timeToTrip(curve, 1.5, heat);
+      if (toTrip <= 300) {
+        expectedTrip = start + toTrip;
         break;
       }
-      heat = (heat + 300 / T) * Math.exp(-60 / curve.coolingS);
+      heat = heatAfter(curve, 0, heatAfter(curve, 1.5, heat, 300), 60);
     }
     expect(expectedTrip).toBeGreaterThan(360);
     const s = c16();
@@ -272,14 +277,18 @@ describe('nextEvent', () => {
     const next = s.nextEvent();
     expect(next).toMatchObject({ type: 'trip', nodeId: 'Q1', cause: 'thermal' });
 
-    // Independent brute force: Euler steps of 1 ms over the same history.
+    // Independent brute force: Euler steps of 1 ms of the heating ODE over the same history.
     const dt = 0.001;
     let heat = 0;
     let t = 0;
     const step = (until: number, a: number) => {
-      const T = curve.thermalTime(a / 16);
+      const m = a / 16;
+      const T = curve.thermalTime(m);
+      const r = crawlRate(curve, m);
+      const steady = PICKUP_HEAT * Math.min(1, m / curve.pickup) ** 2;
       while (t < until - 1e-9 && heat < 1) {
-        heat = Number.isFinite(T) ? heat + dt / T : heat * Math.exp(-dt / curve.coolingS);
+        const relax = (steady - heat) / curve.coolingS;
+        heat += dt * (Number.isFinite(T) ? Math.max(relax, r) : relax);
         t += dt;
       }
     };
@@ -451,9 +460,10 @@ describe('trip, reclose and de-energising', () => {
     s.evaluate(0, { A: { amps: [48, 48, 48] }, B: { amps: [30, 30, 30] } });
     s.evaluate(100 * S);
     const tq = q.thermalTime(3);
-    // UP heats at 78 A until Q trips, then cools at 30 A, which is below its pickup.
+    // UP heats at 78 A until Q trips, then settles towards its steady heat at 30 A, which is below its pickup.
     expect(up.thermalTime(0.3)).toBe(Number.POSITIVE_INFINITY);
-    const expected = (tq / up.thermalTime(0.78)) * Math.exp(-(100 - tq) / up.coolingS);
+    const steady = PICKUP_HEAT * (0.3 / up.pickup) ** 2;
+    const expected = steady + (tq / up.thermalTime(0.78) - steady) * Math.exp(-(100 - tq) / up.coolingS);
     expect(s.state()?.nodes.Q?.tripped).toBe(true);
     expect(s.thermal('UP')?.[0]).toBeCloseTo(expected, 12);
   });

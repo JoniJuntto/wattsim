@@ -20,6 +20,11 @@ export type SupplyDescription = {
   ratingA?: number;
   /** Phase imbalance limit at the supply point (largest minus smallest phase current), A. Default 16. */
   imbalanceLimitA?: number;
+  /**
+   * Prospective short-circuit current at the supply point, A, used by the selectivity check. Default 6 kA, or an
+   * infinite grid upstream of a transformer node.
+   */
+  faultCurrentA?: number;
 };
 
 type NodeBase = {
