@@ -7,6 +7,7 @@ import type { CallFrame, OcppVersion, v201 } from '@wattsim/protocol';
 import type { ProfileStore } from '../charging';
 import type { Clock } from '../clock';
 import type { MeterSample } from '../meter';
+import type { SecurityEventKind, SecurityProfile, StationSecurity } from '../security';
 import type { ConnectorStatus, EvseState, ResolvedStationConfig, StartOptions } from '../station';
 
 export type BootReason = v201.BootNotificationRequest['reason'];
@@ -45,11 +46,13 @@ export type ProfilePurpose =
 /**
  * Result of handling an inbound CALL. `after` runs once the CALLRESULT has been written to the socket, so any
  * CALLs it causes (StartTransaction after RemoteStartTransaction, ...) are ordered after the reply. `null` means
- * "not handled": the station answers CALLERROR `NotImplemented`.
+ * "not handled": the station answers CALLERROR `NotImplemented`. `deferred` answers later, with the outcome the
+ * promise settles to (certificate checks are asynchronous); a rejection answers CALLERROR `InternalError`.
  */
 export type CallOutcome =
   | { result: unknown; after?: () => void | Promise<void> }
   | { error: [code: string, description: string] }
+  | { deferred: Promise<CallOutcome> }
   | null;
 
 /** The part of `Station` that adapters may use. `Station` implements it. */
@@ -93,6 +96,24 @@ export interface StationContext {
   resetEvse(evseId: number, onIdle: boolean): Promise<void>;
   /** True while an OnIdle reset (station-wide, or for `evseId`) waits for transactions to end; no new ones start. */
   resetPending(evseId?: number): boolean;
+  /** Certificate store and security profile; created on first use for stations configured without `security`. */
+  readonly security: StationSecurity;
+  /** Active security profile (1 when `security` was never configured or touched). */
+  readonly securityProfile: SecurityProfile;
+  /** The CSMS base URL the station connects to now. */
+  readonly csmsUrl: string;
+  /**
+   * SecurityEventNotification with the version's event name. Sent once the station has security state; held until
+   * a BootNotification is Accepted, queued while offline.
+   */
+  raiseSecurityEvent(kind: SecurityEventKind, techInfo?: string): void;
+  /** Certificates changed: the next connection uses the current CSMS roots and station certificate. */
+  securityChanged(): void;
+  /**
+   * Move to a (not lower) security profile, optionally on a new URL: reconnect with it, falling back to the previous
+   * profile when that first attempt fails. Resolves true when the new profile is in use.
+   */
+  switchSecurityProfile(next: { profile: SecurityProfile; url?: string }): Promise<boolean>;
 }
 
 export interface VersionAdapter {

@@ -10,6 +10,7 @@ import type { Clock } from '../clock';
 import { isoTimestamp } from '../clock';
 import type { MeterSample } from '../meter';
 import type { ConnectorStatus, EvseState, ResolvedStationConfig, TransactionState } from '../station';
+import { handleSecurity2x, sendSignCertificate, signTrigger2x } from './security';
 import type { BootReason, CallOutcome, SampleContext, StationContext, TxUpdateTrigger, VersionAdapter } from './types';
 
 type TxEvent = v201.TransactionEventRequest;
@@ -245,7 +246,8 @@ function parseSeconds(value: string): number | undefined {
   return Number.isInteger(n) && n >= 0 && value.trim() !== '' ? n : undefined;
 }
 
-type VariableEntry = { get: (st: StationContext) => string; set: (st: StationContext, v: string) => boolean };
+/** A variable without `set` is read-only: SetVariables answers Rejected. */
+type VariableEntry = { get: (st: StationContext) => string; set?: (st: StationContext, v: string) => boolean };
 
 /** Device-model variables this station understands, keyed `Component.Variable`. */
 const VARIABLES: Record<string, VariableEntry> = {
@@ -264,6 +266,15 @@ const VARIABLES: Record<string, VariableEntry> = {
       const s = parseSeconds(v);
       if (s === undefined) return false;
       st.setMeterIntervalMs(s * 1000);
+      return true;
+    },
+  },
+  // SecurityProfile is changed only through SetNetworkProfile (A05), so it is read-only here.
+  'SecurityCtrlr.SecurityProfile': { get: (st) => String(st.securityProfile) },
+  'SecurityCtrlr.OrganizationName': {
+    get: (st) => st.security.organization,
+    set: (st, v) => {
+      st.security.organization = v;
       return true;
     },
   },
@@ -351,8 +362,13 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
           after = () => st.sendTransactionUpdate(evseId, 'Trigger');
           break;
         }
-        default:
-          return { result: { status: 'NotImplemented' } satisfies v201.TriggerMessageResponse };
+        default: {
+          const use = signTrigger2x(p.requestedMessage);
+          if (!use) return { result: { status: 'NotImplemented' } satisfies v201.TriggerMessageResponse };
+          after = async () => {
+            await sendSignCertificate(st, use);
+          };
+        }
       }
       return { result: { status: 'Accepted' } satisfies v201.TriggerMessageResponse, after };
     }
@@ -397,7 +413,7 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
         if (d.attributeType !== undefined && d.attributeType !== 'Actual') {
           return { ...base, attributeStatus: 'NotSupportedAttributeType' };
         }
-        return { ...base, attributeStatus: entry.set(st, d.attributeValue) ? 'Accepted' : 'Rejected' };
+        return { ...base, attributeStatus: entry.set?.(st, d.attributeValue) ? 'Accepted' : 'Rejected' };
       });
       return { result: { setVariableResult } satisfies v201.SetVariablesResponse };
     }
@@ -482,7 +498,7 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       // Cost display is not modelled; acknowledging is what a conformant station does.
       return { result: {} satisfies v201.CostUpdatedResponse };
     default:
-      return null;
+      return handleSecurity2x(st, call);
   }
 }
 

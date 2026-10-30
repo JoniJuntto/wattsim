@@ -1,0 +1,23 @@
+{
+  "name": "@wattsim/pki",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@peculiar/asn1-ocsp": "2.11.1",
+    "@peculiar/asn1-schema": "2.11.1",
+    "@peculiar/asn1-x509": "2.11.1",
+    "@peculiar/x509": "1.14.3"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "@types/bun": "catalog:"
+  }
+}

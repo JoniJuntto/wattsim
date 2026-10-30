@@ -7,7 +7,9 @@ import { parseTime, profileProblem } from '../charging';
 import type { Clock } from '../clock';
 import { isoTimestamp } from '../clock';
 import type { MeterSample } from '../meter';
+import { MAX_CERTIFICATE_ENTRIES } from '../security';
 import type { ConnectorStatus, EvseState, ResolvedStationConfig, TransactionState } from '../station';
+import { changeSecurityProfile16, handleSecurity16 } from './security';
 import type { BootReason, CallOutcome, SampleContext, StationContext, TxUpdateTrigger, VersionAdapter } from './types';
 
 type MeterValue16 = NonNullable<v16.StopTransactionRequest['transactionData']>[number];
@@ -155,6 +157,18 @@ const CONFIG: Record<string, ConfigEntry> = {
   ChargingScheduleAllowedChargingRateUnit: { readonly: true, get: () => 'Current,Power' },
   ChargingScheduleMaxPeriods: { readonly: true, get: () => String(SMART_CHARGING_16.maxPeriods) },
   MaxChargingProfilesInstalled: { readonly: true, get: () => String(SMART_CHARGING_16.maxInstalled) },
+  // Security Whitepaper keys. SecurityProfile changes go through `changeSecurityProfile16` (upgrade, reconnect).
+  SecurityProfile: { readonly: false, get: (st) => String(st.securityProfile) },
+  CpoName: {
+    readonly: false,
+    get: (st) => st.security.organization,
+    set: (st, v) => {
+      st.security.organization = v;
+      return true;
+    },
+  },
+  CertificateStoreMaxLength: { readonly: true, get: () => String(MAX_CERTIFICATE_ENTRIES) },
+  AdditionalRootCertificateCheck: { readonly: true, get: () => 'false' },
 };
 
 function handleCall(st: StationContext, call: CallFrame): CallOutcome {
@@ -243,6 +257,7 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
     }
     case 'ChangeConfiguration': {
       const p = call.payload as v16.ChangeConfigurationRequest;
+      if (p.key === 'SecurityProfile') return changeSecurityProfile16(st, p.value);
       const entry = Object.hasOwn(CONFIG, p.key) ? CONFIG[p.key] : undefined;
       let status: v16.ChangeConfigurationResponse['status'];
       if (!entry) status = 'NotSupported';
@@ -311,7 +326,7 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       return { result, after: () => st.endTransaction(evse.id, 'UnlockCommand') };
     }
     default:
-      return null;
+      return handleSecurity16(st, call);
   }
 }
 

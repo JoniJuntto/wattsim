@@ -4,7 +4,7 @@ A spec-strict, scriptable OCPP 1.6/2.0.1/2.1 simulator for every side of the wir
 
 ## Status
 
-A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. It also ships a CSMS simulator that checks any charger's traffic for spec conformance, and an MCP server so AI agents can drive it. Vendor quirk profiles and record/replay are in progress. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
+A Bun/TypeScript library, CLI and local browser UI that simulates charge points speaking OCPP 1.6J, 2.0.1 and 2.1 against any CSMS, driven by a scenario DSL or by clicking. Security profiles 1 to 3 and the full certificate lifecycle work against a built-in test CA. It also ships a CSMS simulator that checks any charger's traffic for spec conformance, and an MCP server so AI agents can drive it. A proxy records real charger traffic in the Open OCPP Trace format, injects faults into it, and replays or converts recordings to scenarios. Vendor quirk profiles are in progress. The full design is in [DESIGN.md](DESIGN.md); decisions that would otherwise need reverse-engineering are logged in [DECISIONS.md](DECISIONS.md).
 
 ## Quick start
 
@@ -176,6 +176,80 @@ Out of the box it behaves like a reasonable CSMS for every station-initiated act
 
 Every violation carries `identity`, `rule`, `severity`, `message`, `specRef` and the `frameId` of the offending frame. The rules are plain functions over a session state and a frame (`checkStationCall`, `checkStationReply` and friends), exported for use without sockets.
 
+## Security profiles and certificates
+
+Stations speak OCPP security profiles 1, 2 and 3, and `@wattsim/pki` provides a test CA so that TLS and the certificate messages run end to end without any setup.
+
+```ts
+import { createTestCa, issueClientCert, issueServerCert, signCsr } from '@wattsim/pki';
+
+const ca = await createTestCa({ subCa: true });                  // root + issuing sub-CA, ECDSA P-256
+const server = await issueServerCert(ca, ['localhost', '127.0.0.1']); // { certPem, keyPem } for the CSMS
+const client = await issueClientCert(ca, 'CP-1');                // CN = identity, for profile 3
+
+const station = new Station({
+  id: 'CP-1', version: 'ocpp2.0.1', clock, csmsUrl: 'wss://localhost:9443',
+  basicAuth: { user: 'CP-1', password: 'a-long-password' },
+  security: { profile: 2, ca: ca.rootPem },
+  // profile 3: { profile: 3, ca: ca.rootPem, clientCert: client.certPem, clientKey: client.keyPem }
+});
+```
+
+| Profile | Transport | Station authenticates with |
+|---|---|---|
+| 1 | `ws://` | HTTP basic auth (`basicAuth`) |
+| 2 | `wss://`, server certificate checked against `security.ca` (or the system CAs when unset) | HTTP basic auth |
+| 3 | `wss://` with mutual TLS | its client certificate; no basic auth header |
+
+A profile that does not fit the URL scheme is a constructor error. Profile 3 without a client certificate fails `connect()` before any socket opens. A server certificate the CA does not vouch for, or a client certificate the CSMS refuses, fails the handshake with a `HandshakeError` (`kind`: `server-certificate`, `client-certificate`, `unauthorized`, `tls`) on the station's `error` event. With `reconnect: false` the same text ends up in the `connect()` rejection.
+
+Certificate messages, in 1.6 (Security Whitepaper) and 2.0.1 / 2.1:
+
+| Message | What the station does |
+|---|---|
+| SignCertificate | `station.signCertificate(use?)`, or TriggerMessage `SignChargingStationCertificate` / `SignV2GCertificate` / `SignCombinedCertificate` (1.6: ExtendedTriggerMessage `SignChargePointCertificate`). A fresh key pair and a real PKCS#10 CSR, CN = identity, O = `security.organization` |
+| CertificateSigned | installs the chain if it reaches an installed CSMS root (V2G root for V2G certificates) on the station clock and matches the pending key; otherwise Rejected, `InvalidCertificate` with the reason, and an InvalidChargingStationCertificate event. A new station certificate is used from the next connection |
+| InstallCertificate | accepts a valid self-signed CA certificate; Rejected otherwise, Failed when the 20-entry store is full. CSMS roots become the TLS trust for the next connection |
+| DeleteCertificate | by hash data; Failed for the station's own certificate and for the last CSMS root while on profile 2 or 3 |
+| GetInstalledCertificateIds | hash data (SHA-256) per installed certificate, V2G chains with their sub-CAs as children |
+| GetCertificateStatus, Get15118EVCertificate | `station.getCertificateStatus(...)`, `station.get15118EvCertificate(...)` (2.x). There is no ISO 15118 stack: the EXI request is a fixed placeholder |
+| SetNetworkProfile, 1.6 `SecurityProfile` | upgrade only. The station reconnects at once with the new profile (and URL) and falls back to the old one if that attempt fails. 1.6 uses `security.upgradeUrl`, or the current URL switched to `wss://` |
+| SignedUpdateFirmware, UpdateFirmware | checks the signing certificate against the manufacturer roots (InvalidCertificate otherwise), then reports Downloading through Installed. Nothing is downloaded |
+
+SecurityEventNotification starts once a station has security state: from boot when `security` is configured, otherwise after its first certificate or security message. Events: StartupOfTheDevice, ResetOrReboot, ReconfigurationOfSecurityParameters, InvalidCsmsCertificate (reported on the next successful connection), FailedToAuthenticateAtCsms, InvalidChargingStationCertificate, InvalidFirmwareSigningCertificate, FirmwareUpdated. 1.6 uses its own names, such as InvalidCentralSystemCertificate.
+
+The CSMS side of the test CA: `signCsr(ca, csrPem, { identity })` returns the chain for CertificateSigned. `ocspResponse(ca, hashData)` answers GetCertificateStatus with a signed OCSP response built from the CA's revocation table (`revokeCertificate`). `cannedEv15118Response()` answers Get15118EVCertificate. `certificateHashData(pem, issuerPem)`, `verifyChain`, `fingerprint`, `createCsr` and `generateKeyPair` (`'ec'` or `'rsa'`) cover the rest. Certificates are backdated an hour and valid for ten years by default; pass `now` to line them up with a virtual clock.
+
+## Record, replay and proxy
+
+```sh
+wattsim proxy --listen 9000 --upstream ws://csms.example/ocpp --record session.jsonl
+wattsim replay session.jsonl --csms ws://staging.example/ocpp --virtual
+wattsim replay session.jsonl --export session.ws
+```
+
+`wattsim proxy` sits between chargers and a CSMS. Point a charger at `ws://<host>:9000/<any path>/<identity>` and the proxy opens `<upstream>/<identity>`, offering the charger's subprotocols and passing its `Authorization` header on, then completes the charger's handshake with the subprotocol the CSMS chose. If the CSMS refuses, the charger gets the same HTTP status. Frames go through byte for byte, including ones that do not decode, and a close on one side closes the other with the same code (an abnormal close, which has no code to send, is passed on as an abrupt close). The proxy does not queue or reorder anything; keeping one CALL in flight stays the endpoints' job.
+
+| Flag | Meaning |
+|---|---|
+| `--listen <port>` or `<host:port>` | Where chargers connect (default host `127.0.0.1`) |
+| `--upstream <url>` | The CSMS; the charger identity is appended |
+| `--record <file>` | Append every frame to a trace file as it passes |
+| `--format oot\|frames` | Trace format, default `oot` (see below) |
+| `--chaos "<rules>"` | DSL chaos statements without the `chaos` keyword, several separated by `;`: `--chaos "drop out MeterValues nth 3; delay 2s in every 2"`. `out` is charger to CSMS, `in` CSMS to charger. Counters run per connection. |
+| `--seed <n>` | Seed for `probability` rules |
+| `--quiet` | No per-frame lines |
+
+A frame a chaos rule touches is still recorded as its sender sent it, with the rule noted in `meta.wattsim.chaos`. With `callError` on a CALL the proxy answers the sender itself, and that CALLERROR is recorded with `meta.wattsim.injected`.
+
+**Trace files.** Recordings use the [Open OCPP Trace Format](https://github.com/open-ocpp-trace/specification) v1.1: one JSON record per message, with the verbatim frame in `raw`. Its Apache-2.0 schema and conformance fixtures are vendored under `packages/trace/schemas/open-ocpp-trace`. v1.1 has no record for text that is not an OCPP-J array or for the 2.1 message types SEND and CALLRESULTERROR, so those are left out of an `oot` file and the proxy prints a warning. `--format frames` writes wattsim's own line format instead, which keeps everything: `{"ts": "<ISO 8601>", "dir": "out" | "in", "identity": "CP-1", "version": "ocpp1.6", "frame": [2, "id", "Action", {}]}`. A frame that is not JSON is kept as a string. Reading accepts Open OCPP Trace records, frames lines and bare `[2, ...]` frames, one per line and mixed freely, or a JSON array of records. A bare frame has no direction: a CALL takes its action's initiator (DataTransfer counts as the station's) and a response goes opposite to its CALL.
+
+**Replay.** `wattsim replay <trace> --csms <url>` connects once per identity in the trace and sends the station's frames again, at the recorded pace (`--speed n` for n times faster) or, with `--virtual`, as soon as the CSMS has answered what came before. Each CSMS frame in the trace becomes an expectation. A CALL matches the next CALL of the same action, and a response matches the answer to the station CALL it answered. Payloads are compared like `expect` in a scenario (keys you would write must match, extra keys are fine) after removing timestamps and CSMS-assigned ids (`id`, `transactionId`, `requestId`, `remoteStartId`, `reservationId`, `chargingProfileId`). A station answer to a CSMS CALL goes out under the id the live CSMS used. Mismatches print as `trace.jsonl:<line>: <identity>: <what differed>`, and so do CSMS frames the trace does not have. Exit code 0 means everything matched, 1 means mismatches (a refused connection included), 2 means unreadable input or a bad flag. Other flags: `--identity NEW` or `OLD=NEW[,OLD=NEW]`, `--version 1.6` for lines that carry none, `--auth user:password`, and `--timeout <s>` per expected frame (default 30).
+
+**Trace to scenario.** `--export out.ws` (or `-` for stdout) writes the trace as a `.ws` scenario instead of replaying it. Station messages become `boot`, `heartbeat` and `authorize` where those send exactly the recorded message; everything else becomes `send ACTION {payload}`. The CSMS's answers become `expect result` and `expect error`, its CALLs `expect call`, and the station's recorded answers become `on` handlers. `wait`s keep the recorded gaps. The output passes `wattsim check` and `wattsim fmt --check`.
+
+From TypeScript (`@wattsim/trace`): `new Recorder({ path }).attach(station)` records a core `Station`, `startProxy(...)` runs the proxy, `replay(entries, { csmsUrl, virtual })` returns a report, `toScenario(entries)` returns `.ws` text, and `readTrace`, `parseTrace`, `formatTrace` and `writeTrace` handle the files.
+
 ## Development
 
 ```sh
@@ -190,9 +264,11 @@ Packages, all Bun workspaces under `packages/`:
 - `scenario`: the DSL (lexer, parser, AST, formatter, interpreter) and JUnit reporting
 - `server`: the local UI server: HTTP API and browser stream over the core, the built-in test CSMS, session export
 - `ui`: the browser app (React, Vite, Tailwind, shadcn); `bun run --filter @wattsim/ui dev` runs it against a server on port 7700
+- `pki`: the built-in test certificate authority (certificates, CSR signing, OCSP)
 - `csms`: the CSMS simulator and conformance checker
 - `mcp`: the MCP server for AI agents (`wattsim mcp`)
-- `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`, `mcp`)
+- `trace`: Open OCPP Trace reading and writing, the recording proxy, replay, and trace-to-scenario conversion
+- `cli`: the `wattsim` command (`run`, `check`, `fmt`, `ui`, `mcp`, `proxy`, `replay`)
 
 Style is Biome with two-space indent and single quotes; lefthook runs lint and typecheck on commit. Tests are `bun test` and never touch the network except through the in-repo fake CSMS.
 

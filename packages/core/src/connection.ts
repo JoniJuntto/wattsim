@@ -26,6 +26,19 @@ export type SendMessage = { action: string; payload: unknown };
 
 export type ReconnectPolicy = { initialMs: number; maxMs: number; factor: number };
 
+/**
+ * TLS client settings for `wss://` (OCPP security profiles 2 and 3), passed to Bun's WebSocket. `ca` replaces the
+ * system trust store; `cert` (PEM chain, leaf first) and `key` (PKCS#8 PEM) present a client certificate.
+ */
+export type ConnectionTls = { ca?: string | string[]; cert?: string; key?: string; rejectUnauthorized?: boolean };
+
+/** The parts of a connection that `reconfigure` can change; they apply from the next socket opened. */
+export type ConnectionEndpoint = {
+  url: string;
+  basicAuth?: { user: string; password: string };
+  tls?: ConnectionTls;
+};
+
 export type ConnectionOptions = {
   /** CSMS endpoint; the identity is appended as the last path segment. */
   url: string;
@@ -33,6 +46,7 @@ export type ConnectionOptions = {
   version: OcppVersion;
   clock: Clock;
   basicAuth?: { user: string; password: string };
+  tls?: ConnectionTls;
   /** Default 30000. Counted from the moment the CALL is actually sent, not from when it was queued. */
   requestTimeoutMs?: number;
   /** Default `{ initialMs: 1000, maxMs: 60000, factor: 2 }`; `false` disables reconnecting. */
@@ -78,6 +92,56 @@ export class QueueOverflowError extends Error {
     super(`${action}: dropped from the outbound queue (${maxQueue} CALLs already queued)`);
     this.name = 'QueueOverflowError';
   }
+}
+
+/**
+ * Why opening the socket failed, from what Bun reports. `server-certificate`: the CSMS certificate did not verify
+ * against the trusted CA (or its name did not match). `client-certificate`: the CSMS refused the TLS handshake for
+ * want of an acceptable client certificate. `unauthorized`: the HTTP upgrade was answered 401 (basic auth).
+ * `tls`: any other TLS failure.
+ */
+export type HandshakeFailure = 'server-certificate' | 'client-certificate' | 'unauthorized' | 'tls';
+
+/** The socket could not be opened for a TLS or authentication reason; emitted through `error`. */
+export class HandshakeError extends Error {
+  constructor(
+    readonly kind: HandshakeFailure,
+    readonly url: string,
+    readonly detail: string,
+  ) {
+    super(`${HANDSHAKE_TEXT[kind]} (${url}): ${detail}`);
+    this.name = 'HandshakeError';
+  }
+}
+
+const HANDSHAKE_TEXT: Record<HandshakeFailure, string> = {
+  'server-certificate': 'CSMS certificate rejected',
+  'client-certificate': 'CSMS refused the client certificate',
+  unauthorized: 'CSMS refused the credentials',
+  tls: 'TLS handshake failed',
+};
+
+const SERVER_CERT_FAILURES =
+  /unable to verify|self[- ]signed certificate|certificate has expired|certificate is not yet valid|unable to get (local )?issuer|hostname|IP address mismatch|does not match|certificate verify failed|CERT_/i;
+
+/** Classify Bun's WebSocket error text; `undefined` when it is not a TLS or authentication failure. */
+export function classifyHandshake(message: string, clientCert: boolean): HandshakeFailure | undefined {
+  if (/Expected 101 status code: 401\b/.test(message)) return 'unauthorized';
+  if (/TLS handshake failed/i.test(message)) {
+    // The server's alert names the problem with our certificate; our own verification failures carry no alert.
+    if (
+      /ALERT_(CERTIFICATE_REQUIRED|BAD_CERTIFICATE|UNKNOWN_CA|CERTIFICATE_UNKNOWN|UNSUPPORTED_CERTIFICATE|CERTIFICATE_REVOKED|CERTIFICATE_EXPIRED|ACCESS_DENIED)/i.test(
+        message,
+      )
+    ) {
+      return 'client-certificate';
+    }
+    if (SERVER_CERT_FAILURES.test(message)) return 'server-certificate';
+    return 'tls';
+  }
+  // A server that rejects a client certificate signed by a CA it does not trust closes the socket mid-handshake.
+  if (clientCert && /Connection ended/i.test(message)) return 'client-certificate';
+  return undefined;
 }
 
 /** A CALL got no CALLRESULT/CALLERROR within `requestTimeoutMs`. */
@@ -131,10 +195,12 @@ type Waiter = { resolve: () => void; reject: (err: Error) => void };
 const WS_OPEN = 1;
 
 export class Connection extends TypedEmitter<ConnectionEvents> {
-  private readonly url: string;
+  private url: string;
+  private readonly identity: string;
   private readonly version: OcppVersion;
   private readonly clock: Clock;
-  private readonly headers: Record<string, string>;
+  private headers: Record<string, string>;
+  private tls: ConnectionTls | undefined;
   private readonly requestTimeoutMs: number;
   private readonly reconnect: ReconnectPolicy | false;
   private readonly chaos: ChaosEngine | undefined;
@@ -151,15 +217,19 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   private attempts = 0;
   private openWaiters: Waiter[] = [];
   private closeWaiters: Array<() => void> = [];
+  /** `tryConnect` in progress: a failed attempt rejects instead of scheduling a reconnect. */
+  private singleAttempt = false;
+  /** The last socket error since the last successful open, for the rejection message. */
+  private lastError: Error | undefined;
 
   constructor(opts: ConnectionOptions) {
     super();
-    this.url = `${opts.url.replace(/\/+$/, '')}/${encodeURIComponent(opts.identity)}`;
+    this.identity = opts.identity;
+    this.url = endpointUrl(opts.url, opts.identity);
     this.version = opts.version;
     this.clock = opts.clock;
-    this.headers = opts.basicAuth
-      ? { Authorization: `Basic ${btoa(`${opts.basicAuth.user}:${opts.basicAuth.password}`)}` }
-      : {};
+    this.headers = authHeaders(opts.basicAuth);
+    this.tls = opts.tls;
     this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.reconnect = opts.reconnect === undefined ? DEFAULT_RECONNECT : opts.reconnect;
     this.chaos = opts.chaos;
@@ -171,6 +241,30 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
 
   get state(): ConnectionState {
     return this.currentState;
+  }
+
+  /** The endpoint the next socket opens: CSMS URL with the identity appended. */
+  get endpoint(): string {
+    return this.url;
+  }
+
+  /** Change URL, credentials or TLS settings. An open socket is not touched; the next one uses them. */
+  reconfigure(endpoint: ConnectionEndpoint): void {
+    this.url = endpointUrl(endpoint.url, this.identity);
+    this.headers = authHeaders(endpoint.basicAuth);
+    this.tls = endpoint.tls;
+  }
+
+  /**
+   * One connection attempt: resolves when it opens, rejects (without scheduling a reconnect) when it fails. After it
+   * opens, a later drop reconnects as usual.
+   */
+  tryConnect(): Promise<void> {
+    if (this.currentState !== 'Disconnected') return this.connect();
+    this.singleAttempt = true;
+    return this.connect().finally(() => {
+      this.singleAttempt = false;
+    });
   }
 
   /**
@@ -240,11 +334,15 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
 
   private open(): void {
     this.setState('Connecting');
-    const ws = new WebSocket(this.url, { protocols: [this.version], headers: this.headers });
+    const ws = this.tls
+      ? new WebSocket(this.url, { protocols: [this.version], headers: this.headers, tls: this.tls })
+      : new WebSocket(this.url, { protocols: [this.version], headers: this.headers });
     this.ws = ws;
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this.attempts = 0;
+      this.lastError = undefined;
+      this.singleAttempt = false;
       if (ws.protocol !== this.version) {
         this.emit('error', new Error(`CSMS negotiated subprotocol '${ws.protocol}', expected '${this.version}'`));
       }
@@ -259,9 +357,16 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       const data: unknown = ev.data;
       this.onRaw(typeof data === 'string' ? data : Buffer.from(data as ArrayBuffer).toString('utf8'));
     };
-    ws.onerror = () => {
+    ws.onerror = (ev) => {
       if (this.ws !== ws) return;
-      this.emit('error', new Error(`websocket error (${this.url})`));
+      const message = (ev as { message?: unknown }).message;
+      const detail = typeof message === 'string' && message ? message : '';
+      const kind = detail ? classifyHandshake(detail, this.tls?.cert !== undefined) : undefined;
+      const err = kind
+        ? new HandshakeError(kind, this.url, detail.replace(/^WebSocket connection to '[^']*' failed: /, ''))
+        : new Error(`websocket error (${this.url})${detail ? `: ${detail}` : ''}`);
+      this.lastError = err;
+      this.emit('error', err);
     };
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;
@@ -277,10 +382,15 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
     this.closeWaiters = [];
     for (const w of closeWaiters) w();
     if (!this.wantConnected) return;
-    if (this.reconnect === false) {
+    if (this.reconnect === false || this.singleAttempt) {
       this.wantConnected = false;
+      this.singleAttempt = false;
       const detail = code === undefined ? '' : ` (${code}${reason ? `: ${reason}` : ''})`;
-      this.rejectOpenWaiters(new Error(`connection closed${detail} and reconnect is disabled`));
+      const cause = this.lastError;
+      const why = this.reconnect === false ? 'reconnect is disabled' : 'this was a single attempt';
+      this.rejectOpenWaiters(
+        new Error(`connection closed${detail} and ${why}${cause ? `: ${cause.message}` : ''}`, { cause }),
+      );
       return;
     }
     const { initialMs, maxMs, factor } = this.reconnect;
@@ -573,6 +683,14 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
     for (const v of result.violations) this.emit('violation', v);
     return result.violations;
   }
+}
+
+function endpointUrl(url: string, identity: string): string {
+  return `${url.replace(/\/+$/, '')}/${encodeURIComponent(identity)}`;
+}
+
+function authHeaders(basicAuth: { user: string; password: string } | undefined): Record<string, string> {
+  return basicAuth ? { Authorization: `Basic ${btoa(`${basicAuth.user}:${basicAuth.password}`)}` } : {};
 }
 
 /** Drop the closing bracket so the text is no longer valid JSON. */

@@ -10,12 +10,14 @@
  * Every outbound CALL goes through `request()`, which emits `error` once when it fails and still rejects to the
  * caller, so fire-and-forget sends (heartbeats, meter values) never become unhandled rejections.
  */
-import type { CallFrame, OcppVersion } from '@wattsim/protocol';
+import type { CallFrame, OcppVersion, v201 } from '@wattsim/protocol';
 import { ocpp16 } from './adapters/ocpp16';
 import { ocpp21 } from './adapters/ocpp21';
 import { ocpp201 } from './adapters/ocpp201';
+import { schemeProblem, sendSignCertificate } from './adapters/security';
 import type {
   BootReason,
+  CallOutcome,
   ResetRequest,
   SampleContext,
   StationContext,
@@ -26,13 +28,29 @@ import type { ChaosEngine } from './chaos';
 import type { ChargingProfile } from './charging';
 import { ProfileStore } from './charging';
 import type { Clock, Timer } from './clock';
-import type { ConnectionEvents, ConnectionOptions, ConnectionState } from './connection';
-import { CallError, Connection, QueueOverflowError, RequestTimeoutError, ViolationError } from './connection';
+import { isoTimestamp } from './clock';
+import type {
+  ConnectionEndpoint,
+  ConnectionEvents,
+  ConnectionOptions,
+  ConnectionState,
+  HandshakeFailure,
+} from './connection';
+import {
+  CallError,
+  Connection,
+  HandshakeError,
+  QueueOverflowError,
+  RequestTimeoutError,
+  ViolationError,
+} from './connection';
 import type { EvConfig } from './ev';
 import { EvModel } from './ev';
 import { TypedEmitter } from './events';
 import type { MeterSample } from './meter';
 import { MeterModel } from './meter';
+import type { CertificateSigningUse, SecurityConfig, SecurityEventKind, SecurityProfile } from './security';
+import { StationSecurity, securityEventName } from './security';
 
 /** 1.6 vocabulary; the 2.0.1 adapter maps Preparing, Charging, SuspendedEV, SuspendedEVSE and Finishing to `Occupied`. */
 export type ConnectorStatus =
@@ -67,7 +85,13 @@ export type StationConfig = {
   maxCurrentA?: number;
   /** Default 3. */
   phases?: 1 | 3;
+  /** Profile 1 and 2 send it as HTTP Basic auth; profile 3 authenticates with the client certificate instead. */
   basicAuth?: { user: string; password: string };
+  /**
+   * OCPP security profile, CA and client certificate. Omitted: profile 1, no SecurityEventNotification until a
+   * certificate or security message creates the security state.
+   */
+  security?: SecurityConfig;
   chaos?: ChaosEngine;
   strict?: boolean;
   requestTimeoutMs?: number;
@@ -160,6 +184,9 @@ const MANUAL_STATUSES: ReadonlySet<ConnectorStatus> = new Set<ConnectorStatus>([
 export type CallAnswer = { result: unknown } | { error: [code: string, description: string] } | undefined;
 export type CallInterceptor = (call: CallFrame) => CallAnswer;
 
+/** Base64 placeholder for an EV's EXI CertificateInstallationReq (no ISO 15118 stack). */
+const CANNED_EXI_REQUEST = Buffer.from('wattsim-canned-15118-exi-request').toString('base64');
+
 const ADAPTERS: Record<OcppVersion, VersionAdapter> = { 'ocpp1.6': ocpp16, 'ocpp2.0.1': ocpp201, 'ocpp2.1': ocpp21 };
 
 function toError(err: unknown): Error {
@@ -217,6 +244,15 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   private held: Array<() => void> = [];
   /** Installed by `interceptCall`; undefined (not empty) when there are none, so the inbound path pays one check. */
   private interceptors: CallInterceptor[] | undefined;
+  /** Security state; undefined for profile-1 stations until a certificate or security message needs it. */
+  private sec: StationSecurity | undefined;
+  private baseUrl: string;
+  private readonly basicAuth: { user: string; password: string } | undefined;
+  /** SecurityEventNotifications raised before the first Accepted boot (or during a reboot). */
+  private heldEvents: unknown[] | undefined;
+  /** Handshake failures already reported since the last successful connection (one event per failure streak). */
+  private handshakeReported: Set<HandshakeFailure> | undefined;
+  private startupReported = false;
 
   constructor(cfg: StationConfig) {
     super();
@@ -258,12 +294,18 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       txStartedAt: (id) => this.evses[id - 1]?.tx?.startedAt,
     });
 
+    this.baseUrl = cfg.csmsUrl;
+    this.basicAuth = cfg.basicAuth;
+    if (cfg.security) {
+      this.sec = new StationSecurity(cfg.security, this.cfg.vendor);
+      const problem = schemeProblem(cfg.csmsUrl, this.sec.profile);
+      if (problem) throw new RangeError(`${cfg.id}: ${problem}`);
+    }
     this.conn = new Connection({
-      url: cfg.csmsUrl,
+      ...this.endpoint(this.sec?.profile ?? 1, cfg.csmsUrl),
       identity: cfg.id,
       version: cfg.version,
       clock: cfg.clock,
-      basicAuth: cfg.basicAuth,
       chaos: cfg.chaos,
       strict: cfg.strict,
       requestTimeoutMs: cfg.requestTimeoutMs,
@@ -271,12 +313,16 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
       maxQueue: cfg.maxQueue,
     });
     this.conn.on('state', (s) => {
+      if (s === 'Connected') this.handshakeReported = undefined;
       this.emit('connection', s);
       this.emitState();
     });
     this.conn.on('frame', (dir, frame, raw) => this.emit('frame', dir, frame, raw));
     this.conn.on('violation', (v) => this.emit('violation', v));
-    this.conn.on('error', (e) => this.emit('error', e));
+    this.conn.on('error', (e) => {
+      if (e instanceof HandshakeError) this.onHandshakeFailure(e);
+      this.emit('error', e);
+    });
     this.conn.on('chaos', (rule, frame) => this.emit('chaos', rule, frame));
     this.conn.on('call', (call, reply, error) => this.onCall(call, reply, error));
     this.conn.on('send', (message) => this.emit('send', message));
@@ -309,9 +355,29 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     return this.evses[id - 1];
   }
 
+  /** Certificate store and security profile; created (profile 1) on first use when `security` was not configured. */
+  get security(): StationSecurity {
+    this.sec ??= new StationSecurity(undefined, this.cfg.vendor);
+    return this.sec;
+  }
+
+  get securityProfile(): SecurityProfile {
+    return this.sec?.profile ?? 1;
+  }
+
+  /** The CSMS base URL in use (changes with SetNetworkProfile / a 1.6 SecurityProfile upgrade). */
+  get csmsUrl(): string {
+    return this.baseUrl;
+  }
+
   // ---- connection lifecycle --------------------------------------------------------------------------------
 
   async connect(): Promise<void> {
+    if (this.sec?.profile === 3 && !this.sec.hasClientCertificate) {
+      throw new Error(
+        `${this.id}: security profile 3 needs a client certificate (set security.clientCert and security.clientKey)`,
+      );
+    }
     await this.conn.connect();
     if (this.booted) this.startHeartbeat();
     this.ensureMeterTimer();
@@ -362,7 +428,13 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     this.startHeartbeat();
     this.ensureMeterTimer();
     this.emitState();
-    await this.sendStatus();
+    const statuses = this.sendStatus();
+    if (this.sec && !this.startupReported) {
+      this.startupReported = true;
+      this.raiseSecurityEvent('StartupOfTheDevice');
+    }
+    for (const payload of this.heldEvents?.splice(0) ?? []) fire(this.request('SecurityEventNotification', payload));
+    await statuses;
   }
 
   // ---- EV side ---------------------------------------------------------------------------------------------
@@ -476,6 +548,117 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
 
   sendRaw(action: string, payload: unknown): Promise<unknown> {
     return this.request(action, payload);
+  }
+
+  // ---- security ----------------------------------------------------------------------------------------------
+
+  /**
+   * SignCertificate with a fresh key pair and a real CSR; the certificate arrives in a CertificateSigned CALL.
+   * Resolves with the CSMS's status (`Accepted` / `Rejected`).
+   */
+  signCertificate(use: CertificateSigningUse | 'Combined' = 'ChargingStationCertificate'): Promise<string> {
+    return sendSignCertificate(this, use);
+  }
+
+  /** 2.x GetCertificateStatus (OCSP via the CSMS) for one certificate's hash data and responder URL. */
+  async getCertificateStatus(
+    ocspRequestData: v201.GetCertificateStatusRequest['ocspRequestData'],
+  ): Promise<v201.GetCertificateStatusResponse> {
+    if (this.version === 'ocpp1.6') throw new Error('GetCertificateStatus does not exist in OCPP 1.6');
+    const payload: v201.GetCertificateStatusRequest = { ocspRequestData };
+    return (await this.request('GetCertificateStatus', payload)) as v201.GetCertificateStatusResponse;
+  }
+
+  /**
+   * 2.x Get15118EVCertificate on behalf of an EV. wattsim has no ISO 15118 stack: `exiRequest` defaults to a fixed
+   * base64 placeholder.
+   */
+  async get15118EvCertificate(
+    opts: { action?: 'Install' | 'Update'; exiRequest?: string; iso15118SchemaVersion?: string } = {},
+  ): Promise<v201.Get15118EVCertificateResponse> {
+    if (this.version === 'ocpp1.6') throw new Error('Get15118EVCertificate does not exist in OCPP 1.6');
+    const payload: v201.Get15118EVCertificateRequest = {
+      iso15118SchemaVersion: opts.iso15118SchemaVersion ?? 'urn:iso:15118:2:2013:MsgDef',
+      action: opts.action ?? 'Install',
+      exiRequest: opts.exiRequest ?? CANNED_EXI_REQUEST,
+    };
+    return (await this.request('Get15118EVCertificate', payload)) as v201.Get15118EVCertificateResponse;
+  }
+
+  raiseSecurityEvent(kind: SecurityEventKind, techInfo?: string): void {
+    if (!this.sec) return;
+    const payload: v201.SecurityEventNotificationRequest = {
+      type: securityEventName(this.version, kind),
+      timestamp: isoTimestamp(this.clock),
+    };
+    if (techInfo) payload.techInfo = techInfo.slice(0, 255);
+    if (this.booted && !this.bootHold) fire(this.request('SecurityEventNotification', payload));
+    else {
+      this.heldEvents ??= [];
+      this.heldEvents.push(payload);
+    }
+  }
+
+  securityChanged(): void {
+    this.conn.reconfigure(this.endpoint(this.securityProfile, this.baseUrl));
+  }
+
+  async switchSecurityProfile(next: { profile: SecurityProfile; url?: string }): Promise<boolean> {
+    const sec = this.security;
+    const from = { profile: sec.profile, url: this.baseUrl };
+    const url = next.url ?? this.baseUrl;
+    const problem = sec.upgradeProblem(next.profile) ?? schemeProblem(url, next.profile);
+    if (problem) {
+      this.emit('error', new Error(`${this.id}: cannot switch security profile: ${problem}`));
+      return false;
+    }
+    this.stopHeartbeat();
+    await this.conn.disconnect();
+    this.conn.reconfigure(this.endpoint(next.profile, url));
+    try {
+      await this.conn.tryConnect();
+    } catch (err) {
+      this.emit(
+        'error',
+        new Error(
+          `${this.id}: connecting with security profile ${next.profile} failed, back to profile ${from.profile}: ${toError(err).message}`,
+        ),
+      );
+      this.conn.reconfigure(this.endpoint(from.profile, from.url));
+      await this.conn.connect();
+      if (this.booted) this.startHeartbeat();
+      return false;
+    }
+    sec.profile = next.profile;
+    this.baseUrl = url;
+    this.raiseSecurityEvent(
+      'ReconfigurationOfSecurityParameters',
+      `security profile ${from.profile} -> ${next.profile}${url === from.url ? '' : `, CSMS ${url}`}`,
+    );
+    if (url !== from.url) await this.boot('Unknown');
+    else if (this.booted) this.startHeartbeat();
+    return true;
+  }
+
+  /** URL, credentials and TLS settings for `profile`; profile 3 authenticates by certificate, not basic auth. */
+  private endpoint(profile: SecurityProfile, url: string): ConnectionEndpoint {
+    const endpoint: ConnectionEndpoint = { url };
+    if (profile < 3 && this.basicAuth) endpoint.basicAuth = this.basicAuth;
+    const tls = this.sec?.tls(profile);
+    if (tls) endpoint.tls = tls;
+    return endpoint;
+  }
+
+  /** Report a TLS / authentication failure once per streak of failed attempts, as a security event. */
+  private onHandshakeFailure(e: HandshakeError): void {
+    if (!this.sec) return;
+    this.handshakeReported ??= new Set();
+    if (this.handshakeReported.has(e.kind)) return;
+    this.handshakeReported.add(e.kind);
+    if (e.kind === 'server-certificate') this.raiseSecurityEvent('InvalidCsmsCertificate', e.detail);
+    else if (e.kind === 'client-certificate' || e.kind === 'unauthorized') {
+      this.raiseSecurityEvent('FailedToAuthenticateAtCsms', e.detail);
+    }
   }
 
   /**
@@ -716,7 +899,25 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
         return;
       }
     }
-    const outcome = this.adapter.handleCall(this, call);
+    this.answer(this.adapter.handleCall(this, call), call, reply, error);
+  }
+
+  private answer(
+    outcome: CallOutcome,
+    call: CallFrame,
+    reply: (r: unknown) => void,
+    error: (code: string, description: string) => void,
+  ): void {
+    if (outcome !== null && 'deferred' in outcome) {
+      outcome.deferred.then(
+        (o) => this.answer(o, call, reply, error),
+        (err: unknown) => {
+          this.emit('error', toError(err));
+          error('InternalError', `${call.action} failed: ${toError(err).message}`.slice(0, 255));
+        },
+      );
+      return;
+    }
     if (outcome === null) {
       error('NotImplemented', `${call.action} is not supported by this station`);
       return;
@@ -937,6 +1138,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     try {
       await Promise.allSettled(this.evses.filter((e) => e.tx).map((e) => this.endTransaction(e.id, req.stopReason)));
       this.booted = false;
+      this.raiseSecurityEvent('ResetOrReboot', `reset: ${req.stopReason}`);
       this.stopHeartbeat();
       this.emitState();
       await this.conn.disconnect();

@@ -11,6 +11,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@wattsim/pki": "workspace:*",
     "@wattsim/protocol": "workspace:*",
     "prom-client": "^15.1.3",
     "zod": "catalog:"
