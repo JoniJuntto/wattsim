@@ -18,6 +18,7 @@
     "@wattsim/mcp": "workspace:*",
     "@wattsim/protocol": "workspace:*",
     "@wattsim/scenario": "workspace:*",
+    "@wattsim/trace": "workspace:*",
     "@wattsim/server": "workspace:*",
     "citty": "^0.2.2"
   },
