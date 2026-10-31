@@ -1,0 +1,28 @@
+# A shared wattsim for a team: the image (stations kept in /data) behind Caddy, which adds TLS and the password.
+# Run `docker compose up -d` from this folder with a .env next to it (see .env.example).
+services:
+  wattsim:
+    image: ${WATTSIM_IMAGE}
+    restart: unless-stopped
+    volumes:
+      - wattsim-data:/data
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    env_file: .env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - wattsim
+
+volumes:
+  wattsim-data:
+  caddy-data:
+  caddy-config:

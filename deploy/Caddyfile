@@ -1,0 +1,11 @@
+# The UI and API behind one shared password; the test CSMS open so chargers can reach it. Values from .env.
+{$WATTSIM_DOMAIN} {
+	basic_auth {
+		{$WATTSIM_USER} {$WATTSIM_PASSWORD_HASH}
+	}
+	reverse_proxy wattsim:7700
+}
+
+{$WATTSIM_CSMS_DOMAIN} {
+	reverse_proxy wattsim:7701
+}
