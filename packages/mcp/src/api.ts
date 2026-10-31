@@ -14,10 +14,20 @@ export class ApiError extends Error {
 export type ApiResponse = { status: number; body: unknown };
 
 export class Api {
+  /** Without credentials, so it is safe to print. */
   readonly baseUrl: string;
+  /** `Basic …` from `user:password@` in the URL, sent on every request. */
+  private readonly auth: string | undefined;
 
   constructor(baseUrl: string) {
-    this.baseUrl = baseUrl.replace(/\/+$/, '');
+    const u = new URL(baseUrl);
+    if (u.username || u.password) {
+      const pair = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+      this.auth = `Basic ${Buffer.from(pair).toString('base64')}`;
+      u.username = '';
+      u.password = '';
+    }
+    this.baseUrl = u.href.replace(/\/+$/, '');
   }
 
   async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<ApiResponse> {
@@ -25,7 +35,10 @@ export class Api {
     try {
       res = await fetch(`${this.baseUrl}${path}`, {
         method,
-        headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+        headers: {
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...(this.auth === undefined ? {} : { authorization: this.auth }),
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
     } catch (e) {

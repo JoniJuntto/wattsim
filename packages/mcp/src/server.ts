@@ -158,7 +158,7 @@ function reachable(url: string, timeoutMs = 3000): Promise<boolean> {
 }
 
 export type WattsimMcpOptions = {
-  /** Base URL of the UI server whose API the tools wrap, e.g. `http://127.0.0.1:7700`. */
+  /** Base URL of the UI server whose API the tools wrap, e.g. `http://127.0.0.1:7700`; may carry `user:password@`. */
   serverUrl: string;
   /** The server was started elsewhere (`--attach`), possibly on another host. */
   attached?: boolean;
@@ -176,7 +176,7 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
     const url = attachedCsmsUrl(loopback, opts.serverUrl);
     if (url === loopback || (await reachable(url))) return url;
     throw new Error(
-      `cannot reach the built-in test CSMS of ${opts.serverUrl} at ${url}: it listens on 127.0.0.1 on that host. ` +
+      `cannot reach the built-in test CSMS of ${api.baseUrl} at ${url}: it listens on 127.0.0.1 on that host. ` +
         'Pass csmsUrl with a CSMS this machine can reach.',
     );
   };

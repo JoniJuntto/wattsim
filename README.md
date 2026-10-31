@@ -78,6 +78,14 @@ Claude Code:
 claude mcp add wattsim -- bunx wattsim mcp
 ```
 
+A password-protected server, such as the [shared team server](#shared-team-server), takes its credentials in the URL; they are sent as a basic-auth header and left out of everything printed:
+
+```sh
+claude mcp add wattsim -- bunx wattsim mcp --attach https://team:PASSWORD@wattsim.example.com
+```
+
+`run_scenario` runs its stations on your machine rather than on the server, so against a remote server pass `csmsUrl` with a test CSMS address your machine can reach (for the shared team server, `wss://<csms domain>`).
+
 Any other MCP client:
 
 ```json
