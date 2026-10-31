@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# wattsim server mode: the UI, its HTTP/stream API and the built-in test CSMS in one process, data in /data.
+# wattsim server mode: the UI, its HTTP/stream API and the built-in test CSMS in one process, data and stations in /data.
 #   docker build -t wattsim .
 #   docker run -p 7700:7700 -p 7701:7701 -v wattsim-data:/data wattsim
 # Bun runs the TypeScript sources directly, so the image carries sources, production node_modules, the generated
@@ -41,4 +41,4 @@ VOLUME /data
 # 7700: UI and API. 7701: the built-in test CSMS (ws://<host>:7701/<station id>).
 EXPOSE 7700 7701
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 CMD ["bun", "/app/docker/healthcheck.ts"]
-CMD ["bun", "packages/cli/src/index.ts", "ui", "--host", "0.0.0.0", "--port", "7700", "--csms-port", "7701", "--no-open", "--data", "/data"]
+CMD ["bun", "packages/cli/src/index.ts", "ui", "--host", "0.0.0.0", "--port", "7700", "--csms-port", "7701", "--no-open", "--data", "/data", "--keep-stations"]

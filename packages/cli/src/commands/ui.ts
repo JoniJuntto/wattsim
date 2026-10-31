@@ -56,6 +56,11 @@ export const ui = defineCommand({
       type: 'string',
       description: 'Port of the built-in test CSMS (default: a free port)',
     },
+    'keep-stations': {
+      type: 'boolean',
+      default: false,
+      description: 'Save stations in the data directory and recreate them on start (use with --csms-port)',
+    },
     'max-stations': {
       type: 'string',
       description: `Most stations a scenario run from the UI may have (default ${DEFAULT_MAX_STATIONS}); shard bigger fleets with wattsim run --shard`,
@@ -126,6 +131,7 @@ export const ui = defineCommand({
         host: args.host ?? DEFAULT_HOST,
         dataDir,
         csmsPort,
+        keepStations: args['keep-stations'],
         maxStations,
         maxRuns,
         maxRunMs,

@@ -11,6 +11,7 @@ import { desc, eq, sql } from 'drizzle-orm';
 import { type BunSQLiteDatabase, drizzle } from 'drizzle-orm/bun-sqlite';
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
 import type { SQLiteColumn } from 'drizzle-orm/sqlite-core';
+import type { CreateStation } from '../schemas';
 import type {
   CsmsReportSummary,
   RecordingView,
@@ -137,6 +138,32 @@ export class Store {
 
   close(): void {
     this.sqlite.close();
+  }
+
+  // ---- stations -------------------------------------------------------------------------------------------------
+
+  /** Upsert by id, so a row a failed restore kept is replaced when its id is created again. */
+  saveStations(specs: CreateStation[]): void {
+    if (specs.length === 0) return;
+    const now = Date.now();
+    this.db
+      .insert(schema.stations)
+      .values(specs.map((spec) => ({ id: spec.id, spec, createdAt: now })))
+      .onConflictDoUpdate({ target: schema.stations.id, set: { spec: sql`excluded.spec` } })
+      .run();
+  }
+
+  deleteStation(id: string): void {
+    this.db.delete(schema.stations).where(eq(schema.stations.id, id)).run();
+  }
+
+  /** Every saved spec, oldest first; not validated (they may predate a schema change). */
+  savedStations(): { id: string; spec: unknown }[] {
+    return this.db
+      .select({ id: schema.stations.id, spec: schema.stations.spec })
+      .from(schema.stations)
+      .orderBy(schema.stations.createdAt, schema.stations.id)
+      .all();
   }
 
   // ---- scenarios ------------------------------------------------------------------------------------------------

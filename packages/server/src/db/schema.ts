@@ -102,3 +102,10 @@ export const siteReports = sqliteTable(
   },
   (t) => [index('site_reports_created_at').on(t.createdAt), index('site_reports_run_id').on(t.runId)],
 );
+
+/** UI stations to recreate on start: each one's validated create request. Written only with `--keep-stations`. */
+export const stations = sqliteTable('stations', {
+  id: text('id').primaryKey(),
+  spec: text('spec', { mode: 'json' }).$type<unknown>().notNull(),
+  createdAt: integer('created_at').notNull(),
+});

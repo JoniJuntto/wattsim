@@ -22,6 +22,13 @@
       "when": 1793379265116,
       "tag": "0002_site_reports",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1793470474648,
+      "tag": "0003_stations",
+      "breakpoints": true
     }
   ]
 }

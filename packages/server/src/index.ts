@@ -88,6 +88,11 @@ export type ServerOptions = {
   dataDir?: string;
   /** Port of the built-in test CSMS; default 0 (a free port). Fix it to publish the port from a container. */
   csmsPort?: number;
+  /**
+   * Save created stations in the data directory and recreate them on start; default false. Start the test CSMS at
+   * boot when `csmsPort` is fixed.
+   */
+  keepStations?: boolean;
   /** Stations a browser scenario may expand to, checked and run; default `DEFAULT_MAX_STATIONS`. */
   maxStations?: number;
   /** Scenario runs at once; one more is a 429. Default `DEFAULT_MAX_RUNS`. */
@@ -256,6 +261,20 @@ function expandBulk(b: ReturnType<typeof createBulk.parse>): CreateStation[] {
   }));
 }
 
+/**
+ * Recreate the stations a previous process saved (`keepStations`). A row that no longer validates, or whose create
+ * fails, is logged and left in place, so a later fix can still restore it.
+ */
+function restoreStations(store: Store, reg: Registry): void {
+  for (const row of store.savedStations()) {
+    try {
+      reg.create([parseBody(createStation, row.spec)]);
+    } catch (err) {
+      console.error(`wattsim: not restoring station ${row.id}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+}
+
 export async function startServer(opts: ServerOptions = {}): Promise<RunningServer> {
   const host = opts.host ?? DEFAULT_HOST;
   const uiDir = opts.uiDir ?? DEFAULT_UI_DIR;
@@ -312,10 +331,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       const bulk = typeof b === 'object' && b !== null && 'template' in b;
       const specs = bulk ? expandBulk(parseBody(createBulk, b)) : [parseBody(createStation, b)];
       const views = reg.create(specs);
+      if (opts.keepStations) store.saveStations(specs);
       return json(201, bulk ? views : views[0]);
     })
     .delete('/api/stations/:id', async ({ params }) => {
       await reg.remove(params.id);
+      if (opts.keepStations) store.deleteStation(params.id);
       return noContent();
     })
     .post('/api/stations/:id/actions', async ({ params, body: raw }) => {
@@ -608,6 +629,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     .all('/api/*', () => json(404, { error: 'not found' }))
     .get('/*', ({ path }) => (path.startsWith('/api/') ? json(404, { error: 'not found' }) : serveUi(uiDir, path)));
 
+  if (opts.keepStations) {
+    if (opts.csmsPort) await testCsms.start();
+    restoreStations(store, reg);
+  }
   app.listen({ port: opts.port ?? DEFAULT_PORT, hostname: host, maxRequestBodySize: MAX_REPORT_BYTES });
   const port = app.server?.port;
   if (port === undefined) throw new Error('server did not start');

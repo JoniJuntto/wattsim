@@ -49,7 +49,7 @@ The **Scenarios** page is a `.ws` editor with highlighting, completion and the c
 
 ## Server mode and Docker
 
-`wattsim ui` keeps run history, saved scenarios, recordings (Open OCPP Trace) and CSMS conformance reports in SQLite under `--data <dir>`, default `~/.wattsim`. The schema is applied from the SQL migrations in `packages/server/drizzle` on start. The library call `startServer()` without `dataDir`, which `wattsim mcp` uses, keeps the same database in memory and writes nothing to disk.
+`wattsim ui` keeps run history, saved scenarios, recordings (Open OCPP Trace) and CSMS conformance reports in SQLite under `--data <dir>`, default `~/.wattsim`. The schema is applied from the SQL migrations in `packages/server/drizzle` on start. With `--keep-stations` it also saves the stations you create and recreates them on start: each one reconnects and boots again with idle EVSEs, and a charge in progress at the restart is not resumed. Pair it with `--csms-port`, which also starts the test CSMS at boot, so restored stations that use it find it on the same port. The library call `startServer()` without `dataDir`, which `wattsim mcp` uses, keeps the same database in memory and writes nothing to disk.
 
 The test CSMS saves its report when it stops (the server stopping, or **Stop** on the CSMS page). Its port is random unless you pass `--csms-port`. Runs on the virtual clock against it collect `time.skew` warnings, because the stations' clocks run ahead of the CSMS's wall clock. Scenarios from the browser may `import` quirk files from `<data>/scenarios` and nowhere else: an import that leaves that folder, through `..`, an absolute path or a symlink, is an error and the file is not read. They may not `use plugin`, which would execute a module from the server's disk; run those with `wattsim run`.
 
@@ -66,7 +66,7 @@ docker build -t wattsim .
 docker run -p 7700:7700 -p 7701:7701 -v wattsim-data:/data wattsim
 ```
 
-The image runs `wattsim ui --host 0.0.0.0 --no-open --data /data --csms-port 7701` as the unprivileged `bun` user, with a health check on `/api/health`. Point external charge points at `ws://<host>:7701/<id>` to have the test CSMS check them. There is no authentication: put the container behind a reverse proxy that adds it before exposing it beyond your machine. CI builds the image on every push (`.github/workflows/docker.yml`); nothing is published.
+The image runs `wattsim ui --host 0.0.0.0 --no-open --data /data --csms-port 7701 --keep-stations` as the unprivileged `bun` user, with a health check on `/api/health`. Point external charge points at `ws://<host>:7701/<id>` to have the test CSMS check them. There is no authentication: put the container behind a reverse proxy that adds it before exposing it beyond your machine. CI builds the image on every push (`.github/workflows/docker.yml`); nothing is published.
 
 ## Use it from an AI agent
 

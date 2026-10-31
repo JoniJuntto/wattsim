@@ -62,6 +62,14 @@ export class StreamClient {
   }
 }
 
+/** A port that was free a moment ago, for options that must stay the same across a restart. */
+export function freePort(): number {
+  const s = Bun.serve({ port: 0, fetch: () => new Response() });
+  const port = s.port as number;
+  s.stop(true);
+  return port;
+}
+
 export async function until(cond: () => boolean, timeoutMs = 2000, what = 'condition'): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!cond()) {

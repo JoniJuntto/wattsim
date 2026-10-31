@@ -302,7 +302,7 @@ GitHub Actions.
   - The same request with `-u team:test` gives `200`.
   - `CSMS=$(curl -sk -u team:test -X POST https://wattsim.localhost/api/loopback | sed -E 's/.*"url":"([^"]+)".*/\1/')`
     prints the test CSMS URL the server itself uses. Then
-    `curl -sk -u team:test -X POST -H 'content-type: application/json' -d "{\"id\":\"CP-VM\",\"version\":\"1.6\",\"csmsUrl\":\"$CSMS\"}" https://wattsim.localhost/api/stations`
+    `curl -sk -u team:test -X POST -H 'content-type: application/json' -d "{\"id\":\"CP-VM\",\"version\":\"ocpp1.6\",\"csmsUrl\":\"$CSMS\"}" https://wattsim.localhost/api/stations`
     gives a 201 body with `"id":"CP-VM"`.
   - After `docker compose -f deploy/compose.yml restart wattsim` and about 5 s,
     `curl -sk -u team:test https://wattsim.localhost/api/stations` lists `CP-VM` with `"booted":true`.
