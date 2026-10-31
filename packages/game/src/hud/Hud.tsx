@@ -1,6 +1,21 @@
 import { useEffect, useState } from 'react';
 import { clock, loadColour, STATUS_COLOUR, useTick } from '../hooks';
-import { DISCOUNT, deviceName, type Lot, type Selection, type Ticket, type World } from '../sim/world';
+import {
+  contractText,
+  DISCOUNT,
+  deviceName,
+  FORECASTS,
+  forecastText,
+  type Goal,
+  goalText,
+  goalValue,
+  isKeep,
+  type Lot,
+  type Selection,
+  type Ticket,
+  type World,
+} from '../sim/world';
+import { muted, setMuted } from '../sound';
 
 const SPEEDS = [
   { label: '1×', v: 60 },
@@ -12,6 +27,7 @@ const SPEEDS = [
 export function TopBar(props: { world: World; onLog: () => void; onHelp: () => void; onBusiness: () => void }) {
   const { world, onLog, onHelp } = props;
   useTick(world);
+  const [quiet, setQuiet] = useState(muted);
   const lot = world.lot;
   const f0 = lot.state.nodes.F0;
   const kw = lot.state.supply.powerW.reduce((a, b) => a + b, 0) / 1000;
@@ -45,6 +61,9 @@ export function TopBar(props: { world: World; onLog: () => void; onHelp: () => v
         <Meter pct={world.reputation} colour={world.reputation < 30 ? '#ff5d5d' : '#3fb950'} width={80} />
         <span className="num w-7 text-right">{Math.round(world.reputation)}</span>
       </div>
+      <span className="num text-amber-300" title="Stars earned: they unlock car parks">
+        ★ {world.stars}
+      </span>
       <div className="flex items-center gap-2" title="Main fuse loading, worst phase">
         <span className="text-xs text-slate-400">Site</span>
         <Meter pct={f0?.loadingPct ?? 0} colour={loadColour(f0?.loadingPct)} width={90} />
@@ -73,6 +92,17 @@ export function TopBar(props: { world: World; onLog: () => void; onHelp: () => v
         </button>
         <button type="button" className="btn" onClick={onLog}>
           OCPP log
+        </button>
+        <button
+          type="button"
+          className="btn"
+          aria-label={quiet ? 'Sound on' : 'Sound off'}
+          onClick={() => {
+            setMuted(!quiet);
+            setQuiet(!quiet);
+          }}
+        >
+          {quiet ? '🔇' : '🔊'}
         </button>
         <button type="button" className="btn" onClick={onHelp} aria-label="Help">
           ?
@@ -141,6 +171,61 @@ export function Meter({ pct, colour, width = 120 }: { pct: number; colour: strin
         className="h-full rounded-full"
         style={{ width: `${Math.min(100, Math.max(0, pct))}%`, background: colour }}
       />
+    </div>
+  );
+}
+
+/** Today's three goals, the forecast in force and the deals running. */
+export function Goals({ world }: { world: World }) {
+  useTick(world, 400);
+  return (
+    <section className="panel pointer-events-auto flex w-80 flex-col gap-1.5 p-3 text-xs" aria-label="Today's goals">
+      <div className="flex items-center justify-between">
+        <span className="font-semibold">Day {world.day} goals</span>
+        <span className="num text-slate-400">★ + €{world.goals[0]?.bonus ?? 0} each</span>
+      </div>
+      {world.goals.map((g) => (
+        <GoalRow key={g.id} world={world} g={g} />
+      ))}
+      {world.today && (
+        <p className="rounded bg-amber-400/10 px-2 py-1 leading-snug text-amber-200">
+          <b>{FORECASTS[world.today.id].title}:</b> {forecastText(world, world.today)}
+        </p>
+      )}
+      {world.contracts.map((c) => (
+        <p
+          key={`${c.kind}${c.lot}${c.kind === 'tv' ? c.at : c.until}`}
+          className="rounded bg-sky-400/10 px-2 py-1 text-sky-200"
+        >
+          {contractText(world, c)}
+        </p>
+      ))}
+    </section>
+  );
+}
+
+function GoalRow({ world, g }: { world: World; g: Goal }) {
+  const v = goalValue(world, g);
+  const keep = isKeep(g);
+  const icon = g.state === 'met' ? '✓' : g.state === 'lost' ? '✗' : '○';
+  const colour = g.state === 'met' ? 'text-emerald-400' : g.state === 'lost' ? 'text-red-400' : 'text-slate-400';
+  return (
+    <div className="grid grid-cols-[1rem_1fr_auto] items-center gap-2">
+      <span className={`text-sm ${colour}`}>{icon}</span>
+      <span className={g.state === 'lost' ? 'text-slate-500 line-through' : ''}>{goalText(g)}</span>
+      {keep ? (
+        <span className={`num ${g.state === 'lost' ? 'text-red-400' : 'text-slate-400'}`}>
+          {Math.round(v)}
+          {g.id === 'peak' ? ' %' : ''}
+        </span>
+      ) : (
+        <span className="flex items-center gap-1.5">
+          <Meter pct={(v / g.target) * 100} colour={g.state === 'met' ? '#3fb950' : '#38e8c6'} width={44} />
+          <span className="num w-14 text-right text-slate-400">
+            {Math.floor(Math.min(v, g.target))}/{g.target}
+          </span>
+        </span>
+      )}
     </div>
   );
 }

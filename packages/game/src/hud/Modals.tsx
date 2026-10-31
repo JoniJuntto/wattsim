@@ -1,5 +1,6 @@
 import { useTick } from '../hooks';
-import { DEMAND_PER_KW, TRIP_FINE, type World } from '../sim/world';
+import { LOT_KINDS } from '../sim/layout';
+import { DEMAND_PER_KW, FORECASTS, forecastText, goalText, LOT_STARS, TRIP_FINE, type World } from '../sim/world';
 import { Business } from './Business';
 
 function Modal(props: { children: React.ReactNode; title: string; wide?: boolean; onClose?: () => void }) {
@@ -34,6 +35,15 @@ export function Intro({ onStart }: { onStart: () => void }) {
           and breakers are an electrical model with real trip curves.
         </p>
         <ul className="list-disc space-y-1 pl-5">
+          <li>
+            Every day has <b>three goals</b> (top right). Each one met pays a bonus and earns a star; stars unlock new
+            car parks. From day 2 there is a <b>forecast</b> for tomorrow (a heatwave, a price spike, a taxi rush):
+            prepare for it overnight.
+          </li>
+          <li>
+            Now and then the clock stops for a <b>decision</b>: a breaker about to trip, a grid operator asking you to
+            cut load, a TV crew. Every answer costs something.
+          </li>
           <li>
             Drivers arrive, plug in and want a state of charge before they leave. Unhappy drivers cost reputation.
           </li>
@@ -74,9 +84,46 @@ export function Intro({ onStart }: { onStart: () => void }) {
 export function Summary({ world }: { world: World }) {
   useTick(world, 300);
   const l = world.ledger;
-  const result = l.revenue - l.energyCost - l.demandCharge - l.fines - l.wages - l.refunds;
+  const result = l.revenue + l.bonus - l.energyCost - l.demandCharge - l.fines - l.wages - l.refunds;
+  const stars = world.history.at(-1) ?? 0;
+  const next = Object.values(LOT_KINDS)
+    .filter((k) => !world.lots.some((x) => x.kind.id === k.id) && (LOT_STARS[k.id] ?? 0) > world.stars)
+    .sort((a, b) => (LOT_STARS[a.id] ?? 0) - (LOT_STARS[b.id] ?? 0))[0];
   return (
     <Modal title={`End of day ${world.day}`} wide>
+      <div className="mb-5 flex flex-wrap items-start gap-6">
+        <div className="text-center">
+          <div className="text-4xl tracking-widest" role="img" aria-label={`${stars} of 3 stars`}>
+            {[0, 1, 2].map((i) => (
+              <span key={i} className={i < stars ? 'text-amber-300' : 'text-white/15'}>
+                ★
+              </span>
+            ))}
+          </div>
+          <div className="num text-xs text-slate-400">
+            ★ {world.stars} in all{next ? ` · ${next.name} at ★${LOT_STARS[next.id]}` : ''}
+          </div>
+        </div>
+        <ul className="flex-1 space-y-1 text-sm">
+          {world.goals.map((g) => (
+            <li key={g.id} className="flex justify-between gap-3">
+              <span className={g.state === 'met' ? 'text-emerald-300' : 'text-slate-500 line-through'}>
+                {g.state === 'met' ? '✓' : '✗'} {goalText(g)}
+              </span>
+              <span className="num">{g.state === 'met' ? `+€${g.bonus}` : ''}</span>
+            </li>
+          ))}
+        </ul>
+        {world.forecast && (
+          <div className="w-full rounded border border-amber-400/40 bg-amber-400/10 p-3 text-sm sm:w-72">
+            <div className="text-xs uppercase tracking-wide text-amber-300">
+              Tomorrow: {FORECASTS[world.forecast.id].title}
+            </div>
+            <p className="mt-1 text-amber-100">{forecastText(world, world.forecast)}</p>
+            <p className="mt-1 text-xs text-slate-400">Prepare below before you start the day.</p>
+          </div>
+        )}
+      </div>
       <div className="grid gap-6 lg:grid-cols-[22rem_1fr]">
         <div className="text-sm">
           <Row k="Energy delivered" v={`${l.energyKwh.toFixed(0)} kWh`} />
@@ -86,6 +133,7 @@ export function Summary({ world }: { world: World }) {
           <Row k={`Trips (${l.trips})`} v={`−€${l.fines.toFixed(0)}`} />
           <Row k="Wages" v={`−€${l.wages.toFixed(0)}`} />
           <Row k="Refunds and discounts" v={`−€${l.refunds.toFixed(0)}`} />
+          <Row k="Goal bonuses and deals" v={`+€${l.bonus.toFixed(0)}`} />
           <Row k="Operating result" v={`${result >= 0 ? '' : '−'}€${Math.abs(result).toFixed(0)}`} strong />
           <Row k="Invested today" v={`€${l.invested.toFixed(0)}`} />
           <div className="my-3 border-t border-white/10" />
@@ -131,6 +179,33 @@ export function BusinessModal({ world, onClose }: { world: World; onClose: () =>
   return (
     <Modal title="Business" wide onClose={onClose}>
       <Business world={world} />
+    </Modal>
+  );
+}
+
+/** A decision the clock stopped for: no closing it without an answer. */
+export function DilemmaModal({ world }: { world: World }) {
+  const d = world.dilemma;
+  if (!d) return null;
+  return (
+    <Modal title={d.title}>
+      <p className="mb-1 text-xs uppercase tracking-wide text-slate-400">
+        {world.lots.find((l) => l.id === d.lot)?.name} · {new Date(world.now).toISOString().slice(11, 16)}
+      </p>
+      <p className="mb-4 text-sm leading-relaxed text-slate-300">{d.text}</p>
+      <div className="grid gap-2">
+        {d.options.map((o, i) => (
+          <button
+            key={o.label}
+            type="button"
+            onClick={() => world.choose(i)}
+            className="rounded-lg border border-white/10 bg-white/5 px-4 py-3 text-left hover:border-teal-400 hover:bg-teal-400/10"
+          >
+            <div className="font-semibold">{o.label}</div>
+            <div className="text-xs text-slate-400">{o.detail}</div>
+          </button>
+        ))}
+      </div>
     </Modal>
   );
 }

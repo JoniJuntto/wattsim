@@ -18,6 +18,19 @@ export const DISCOUNT = 5;
 export const energyPrice = (h: number) => (h >= 17 && h < 20 ? 0.32 : h >= 8 && h < 17 ? 0.22 : 0.14);
 export const hhmm = (t: number) => new Date(t).toISOString().slice(11, 16);
 
+/** Something to see or hear: a number rising off the scene, a sound, or both. */
+export type Sound = 'cash' | 'trip' | 'alarm' | 'ticket' | 'solved' | 'failed' | 'star' | 'dilemma';
+export type Fx = {
+  id: number;
+  /** `performance.now()` when it happened: pops fade in real time, paused or not. */
+  real: number;
+  lot?: string;
+  at?: P2;
+  text?: string;
+  tone?: 'good' | 'bad';
+  sound?: Sound;
+};
+
 export type Selection = { kind: 'charger'; id: string } | { kind: 'device'; lot: string; id: string };
 
 export type Alert = {
@@ -162,6 +175,8 @@ export type Ledger = {
   fines: number;
   wages: number;
   refunds: number;
+  /** Goal bonuses and paid deals. */
+  bonus: number;
   /** Chargers, upgrades, lots: shown apart from the day's operating result. */
   invested: number;
   energyKwh: number;
@@ -180,6 +195,7 @@ export const emptyLedger = (): Ledger => ({
   fines: 0,
   wages: 0,
   refunds: 0,
+  bonus: 0,
   invested: 0,
   energyKwh: 0,
   happy: 0,

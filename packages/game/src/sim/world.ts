@@ -3,7 +3,23 @@
  * Every lot runs at once on one `VirtualClock`; `step(ms)` advances it and reconciles each lot at the new instant.
  */
 import { VirtualClock } from '@wattsim/core';
+import { mulberry32 } from '@wattsim/grid';
 import { GameCsms } from './csms';
+import {
+  applyForecast,
+  type Contract,
+  type Dilemma,
+  direct,
+  endContracts,
+  FORECASTS,
+  type Forecast,
+  type Goal,
+  LOT_STARS,
+  pickForecast,
+  planDilemmas,
+  planGoals,
+  settleGoals,
+} from './director';
 import { LOT_KINDS, type LotKind, type LotKindId } from './layout';
 import { Lot } from './lot';
 import {
@@ -14,6 +30,8 @@ import {
   DAY_START_H,
   EPOCH,
   emptyLedger,
+  energyPrice,
+  type Fx,
   HOUR,
   MIN,
   ROLES,
@@ -22,8 +40,10 @@ import {
   STAFF_NAMES,
   type Staff,
   type Ticket,
+  TRIP_FINE,
 } from './model';
 
+export * from './director';
 export { Lot } from './lot';
 export * from './model';
 
@@ -50,19 +70,41 @@ export class World {
   paused = false;
   /** Bumped whenever something the HUD shows changes. */
   version = 0;
+  /** Recent things to see and hear, newest last. */
+  fxs: Fx[] = [];
+  goals: Goal[] = [];
+  /** Stars earned over all days; car parks unlock with them. */
+  stars = 0;
+  /** Stars per finished day. */
+  history: number[] = [];
+  /** Today's and tomorrow's forecast (none on day 1). */
+  today?: Forecast;
+  forecast?: Forecast;
+  /** The decision the clock is stopped for. */
+  dilemma?: Dilemma;
+  contracts: Contract[] = [];
+  /** When today's offers come. */
+  dilemmaAt: number[] = [];
+  /** When each `lot/device` overload was last put to the operator. */
+  asked = new Map<string, number>();
+  readonly rng: () => number;
 
   private ids = 1;
   private nextAgentAt = 0;
   private stepping = false;
   private readonly listeners = new Set<() => void>();
 
-  private constructor(readonly seed: number) {}
+  private constructor(readonly seed: number) {
+    this.rng = mulberry32(seed ^ 0x5eed);
+  }
 
   static async create(seed = 7): Promise<World> {
     const w = new World(seed);
     const lot = await w.addLot('office');
     w.staff.push({ id: w.nextId(), role: 'technician', name: 'Pekka', lot: lot.id });
     lot.addTech(w.staff[0]?.id as number, 'Pekka');
+    w.goals = planGoals(w);
+    planDilemmas(w);
     return w;
   }
 
@@ -137,10 +179,20 @@ export class World {
     const t = this.now;
     for (const lot of this.lots) lot.sync(t);
     this.runAgents(t);
+    direct(this, t);
     if (this.reputation <= 0 || this.money < -2000) {
       this.phase = 'over';
       this.alert('crit', this.reputation <= 0 ? 'Nobody trusts your car parks any more.' : 'The money ran out.');
     } else if (this.hour >= DAY_END_H) this.endDay();
+  }
+
+  /** Grid price now, €/kWh: the forecast's price spike triples the evening peak. */
+  energyPrice(h: number): number {
+    return energyPrice(h) * (this.today?.id === 'price' && h >= 17 && h < 20 ? 3 : 1);
+  }
+
+  get tripFine(): number {
+    return TRIP_FINE * (this.today?.id === 'inspection' ? 3 : 1);
   }
 
   // ---- staff ----------------------------------------------------------------------------------------------------
@@ -189,7 +241,8 @@ export class World {
 
   async buyLot(kind: LotKindId): Promise<Lot | undefined> {
     const k = LOT_KINDS[kind];
-    if (this.lots.some((l) => l.kind.id === kind) || !this.spend(k.price)) return undefined;
+    if (this.lots.some((l) => l.kind.id === kind) || this.stars < (LOT_STARS[kind] ?? 0) || !this.spend(k.price))
+      return undefined;
     const lot = await this.addLot(kind);
     this.view = lot.id;
     this.alert('info', `You bought ${k.name}. It comes with its chargers but no staff.`);
@@ -257,7 +310,11 @@ export class World {
     const wages = this.staff.reduce((a, s) => a + ROLES[s.role].wage, 0);
     this.ledger.wages = wages;
     this.money -= wages;
+    endContracts(this);
+    this.dilemma = undefined;
+    settleGoals(this);
     this.phase = this.reputation <= 0 || this.money < -2000 ? 'over' : 'summary';
+    if (this.phase === 'summary') this.forecast = pickForecast(this);
     this.changed();
   }
 
@@ -268,10 +325,23 @@ export class World {
     for (const lot of this.lots) lot.night();
     await this.clock.advanceTo(EPOCH + (this.day - 1) * DAY + DAY_START_H * HOUR);
     this.ledger = emptyLedger();
+    // Overnight people forget a little: a bad day pulls reputation down, not out for good.
+    if (this.reputation < 70) this.reputation += (70 - this.reputation) * 0.2;
+    this.today = this.forecast;
+    this.forecast = undefined;
     for (const lot of this.lots) lot.morning();
+    applyForecast(this);
+    this.goals = planGoals(this);
+    planDilemmas(this);
+    this.asked.clear();
+    this.paused = false;
     this.phase = 'day';
     const drivers = this.lots.reduce((a, l) => a + l.arrivals.length, 0);
-    this.alert('info', `Day ${this.day}. Expect about ${drivers} drivers across ${this.lots.length} car park(s).`);
+    const news = this.today ? ` ${FORECASTS[this.today.id].title} today.` : '';
+    this.alert(
+      'info',
+      `Day ${this.day}. Expect about ${drivers} drivers across ${this.lots.length} car park(s).${news}`,
+    );
     this.changed();
   }
 
@@ -279,6 +349,22 @@ export class World {
 
   nextId(): number {
     return this.ids++;
+  }
+
+  /** Show and/or play something; the HUD picks up whatever is newer than what it saw. */
+  fx(e: Omit<Fx, 'id' | 'real'>): void {
+    this.fxs.push({ ...e, id: this.nextId(), real: performance.now() });
+    if (this.fxs.length > 40) this.fxs.shift();
+  }
+
+  /** Answer the open dilemma with option `i`; the clock runs again. */
+  choose(i: number): void {
+    const d = this.dilemma;
+    if (!d) return;
+    this.dilemma = undefined;
+    d.options[i]?.pick();
+    this.paused = false;
+    this.changed();
   }
 
   alert(level: Alert['level'], text: string, target?: Selection, lot?: string): void {

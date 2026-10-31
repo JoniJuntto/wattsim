@@ -71,12 +71,14 @@ function Cable({ lot, run }: { lot: Lot; run: Run }) {
   // One material per run: a single colour update covers all its strips.
   const mat = useMemo(() => new MeshStandardMaterial({ color: '#3a3f46' }), []);
   const colour = useMemo(() => new Color(), []);
-  useFrame(() => {
+  useFrame(({ clock }) => {
     const { amps, pct, live } = reading(lot, run);
     colour.set(live ? loadColour(pct) : '#3a3f46');
     mat.color.copy(colour).multiplyScalar(live ? 0.55 : 1);
     mat.emissive.copy(colour);
-    mat.emissiveIntensity = live ? 0.15 + 0.5 * Math.min(1, amps / 60) : 0;
+    // Near the limit a cable throbs, faster the closer it gets.
+    const hot = live && !REDUCED && (pct ?? 0) >= 85 ? Math.max(0, Math.sin(clock.elapsedTime * (pct ?? 0) * 0.08)) : 0;
+    mat.emissiveIntensity = live ? 0.15 + 0.5 * Math.min(1, amps / 60) + 1.2 * hot : 0;
     const w = 0.12 + 0.45 * Math.min(1, amps / 100);
     for (const s of strips.current) if (s) s.scale.x = w;
   });

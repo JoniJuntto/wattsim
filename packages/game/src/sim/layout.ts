@@ -83,8 +83,8 @@ export type ChargerType = {
 };
 
 export const CHARGER_TYPES: Record<ChargerTypeId, ChargerType> = {
-  ac11: { id: 'ac11', name: 'AC 11 kW wallbox', kw: 11, maxA: 16, dc: false, price: 900, tariff: 1 },
-  ac22: { id: 'ac22', name: 'AC 22 kW post', kw: 22, maxA: 32, dc: false, price: 1800, tariff: 1 },
+  ac11: { id: 'ac11', name: 'AC 11 kW wallbox', kw: 11, maxA: 16, dc: false, price: 600, tariff: 1 },
+  ac22: { id: 'ac22', name: 'AC 22 kW post', kw: 22, maxA: 32, dc: false, price: 1200, tariff: 1 },
   dc50: {
     id: 'dc50',
     name: 'DC 50 kW fast charger',
@@ -171,7 +171,7 @@ export const LOT_KINDS: Record<LotKindId, LotKind> = {
     name: 'Harbour Office Park',
     blurb: 'Commuters who stay all morning, a few visitors, an office that shares the 160 A connection.',
     price: 0,
-    kwhPrice: 0.55,
+    kwhPrice: 0.65,
     building: { name: 'Office · HVAC', preset: 'office', peakW: 45_000, hvacW: 30_000, colour: '#8a939e' },
     rate: [3, 3.5, 2, 1.5, 2, 3, 2.5, 1.5, 1.5, 2.5, 4, 3, 2, 1],
     stay: (h, r) => (h < 10 ? 3 + r * 3 : h < 16 ? 0.75 + r * 1.75 : 1 + r * 2),
@@ -199,8 +199,8 @@ export const LOT_KINDS: Record<LotKindId, LotKind> = {
     code: 'MALL',
     name: 'Northgate Mall',
     blurb: 'Shoppers all day long: short stays, higher prices, a busy midday peak and a big building load.',
-    price: 14_000,
-    kwhPrice: 0.65,
+    price: 9_000,
+    kwhPrice: 0.79,
     building: { name: 'Mall · HVAC', preset: 'office', peakW: 70_000, hvacW: 40_000, colour: '#b9a58c' },
     rate: [1, 1.5, 3, 3.5, 4, 4.5, 4, 3.5, 3.5, 4, 4.5, 4, 3, 2],
     stay: (_h, r) => 0.5 + r * 1.25,
@@ -228,8 +228,8 @@ export const LOT_KINDS: Record<LotKindId, LotKind> = {
     code: 'DEPOT',
     name: 'Eastside Logistics Depot',
     blurb: 'Delivery vans that top up in the morning and come back in the afternoon. Cheap fleet tariff, big volumes.',
-    price: 20_000,
-    kwhPrice: 0.42,
+    price: 14_000,
+    kwhPrice: 0.5,
     building: { name: 'Warehouse · cooling', preset: 'flat', peakW: 25_000, hvacW: 20_000, colour: '#9aa7a0' },
     rate: [3, 2, 1, 1, 1, 1, 1.5, 2, 3, 4, 4, 3, 2, 1.5],
     stay: (_h, r) => 2 + r * 3,

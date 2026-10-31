@@ -3,7 +3,14 @@ import { useRef } from 'react';
 import type { Group, Mesh, MeshBasicMaterial } from 'three';
 import { useTick } from '../hooks';
 import { bayById, QUEUE } from '../sim/layout';
-import { type Car, type Lot, pathAt } from '../sim/world';
+import { type Car, type Lot, MIN, pathAt } from '../sim/world';
+
+/** A driver who is losing patience: queuing, stuck, or parked without charge for a while. */
+function angry(lot: Lot, car: Car): boolean {
+  const t = lot.now;
+  if (car.state === 'waiting') return t - car.arrivedAt > 6 * MIN;
+  return car.state === 'parked' && (!!car.stuck || (car.idleSince !== undefined && t - car.idleSince > 3 * MIN));
+}
 
 export function Cars({ lot }: { lot: Lot }) {
   useTick(lot.w, 250);
@@ -41,7 +48,13 @@ function CarModel({ lot, car }: { lot: Lot; car: Car }) {
   const bar = useRef<Mesh>(null);
   const barMat = useRef<MeshBasicMaterial>(null);
   const target = useRef<Mesh>(null);
-  useFrame(() => {
+  const mood = useRef<Mesh>(null);
+  useFrame(({ clock }) => {
+    if (mood.current) {
+      mood.current.visible = angry(lot, car);
+      mood.current.position.y = 3.1 + Math.sin(clock.elapsedTime * 4 + car.id) * 0.15;
+      mood.current.rotation.y = clock.elapsedTime * 2;
+    }
     const [x, z, h] = pose(lot, car);
     g.current?.position.set(x, 0, z);
     if (g.current) g.current.rotation.y = h;
@@ -87,6 +100,11 @@ function CarModel({ lot, car }: { lot: Lot; car: Car }) {
           </mesh>
         )),
       )}
+      {/* an angry driver: a red marker bobbing over the car */}
+      <mesh ref={mood} visible={false}>
+        <octahedronGeometry args={[0.45]} />
+        <meshBasicMaterial color="#ff4d4d" toneMapped={false} />
+      </mesh>
       {/* state of charge, seen from above: fill, and a tick at the driver's target */}
       <group position-y={2.1} rotation-x={-Math.PI / 2}>
         <mesh position-z={-0.001}>

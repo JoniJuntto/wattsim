@@ -54,7 +54,6 @@ import {
   deviceName,
   EPOCH,
   emptyStats,
-  energyPrice,
   type Fault,
   HOUR,
   hhmm,
@@ -68,7 +67,6 @@ import {
   type Tech,
   type Ticket,
   type TicketKind,
-  TRIP_FINE,
 } from './model';
 import type { World } from './world';
 
@@ -99,6 +97,8 @@ export const EXPAND_PRICE = 6000;
 type Incident = {
   at: number;
   kind: 'reset-fault' | 'tech-fault' | 'jam' | 'comm' | 'hvac' | 'fleet' | 'rush' | 'billing';
+  /** hvac: how long it runs (default one to three hours). */
+  hours?: number;
 };
 
 /** A finished session, for billing questions. */
@@ -222,6 +222,7 @@ export class Lot {
       if (heat > 0.6 && !this.warned.has(id)) {
         this.warned.add(id);
         this.alert('warn', `${deviceName(id)} is heating up (${Math.round(heat * 100)} % to trip)`, this.device(id));
+        this.w.fx({ lot: this.id, sound: 'alarm' });
       } else if (heat < 0.3) this.warned.delete(id);
     }
   }
@@ -234,9 +235,11 @@ export class Lot {
       if (e.cause !== 'manual') {
         this.stats.trips++;
         this.w.ledger.trips++;
-        this.w.ledger.fines += TRIP_FINE;
-        this.w.money -= TRIP_FINE;
+        const fine = this.w.tripFine;
+        this.w.ledger.fines += fine;
+        this.w.money -= fine;
         this.w.reputation -= 4;
+        this.w.fx({ lot: this.id, at: MDB, text: `TRIP −€${fine}`, tone: 'bad', sound: 'trip' });
       }
     } else if (e.type === 'reclose') {
       this.trippedAt.delete(e.nodeId);
@@ -317,7 +320,7 @@ export class Lot {
       const kwh = Math.max(0, wh - ch.lastWh) / 1000;
       ch.lastWh = wh;
       const revenue = kwh * this.kind.kwhPrice * ch.type.tariff;
-      const cost = kwh * energyPrice(this.hour);
+      const cost = kwh * w.energyPrice(this.hour);
       this.stats.energyKwh += kwh;
       this.stats.revenue += revenue;
       w.ledger.energyKwh += kwh;
@@ -344,10 +347,11 @@ export class Lot {
   planDay(): void {
     const day = this.w.day;
     const base = EPOCH + (day - 1) * DAY;
-    const scale = (1 + 0.3 * (day - 1)) * (this.chargers.size / 6);
+    const scale = (1 + 0.12 * (day - 1)) * (this.chargers.size / 6);
     this.arrivals = [];
     for (let h = DAY_START_H; h < DAY_START_H + this.kind.rate.length; h++) {
-      const perHour = (this.kind.rate[h - DAY_START_H] ?? 1) * scale;
+      const match = this.w.today?.id === 'match' && h >= 15 && h < 19 ? 1.6 : 1;
+      const perHour = (this.kind.rate[h - DAY_START_H] ?? 1) * scale * match;
       let t = 0;
       for (;;) {
         t += -Math.log(1 - this.rng()) / perHour;
@@ -448,8 +452,9 @@ export class Lot {
         if (this.park(car)) continue;
         if (t - car.arrivedAt > WAIT_MS) {
           this.w.ledger.turnedAway++;
-          this.w.reputation -= 1;
+          this.w.reputation -= 0.5;
           this.alert('warn', `A ${car.preset.name} driver gave up waiting for a free charger`);
+          this.w.fx({ lot: this.id, at: QUEUE, text: '😠 gave up', tone: 'bad' });
           this.leave(car, [QUEUE, [-20, 3], ENTRY]);
         }
       } else if (car.state === 'arriving' && done) {
@@ -498,12 +503,19 @@ export class Lot {
     const w = this.w;
     this.run(ch, () => st.unplug(1));
     const short = car.targetSoc - car.soc;
-    this.sessions.push({
-      driver: car.driver,
-      charger: ch.id,
-      kwh: (car.soc - car.initialSoc) * car.preset.batteryKwh,
-      t: this.now,
-    });
+    const kwh = (car.soc - car.initialSoc) * car.preset.batteryKwh;
+    this.sessions.push({ driver: car.driver, charger: ch.id, kwh, t: this.now });
+    const paid = `€${(kwh * this.kind.kwhPrice * ch.type.tariff).toFixed(2)}`;
+    this.w.fx(
+      short <= 0.02
+        ? { lot: this.id, at: ch.bay.charger, text: `+${paid} 🙂`, tone: 'good', sound: 'cash' }
+        : {
+            lot: this.id,
+            at: ch.bay.charger,
+            text: `${paid} 😠 ${Math.round(car.soc * 100)}/${Math.round(car.targetSoc * 100)} %`,
+            tone: 'bad',
+          },
+    );
     if (this.sessions.length > 30) this.sessions.shift();
     for (const k of this.tickets) {
       if (k.car !== car.id || (k.state !== 'open' && k.state !== 'promised')) continue;
@@ -526,7 +538,7 @@ export class Lot {
     } else {
       w.ledger.unhappy++;
       this.stats.unhappy++;
-      w.reputation -= Math.min(3, short * 8);
+      w.reputation -= Math.min(2, short * 6);
       this.alert(
         short > 0.15 ? 'warn' : 'info',
         `${car.preset.name} left at ${Math.round(car.soc * 100)} % of a ${Math.round(car.targetSoc * 100)} % target`,
@@ -578,7 +590,7 @@ export class Lot {
         }
         return;
       case 'hvac':
-        this.hvac(true);
+        this.hvac(true, inc.hours);
         return;
       case 'fleet': {
         this.alert('info', 'A delivery fleet is arriving: three vans want a quick top-up');
@@ -594,9 +606,9 @@ export class Lot {
     }
   }
 
-  private hvac(on: boolean): void {
+  private hvac(on: boolean, hours?: number): void {
     (this.site.models.get('HVAC') as StepLoad | undefined)?.set(on);
-    this.hvacUntil = on ? this.now + (1 + this.rng() * 2) * HOUR : 0;
+    this.hvacUntil = on ? this.now + (hours ?? 1 + this.rng() * 2) * HOUR : 0;
     if (on) {
       const kw = Math.round((this.kind.building.hvacW ?? 0) / 1000);
       this.alert('warn', `The building switched its cooling on: +${kw} kW on the building feed`, this.device('QB'));
@@ -706,6 +718,7 @@ export class Lot {
       ...(car ? { car: car.id } : {}),
     };
     this.tickets.unshift(k);
+    this.w.fx({ lot: this.id, ...(ch ? { at: ch.bay.charger } : {}), text: '☎', sound: 'ticket' });
     return k;
   }
 
@@ -714,6 +727,15 @@ export class Lot {
     k.outcome = outcome;
     k.due = this.now;
     this.w.reputation = Math.min(100, this.w.reputation + rep);
+    const at = this.chargers.get(k.charger ?? '')?.bay.charger;
+    this.w.fx({
+      lot: this.id,
+      ...(at ? { at } : {}),
+      ...(rep !== 0
+        ? { text: `${rep > 0 ? '+' : '−'}${Math.abs(rep)} reputation`, tone: rep > 0 ? 'good' : 'bad' }
+        : {}),
+      sound: state,
+    });
     if (state === 'solved') this.w.ledger.ticketsSolved++;
     else this.w.ledger.ticketsFailed++;
   }
@@ -1025,9 +1047,10 @@ export class Lot {
     return Math.max(0, this.stats.peakKw) * DEMAND_PER_KW;
   }
 
-  /** Before the next morning: close what tripped, forget the day's tickets. */
+  /** Before the next morning: close what tripped, lift the operator's caps, forget the day's tickets. */
   night(): void {
     this.tickets = [];
+    for (const ch of this.chargers.values()) if (ch.manualA < ch.type.maxA) void this.setLimit(ch.id, ch.type.maxA);
     this.hvac(false);
     for (const id of this.protective()) if (this.state.nodes[id]?.tripped) this.site.reclose(id, { t: this.now });
     this.trippedAt.clear();
@@ -1184,6 +1207,10 @@ export class Lot {
       lastWh: 0,
     };
     this.chargers.set(id, ch);
+    // A reset can reboot within one step, so the lot never sees it down: its BootNotification marks the reboot.
+    station.on('frame', (dir: string, f: { type: number; action?: string }) => {
+      if (dir === 'out' && f.type === 2 && f.action === 'BootNotification' && ch.resetting) ch.resetting = 'down';
+    });
     await station.connect();
     await station.boot('PowerUp');
   }

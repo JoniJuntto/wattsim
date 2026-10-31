@@ -8,6 +8,7 @@ import { Cars, Techs } from './Cars';
 import { Chargers } from './Chargers';
 import { Flow } from './Flow';
 import { LotModel } from './Lot';
+import { Pops } from './Pops';
 
 export type SceneProps = { lot: Lot; selected: Selection | null; onSelect: (s: Selection | null) => void };
 
@@ -22,6 +23,7 @@ function View(props: { world: World } & Omit<SceneProps, 'lot'>) {
       <Chargers lot={lot} selected={props.selected} onSelect={props.onSelect} />
       <Cars lot={lot} />
       <Techs lot={lot} />
+      <Pops lot={lot} />
     </group>
   );
 }

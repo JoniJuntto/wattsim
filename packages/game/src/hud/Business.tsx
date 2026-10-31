@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useTick } from '../hooks';
 import { CHARGER_TYPES, type ChargerTypeId } from '../sim/layout';
-import { type Lot, ROLES, type Role, type World } from '../sim/world';
+import { LOT_STARS, type Lot, ROLES, type Role, type World } from '../sim/world';
 
 type Tab = 'chargers' | 'upgrades' | 'staff' | 'lots';
 const TABS: Array<[Tab, string]> = [
@@ -244,28 +244,32 @@ function Lots({ world }: { world: World }) {
       </div>
       <div className="text-sm font-semibold">For sale</div>
       {world.forSale().length === 0 && <p className="text-xs text-slate-400">You own every car park in town.</p>}
-      {world.forSale().map((k) => (
-        <div key={k.id} className="flex items-center gap-3 rounded bg-white/5 p-3">
-          <div className="flex-1">
-            <div className="text-sm font-semibold">{k.name}</div>
-            <div className="text-xs text-slate-400">{k.blurb}</div>
-            <div className="num mt-1 text-xs text-slate-300">
-              {Object.values(k.start.chargers)
-                .map((t) => CHARGER_TYPES[t].kw + (CHARGER_TYPES[t].dc ? ' DC' : ''))
-                .join(' · ')}{' '}
-              kW · {k.start.mainA} A · €{k.kwhPrice.toFixed(2)}/kWh
+      {world.forSale().map((k) => {
+        const need = LOT_STARS[k.id] ?? 0;
+        const locked = world.stars < need;
+        return (
+          <div key={k.id} className="flex items-center gap-3 rounded bg-white/5 p-3">
+            <div className="flex-1">
+              <div className="text-sm font-semibold">{k.name}</div>
+              <div className="text-xs text-slate-400">{k.blurb}</div>
+              <div className="num mt-1 text-xs text-slate-300">
+                {Object.values(k.start.chargers)
+                  .map((t) => CHARGER_TYPES[t].kw + (CHARGER_TYPES[t].dc ? ' DC' : ''))
+                  .join(' · ')}{' '}
+                kW · {k.start.mainA} A · €{k.kwhPrice.toFixed(2)}/kWh
+              </div>
             </div>
+            <button
+              type="button"
+              className="btn-primary whitespace-nowrap"
+              disabled={locked || k.price > world.money}
+              onClick={() => void world.buyLot(k.id)}
+            >
+              {locked ? `Needs ★${need} (you have ★${world.stars})` : `Buy ${euro(k.price)}`}
+            </button>
           </div>
-          <button
-            type="button"
-            className="btn-primary whitespace-nowrap"
-            disabled={k.price > world.money}
-            onClick={() => void world.buyLot(k.id)}
-          >
-            Buy {euro(k.price)}
-          </button>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

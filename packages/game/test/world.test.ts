@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { type Charger, type Lot, PRESETS, World } from '../src/sim/world';
+import { type Charger, energyPrice, type Lot, PRESETS, World } from '../src/sim/world';
 
 const SEDAN = PRESETS[1] as (typeof PRESETS)[number];
 const SUV = PRESETS[2] as (typeof PRESETS)[number];
@@ -11,6 +11,7 @@ async function quiet(): Promise<{ w: World; lot: Lot }> {
   const lot = w.lots[0] as Lot;
   lot.arrivals = [];
   lot.incidents = [];
+  w.dilemmaAt = [];
   return { w, lot };
 }
 
@@ -122,6 +123,8 @@ test('a day under auto-DLM runs headless to a summary without trips', async () =
 test('buying a second car park runs it alongside the first; expanding adds an aisle', async () => {
   const { w, lot } = await quiet();
   w.money = 40_000;
+  expect(await w.buyLot('mall')).toBeUndefined();
+  w.stars = 5;
   const mall = await w.buyLot('mall');
   expect(mall?.chargers.size).toBe(6);
   expect(w.lot).toBe(mall as Lot);
@@ -199,4 +202,70 @@ test('hired staff work on their own: an agent answers a dispute, an electrician 
   expect(w.ledger.trips).toBe(1);
   await w.step(4 * MIN);
   expect(w.alerts.some((a) => a.text.startsWith('The electrician closed'))).toBe(true);
+});
+
+test('day 1 has three goals: a trip loses one at once, the night settles the rest and pays the stars', async () => {
+  const { w, lot } = await quiet();
+  expect(w.goals.map((g) => g.id)).toEqual(['energy', 'noTrips', 'happy']);
+  for (const c of row(lot, 1)) c.disabled = true;
+  for (let i = 0; i < 3; i++) lot.spawnCar(w.now, SUV);
+  for (let i = 0; i < 90 && w.ledger.trips === 0; i++) await w.step(MIN);
+  expect(w.goals.find((g) => g.id === 'noTrips')?.state).toBe('lost');
+  const energy = w.goals.find((g) => g.id === 'energy');
+  if (energy) energy.target = 1;
+  for (let i = 0; i < 200 && w.phase === 'day'; i++) await w.step(10 * MIN);
+  expect(w.phase).toBe('summary');
+  expect(energy?.state).toBe('met');
+  expect(w.stars).toBe(w.goals.filter((g) => g.state === 'met').length);
+  expect(w.ledger.bonus).toBe(w.stars * (energy?.bonus ?? 0));
+  expect(w.forecast).toBeDefined();
+}, 60_000);
+
+test('a feeder heating up stops the clock; capping its chargers keeps it from tripping', async () => {
+  const { w, lot } = await quiet();
+  for (const c of row(lot, 1)) c.disabled = true;
+  for (let i = 0; i < 3; i++) lot.spawnCar(w.now, SUV);
+  for (let i = 0; i < 90 && !w.dilemma; i++) await w.step(MIN);
+  expect(w.dilemma?.title).toContain('Feeder breaker row 1');
+  expect(w.paused).toBe(true);
+  expect(w.ledger.trips).toBe(0);
+  w.choose(0);
+  expect(w.paused).toBe(false);
+  await w.step(60 * MIN);
+  expect(w.ledger.trips).toBe(0);
+  expect(w.dilemma).toBeUndefined();
+  for (const c of charging(lot)) expect(c.sentA).toBe(16);
+});
+
+test("day 1's noon offer is a TV crew: a working lot earns reputation when they film", async () => {
+  const { w } = await quiet();
+  w.dilemmaAt = [w.now + 60 * MIN];
+  await w.step(61 * MIN);
+  expect(w.dilemma?.title).toBe('Local TV wants to film');
+  const rep = w.reputation;
+  w.choose(0);
+  await w.step(50 * MIN);
+  expect(w.reputation).toBe(Math.min(100, rep + 8));
+});
+
+test("a price-spike forecast triples tomorrow's evening grid price", async () => {
+  const { w } = await quiet();
+  for (let i = 0; i < 200 && w.phase === 'day'; i++) await w.step(10 * MIN);
+  w.forecast = { id: 'price' };
+  await w.nextDay();
+  expect(w.today?.id).toBe('price');
+  expect(w.energyPrice(18)).toBeCloseTo(3 * energyPrice(18));
+  expect(w.energyPrice(12)).toBeCloseTo(energyPrice(12));
+}, 60_000);
+
+test('a remote reset clears a reset fault even when the station reboots within one step', async () => {
+  const { w, lot } = await quiet();
+  lot.incident({ at: w.now, kind: 'reset-fault' });
+  const ch = [...lot.chargers.values()].find((c) => c.fault) as Charger;
+  await w.step(MIN);
+  await lot.reset(ch.id);
+  await w.step(5 * MIN);
+  expect(ch.fault).toBeUndefined();
+  expect(ch.resetting).toBeUndefined();
+  expect(ch.station.evses[0]?.status).toBe('Available');
 });
