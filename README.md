@@ -66,7 +66,34 @@ docker build -t wattsim .
 docker run -p 7700:7700 -p 7701:7701 -v wattsim-data:/data wattsim
 ```
 
-The image runs `wattsim ui --host 0.0.0.0 --no-open --data /data --csms-port 7701 --keep-stations` as the unprivileged `bun` user, with a health check on `/api/health`. Point external charge points at `ws://<host>:7701/<id>` to have the test CSMS check them. There is no authentication: put the container behind a reverse proxy that adds it before exposing it beyond your machine. CI builds the image on every push (`.github/workflows/docker.yml`); nothing is published.
+The image runs `wattsim ui --host 0.0.0.0 --no-open --data /data --csms-port 7701 --keep-stations` as the unprivileged `bun` user, with a health check on `/api/health`. Point external charge points at `ws://<host>:7701/<id>` to have the test CSMS check them. The server itself has no authentication: put the container behind a reverse proxy that adds it before exposing it beyond your machine, as the [shared team server](#shared-team-server) setup does. CI builds the image on every push (`.github/workflows/docker.yml`); pushes to `main` also publish it to `ghcr.io/<owner>/wattsim` and deploy it when the `DEPLOY_HOST` variable is set.
+
+### Shared team server
+
+`deploy/` runs one wattsim for a whole team on a VM: the UI behind a shared password, stations that stay connected when everyone's laptop is closed and come back after a restart, and every push to `main` deployed. Caddy in front provides TLS and the password; the test CSMS gets its own domain with no password so chargers can reach it.
+
+You need a small Linux VM with Docker (a Hetzner CX22 is plenty) and two DNS A records pointing at it: one for the UI, one for the test CSMS.
+
+One-time setup on the VM:
+
+```sh
+scp -r deploy you@vm:~/wattsim                           # compose.yml, Caddyfile, .env.example
+ssh you@vm
+cd ~/wattsim && cp .env.example .env                     # fill in the image, both domains and the user
+docker run --rm caddy:2 caddy hash-password             # paste the hash into .env, inside single quotes
+docker login ghcr.io                                     # only if the package is private; a read:packages token
+docker compose up -d
+```
+
+To deploy from CI, set the repository **variables** `DEPLOY_HOST` and `DEPLOY_USER` and the **secrets** `DEPLOY_SSH_KEY` (a private key that user accepts) and `DEPLOY_KNOWN_HOSTS` (the output of `ssh-keyscan <host>`, so the runner checks it is talking to your VM). Each push to `main` then runs `docker compose pull && docker compose up -d` on the VM. Without `DEPLOY_HOST` the deploy job is skipped.
+
+Using it:
+
+- Open `https://<ui domain>` and log in with the shared user and password.
+- Outside chargers connect to `wss://<csms domain>/<station id>`.
+- Agents attach with `wattsim mcp --attach https://<user>:<password>@<ui domain>` (see [Use it from an AI agent](#use-it-from-an-ai-agent)); `run_scenario` against it needs `csmsUrl: wss://<csms domain>`.
+
+Limits: a deploy or restart ends charges in progress (stations reconnect and boot again with idle EVSEs); chaos rules and configuration changes are not kept; everyone with the password sees and controls every station; the CSMS domain has no password.
 
 ## Use it from an AI agent
 
