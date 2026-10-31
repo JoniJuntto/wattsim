@@ -29,16 +29,18 @@ This is the only server code change. Today stations live only in memory (`packag
 - **Table:** add a `stations` table to `packages/server/src/db/schema.ts` with columns `id` (text, primary key), `spec`
   (JSON, the validated `CreateStation`) and `created_at`. Generate migration `0003_stations.sql` with `bun run
   db:generate`.
-- **Write path:** `Registry.create` saves each spec once its station is created, and `Registry.remove` deletes the row.
-  The registry gets this through an optional callback pair passed by `startServer`, so the registry doesn't import
-  the store.
-- **Server mode only:** saving happens only with `--data`. Without it the `Store` is in-memory or absent, so local
-  `wattsim ui` and the embedded server of `wattsim mcp` behave as they do now.
-- **Restore on boot:** after the routes are built and before `startServer` returns, it reads every saved spec,
-  re-validates it with the `createStation` schema, and calls `Registry.create` for the valid ones. Each station
-  connects and sends BootNotification as on creation.
-- **Test CSMS first:** the built-in test CSMS starts lazily (`POST /api/loopback`). If any saved spec's `csmsUrl` port
-  equals the fixed `--csms-port`, the server starts the test CSMS before restoring, so those stations find it.
+- **Opt-in flag:** `wattsim ui --keep-stations` (`ServerOptions.keepStations`). Local `wattsim ui` already defaults
+  `--data` to `~/.wattsim`, so keying this off `--data` would bring back old local stations aimed at a test CSMS port
+  that no longer exists. Without the flag nothing changes. The Dockerfile's command adds the flag.
+- **Write path:** with the flag, the `POST /api/stations` handler saves every created spec (bulk creates included)
+  after `Registry.create` succeeds, and the `DELETE /api/stations/:id` handler deletes the row. These handlers are
+  the only callers of `create` and `remove`. Shutdown (`closeAll`) doesn't delete rows.
+- **Restore on boot:** with the flag, before the server starts listening, it reads every saved spec, re-validates it
+  with the `createStation` schema, and creates the valid stations one at a time. Each station connects and sends
+  BootNotification as on creation.
+- **Test CSMS first:** the built-in test CSMS starts lazily (`POST /api/loopback`). With the flag and a fixed
+  `--csms-port`, the server starts it at boot, before restoring. Restored stations find it, and outside chargers can
+  reach it right after a deploy.
 - **Bad rows:** a spec that fails validation (for example after a schema change), or whose create throws, is logged
   with its id and the reason, then skipped. It stays in the table so a later fix can restore it. The server still
   starts.
@@ -57,7 +59,7 @@ New folder `deploy/` with no app code in it:
 
 - **`deploy/compose.yml`** runs two services.
   - `wattsim`: image `ghcr.io/<owner>/wattsim:latest`, the image's default command (`wattsim ui --host 0.0.0.0
-    --csms-port 7701 --data /data`), a named volume on `/data`, `restart: unless-stopped`, and no published ports.
+    --csms-port 7701 --data /data --keep-stations`), a named volume on `/data`, `restart: unless-stopped`, and no published ports.
   - `caddy`: the official image, ports 80 and 443, the Caddyfile mounted read-only, a named volume for certificates,
     and `restart: unless-stopped`.
 - **`deploy/Caddyfile`** has two sites, with domains and the password hash coming from `deploy/.env`:
