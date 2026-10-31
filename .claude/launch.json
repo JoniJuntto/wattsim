@@ -12,6 +12,12 @@
       "runtimeExecutable": "bun",
       "runtimeArgs": ["packages/cli/src/index.ts", "ui", "--no-open"],
       "port": 7700
+    },
+    {
+      "name": "game",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--filter", "@wattsim/game", "dev"],
+      "port": 5174
     }
   ]
 }
