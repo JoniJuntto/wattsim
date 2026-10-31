@@ -20,9 +20,18 @@ export class Api {
   private readonly auth: string | undefined;
 
   constructor(baseUrl: string) {
+    // Errors here never echo the URL: it may hold a password.
     const u = new URL(baseUrl);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      throw new ApiError('the wattsim server URL must start with http:// or https://');
+    }
     if (u.username || u.password) {
-      const pair = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+      let pair: string;
+      try {
+        pair = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+      } catch {
+        throw new ApiError('percent-encode special characters in the URL credentials, e.g. % as %25 and # as %23');
+      }
       this.auth = `Basic ${Buffer.from(pair).toString('base64')}`;
       u.username = '';
       u.password = '';

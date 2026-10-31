@@ -80,12 +80,12 @@ One-time setup on the VM:
 scp -r deploy you@vm:~/wattsim                           # compose.yml, Caddyfile, .env.example
 ssh you@vm
 cd ~/wattsim && cp .env.example .env                     # fill in the image, both domains and the user
-docker run --rm caddy:2 caddy hash-password             # paste the hash into .env, inside single quotes
+docker run --rm -it caddy:2 caddy hash-password         # type the password; paste the hash into .env, in single quotes
 docker login ghcr.io                                     # only if the package is private; a read:packages token
 docker compose up -d
 ```
 
-To deploy from CI, set the repository **variables** `DEPLOY_HOST` and `DEPLOY_USER` and the **secrets** `DEPLOY_SSH_KEY` (a private key that user accepts) and `DEPLOY_KNOWN_HOSTS` (the output of `ssh-keyscan <host>`, so the runner checks it is talking to your VM). Each push to `main` then runs `docker compose pull && docker compose up -d` on the VM. Without `DEPLOY_HOST` the deploy job is skipped.
+To deploy from CI, set the repository **variables** `DEPLOY_HOST` and `DEPLOY_USER` and the **secrets** `DEPLOY_SSH_KEY` (a private key that user accepts) and `DEPLOY_KNOWN_HOSTS` (the output of `ssh-keyscan <host>`, so the runner checks it is talking to your VM). Each push to `main` then runs `docker compose pull && docker compose up -d` on the VM and prunes the images it replaced; runs on `main` queue rather than overlap, so the VM always ends on the newest image. Without `DEPLOY_HOST` the deploy job is skipped. The job doesn't copy `deploy/`: after changing `compose.yml` or the `Caddyfile`, copy them to the VM again.
 
 Using it:
 
@@ -105,7 +105,7 @@ Claude Code:
 claude mcp add wattsim -- bunx wattsim mcp
 ```
 
-A password-protected server, such as the [shared team server](#shared-team-server), takes its credentials in the URL; they are sent as a basic-auth header and left out of everything printed:
+A password-protected server, such as the [shared team server](#shared-team-server), takes its credentials in the URL (percent-encode special characters in the password, e.g. `%` as `%25` and `#` as `%23`); they are sent as a basic-auth header and left out of everything printed:
 
 ```sh
 claude mcp add wattsim -- bunx wattsim mcp --attach https://team:PASSWORD@wattsim.example.com

@@ -68,7 +68,7 @@ New folder `deploy/` with no app code in it:
   - `{$WATTSIM_CSMS_DOMAIN}`: `reverse_proxy wattsim:7701`, with no auth. External chargers reach the test CSMS at
     `wss://<csms domain>/<station id>`.
 - **`deploy/.env.example`** lists the four variables. The real `.env` lives only on the VM and is gitignored. The
-  hash comes from `docker run --rm caddy caddy hash-password`.
+  hash comes from `docker run --rm -it caddy:2 caddy hash-password`.
 - **Health check:** Docker's health check runs inside the container against `127.0.0.1:7700/api/health`, so it doesn't
   go through Caddy's login.
 - **Why it works without code changes:** Caddy keeps the `Host` header, so the API's Origin check (`sameOrigin` in

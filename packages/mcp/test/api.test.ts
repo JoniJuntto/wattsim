@@ -61,6 +61,17 @@ test("an unreachable server's error leaves out the password", async () => {
   expect((err as ApiError).message).not.toContain('secret');
 });
 
+test('a URL without http(s):// is refused without echoing it', () => {
+  // Parses as protocol `team:`, so the password would otherwise end up in "cannot reach … at team:secret@host".
+  expect(() => new Api('team:secret@wattsim.example.com')).toThrow(/http:\/\/ or https:\/\//);
+  expect(() => new Api('team:secret@wattsim.example.com')).not.toThrow(/secret/);
+});
+
+test('a raw % in the password says to percent-encode it', () => {
+  expect(() => new Api('https://team:pa%ss@wattsim.example.com')).toThrow(/percent-encode/);
+  expect(() => new Api('https://team:pa%ss@wattsim.example.com')).not.toThrow(/pa%ss/);
+});
+
 describe('createMcp through basic auth', () => {
   let real: RunningServer;
   let proxy: ReturnType<typeof Bun.serve>;

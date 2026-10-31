@@ -6,6 +6,10 @@ on:
   push:
     branches: [main]
   pull_request:
+# Runs on one ref queue instead of overlapping, so an older main run can't push :latest after a newer one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 permissions:
   contents: read
   packages: write
@@ -71,4 +75,4 @@ jobs:
           install -m 600 /dev/null ~/.ssh/id
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          ssh -i ~/.ssh/id "$DEPLOY_USER@$DEPLOY_HOST" 'cd ~/wattsim && docker compose pull && docker compose up -d'
+          ssh -i ~/.ssh/id "$DEPLOY_USER@$DEPLOY_HOST" 'cd ~/wattsim && docker compose pull && docker compose up -d && docker image prune -f'

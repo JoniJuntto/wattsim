@@ -335,8 +335,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       return json(201, bulk ? views : views[0]);
     })
     .delete('/api/stations/:id', async ({ params }) => {
-      await reg.remove(params.id);
+      // `remove` forgets the station before its first await; drop the row in that same step, so a re-create that
+      // lands while the socket is still closing keeps the row it saves.
+      const removing = reg.remove(params.id);
       if (opts.keepStations) store.deleteStation(params.id);
+      await removing;
       return noContent();
     })
     .post('/api/stations/:id/actions', async ({ params, body: raw }) => {

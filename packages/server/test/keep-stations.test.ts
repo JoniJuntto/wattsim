@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as schema from '../src/db/schema';
@@ -138,5 +140,42 @@ test('the test CSMS is up at boot with keepStations and a fixed csmsPort', async
     });
   } finally {
     ws.close();
+  }
+});
+
+test('a station re-created while its delete is still closing keeps its saved row', async () => {
+  // Completes the WebSocket upgrade by hand, then ignores every frame (close included), so a delete waits out the
+  // registry's close timeout and a re-create of the same id lands inside it.
+  const hang = createServer((sock) => {
+    let head = '';
+    let upgraded = false;
+    sock.on('data', (d) => {
+      if (upgraded) return;
+      head += d.toString('latin1');
+      if (!head.includes('\r\n\r\n')) return;
+      upgraded = true;
+      const key = /sec-websocket-key:\s*(\S+)/i.exec(head)?.[1] ?? '';
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+      sock.write(
+        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\nSec-WebSocket-Protocol: ocpp1.6\r\n\r\n`,
+      );
+    });
+    sock.on('error', () => {});
+  });
+  await new Promise<void>((r) => hang.listen(0, '127.0.0.1', () => r()));
+  try {
+    const csmsUrl = `ws://127.0.0.1:${(hang.address() as { port: number }).port}`;
+    const spec = { id: 'CP-RACE', version: 'ocpp1.6', csmsUrl };
+    let a = await start();
+    expect((await a.post('/api/stations', spec)).status).toBe(201);
+    await waitFor(a, (l) => l.some((s) => s.id === 'CP-RACE' && s.connection === 'open'), 'CP-RACE to connect');
+    const del = a.del('/api/stations/CP-RACE');
+    await Bun.sleep(100);
+    expect((await a.post('/api/stations', spec)).status).toBe(201);
+    expect((await del).status).toBe(204);
+    a = await restart();
+    expect((await stations(a)).map((s) => s.id)).toEqual(['CP-RACE']);
+  } finally {
+    hang.close();
   }
 });
