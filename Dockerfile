@@ -4,16 +4,18 @@
 #   docker run -p 7700:7700 -p 7701:7701 -v wattsim-data:/data wattsim
 # Bun runs the TypeScript sources directly, so the image carries sources, production node_modules, the generated
 # protocol schemas and the built UI. Keep BUN_VERSION in step with packageManager in package.json.
+# Every stage but runtime makes platform-neutral files (sources, generated schemas, the UI bundle, pure-JS
+# dependencies), so they run on the build machine's platform and a multi-platform build emulates only the runtime stage.
 ARG BUN_VERSION=1.4.4
 
 # ---- manifests: package.json files and the lockfile only, so dependency layers cache across source edits -------
-FROM oven/bun:${BUN_VERSION} AS manifests
+FROM --platform=$BUILDPLATFORM oven/bun:${BUN_VERSION} AS manifests
 WORKDIR /src
 COPY . .
 RUN find . -type f ! -name package.json ! -name bun.lock -delete && find . -type d -empty -delete
 
 # ---- build: every dependency, the generated Zod schemas, the UI bundle ------------------------------------------
-FROM oven/bun:${BUN_VERSION} AS build
+FROM --platform=$BUILDPLATFORM oven/bun:${BUN_VERSION} AS build
 WORKDIR /app
 COPY --from=manifests /src ./
 # Only what the CLI (and so the server) and the UI build need: not the docs site or the VS Code extension.
@@ -22,7 +24,7 @@ COPY . .
 RUN bun run --filter @wattsim/protocol build && bun run --filter @wattsim/ui build
 
 # ---- prod-deps: runtime dependencies only ------------------------------------------------------------------------
-FROM oven/bun:${BUN_VERSION} AS prod-deps
+FROM --platform=$BUILDPLATFORM oven/bun:${BUN_VERSION} AS prod-deps
 WORKDIR /app
 COPY --from=manifests /src ./
 RUN bun install --frozen-lockfile --production --ignore-scripts --filter wattsim
