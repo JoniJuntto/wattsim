@@ -1,5 +1,6 @@
 import { useTick } from '../hooks';
 import { LOT_KINDS } from '../sim/layout';
+import { hhmm } from '../sim/model';
 import { DEMAND_PER_KW, FORECASTS, forecastText, goalText, LOT_STARS, TRIP_FINE, type World } from '../sim/world';
 import { Business } from './Business';
 
@@ -190,7 +191,7 @@ export function DilemmaModal({ world }: { world: World }) {
   return (
     <Modal title={d.title}>
       <p className="mb-1 text-xs uppercase tracking-wide text-slate-400">
-        {world.lots.find((l) => l.id === d.lot)?.name} · {new Date(world.now).toISOString().slice(11, 16)}
+        {world.lots.find((l) => l.id === d.lot)?.name} · {hhmm(world.now)}
       </p>
       <p className="mb-4 text-sm leading-relaxed text-slate-300">{d.text}</p>
       <div className="grid gap-2">
@@ -215,7 +216,7 @@ export function GameOver({ world, onRestart }: { world: World; onRestart: () => 
     <Modal title="Game over">
       <p className="mb-4 text-sm text-slate-300">
         {world.alerts[0]?.text} You kept {world.lots.length > 1 ? 'your car parks' : 'the lot'} running until day{' '}
-        {world.day}, {new Date(world.now).toISOString().slice(11, 16)}.
+        {world.day}, {hhmm(world.now)}.
       </p>
       <button type="button" className="btn-primary" onClick={onRestart}>
         Try again

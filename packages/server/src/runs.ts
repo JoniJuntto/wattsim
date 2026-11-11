@@ -25,10 +25,10 @@ import type { RunCsmsView, RunDetail, RunEventView, RunResultView, RunStatus, Ru
 /** Events kept with a run (oldest first); later ones are counted in `eventsDropped`. */
 export const RUN_EVENTS_KEPT = 2000;
 /** `run.event` messages streamed per run; the rest are in the run's detail once it ends. */
-export const RUN_EVENTS_STREAMED = 200;
+const RUN_EVENTS_STREAMED = 200;
 const MAX_VIRTUAL_MS = 24 * 3_600_000;
 
-export type RunLimits = {
+type RunLimits = {
   /** Runs at once; another start is refused with `TooManyRuns`. */
   maxRuns: number;
   /** Wall-clock time a real-time run may take; 0: no limit. */
@@ -75,14 +75,14 @@ export type StartRun = {
 };
 
 /** Where a run's electrical site is shown live and its report saved (`Sites`). */
-export type RunSites = {
+type RunSites = {
   attachRun(runId: string, runName: string, run: SiteRun): { id: string } | { refused: string };
   watchStation(siteId: string, station: CoreStationType): void;
   finishRun(siteId: string): Promise<unknown>;
 };
 
 /** Starts a test CSMS on the given clock (see `startTestCsmsOn`). */
-export type CsmsFactory = (clock: Clock) => Promise<Csms>;
+type CsmsFactory = (clock: Clock) => Promise<Csms>;
 
 type Live = {
   row: RunRow;
@@ -127,22 +127,10 @@ function eventView(e: Exclude<RunEvent, { type: 'frame' }>): RunEventView {
   }
 }
 
+/** The result without its site; a station's undefined `error` or assert `message` is dropped by JSON.stringify. */
 function resultView(r: RunResult): RunResultView {
-  return {
-    ok: r.ok,
-    durationMs: r.durationMs,
-    violations: r.violations,
-    stations: r.stations.map((s) => {
-      const out: RunResultView['stations'][number] = {
-        name: s.name,
-        ok: s.ok,
-        durationMs: s.durationMs,
-        asserts: s.asserts.map((a) => (a.message === undefined ? { ok: a.ok, expect: a.expect } : { ...a })),
-      };
-      if (s.error !== undefined) out.error = s.error;
-      return out;
-    }),
-  };
+  const { site: _, ...view } = r;
+  return view;
 }
 
 export class Runs {

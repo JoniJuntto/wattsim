@@ -10,21 +10,38 @@ description: How @wattsim/grid computes currents, voltages, trips and violations
 A site is a tree under a supply. Inner nodes are `transformer`, `fuse`, `breaker`, `board`, `cable` and `meter`; leaves are `evse`, `load`, `pv`, `battery` and `step` loads. From TypeScript:
 
 ```ts
-import { siteBuilder } from '@wattsim/grid';
+import { buildSite } from '@wattsim/grid';
 
-const site = siteBuilder({ phases: 3, voltageV: 400, ratingA: 250 })
-  .transformer('T1', { kva: 400, ukPercent: 4 }, (t) =>
-    t.fuse('F0', { ratingA: 250 }, (f) =>
-      f.board('MDB', { ratingA: 250 }, (b) =>
-        b
-          .breaker('Q1', { type: 'mcb', curve: 'C', ratingA: 40 }, (q) =>
-            q.cable('W1', { mm2: 10, lengthM: 40, method: 'C' }, (w) => w.evse('CP-1', { phases: 'L2L3L1' })),
-          )
-          .load('HVAC', { model: { type: 'shape', preset: 'office', peakW: 40_000 } }),
-      ),
-    ),
-  )
-  .build();
+const site = buildSite({
+  supply: { phases: 3, voltageV: 400, ratingA: 250 },
+  nodes: [
+    {
+      kind: 'transformer', id: 'T1', kva: 400, ukPercent: 4,
+      children: [
+        {
+          kind: 'fuse', id: 'F0', ratingA: 250,
+          children: [
+            {
+              kind: 'board', id: 'MDB', ratingA: 250,
+              children: [
+                {
+                  kind: 'breaker', id: 'Q1', type: 'mcb', curve: 'C', ratingA: 40,
+                  children: [
+                    {
+                      kind: 'cable', id: 'W1', mm2: 10, lengthM: 40, method: 'C',
+                      children: [{ kind: 'evse', id: 'CP-1', phases: 'L2L3L1' }],
+                    },
+                  ],
+                },
+                { kind: 'load', id: 'HVAC', model: { type: 'shape', preset: 'office', peakW: 40_000 } },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+});
 
 const state = site.evaluate(t, { ...site.loadDraws(t), 'CP-1': { amps: [32, 32, 32] } });
 const next = site.nextEvent(); // { t, type: 'trip', nodeId: 'Q1', cause: 'thermal' } or null

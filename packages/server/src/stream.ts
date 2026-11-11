@@ -16,21 +16,23 @@ import type {
   StreamMessage,
 } from './types';
 
-export const STATION_INTERVAL_MS = 200;
+const STATION_INTERVAL_MS = 200;
 /** `run`, `csms` and `csms.session` state messages. */
 export const STATE_INTERVAL_MS = 250;
 /** `csms.violation` messages per second; the rest are counted in `csms` totals and fetched from `/api/csms/violations`. */
-export const CSMS_VIOLATIONS_PER_S = 50;
+const CSMS_VIOLATIONS_PER_S = 50;
 /** `series` points held per station between two messages; older ones are dropped (the HTTP API has them). */
-export const SERIES_PENDING_CAP = 500;
+const SERIES_PENDING_CAP = 500;
 
-export type StreamSocket = { send(data: string): unknown; close(code?: number, reason?: string): unknown };
+type StreamSocket = { send(data: string): unknown; close(code?: number, reason?: string): unknown };
+/** A per-second rate window (see `allow`). */
+export type RateWindow = { start: number; sent: number };
 
 export class StreamHub implements Sink {
   private readonly sockets = new Set<StreamSocket>();
   private readonly lastSent = new Map<string, number>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
-  private violationWindow = { start: 0, sent: 0 };
+  private readonly violationWindow: RateWindow = { start: 0, sent: 0 };
   /** Series points not yet sent, per station. */
   private readonly pendingSeries = new Map<string, SeriesPoint[]>();
 
@@ -108,12 +110,21 @@ export class StreamHub implements Sink {
 
   /** At most `CSMS_VIOLATIONS_PER_S` a second; returns false for one that was not sent. */
   csmsViolation(violation: ConformanceViolation): boolean {
+    if (!this.allow(this.violationWindow, CSMS_VIOLATIONS_PER_S)) return false;
+    this.broadcast({ type: 'csms.violation', violation });
+    return true;
+  }
+
+  /** Whether one more message may go out within the window's second (at most `perS`); false when nobody listens. */
+  allow(window: RateWindow, perS: number): boolean {
     if (this.sockets.size === 0) return false;
     const now = Date.now();
-    if (now - this.violationWindow.start >= 1000) this.violationWindow = { start: now, sent: 0 };
-    if (this.violationWindow.sent >= CSMS_VIOLATIONS_PER_S) return false;
-    this.violationWindow.sent++;
-    this.broadcast({ type: 'csms.violation', violation });
+    if (now - window.start >= 1000) {
+      window.start = now;
+      window.sent = 0;
+    }
+    if (window.sent >= perS) return false;
+    window.sent++;
     return true;
   }
 

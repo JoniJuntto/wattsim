@@ -7,8 +7,8 @@
  *   20 minutes, nothing limits them, a sub-board breaker heats up and trips.
  *
  * `?mock&chargers=50` makes both depots 50 chargers (for the performance check). The controller here is a compact
- * stand-in for `@wattsim/site`'s reference DLM (same decision trail shape: budgets per node phase, max-min fair water
- * filling, a pause below 6 A); its steps are what the decision panel shows.
+ * stand-in for `@wattsim/site`'s reference DLM (same decision trail shape: budgets per node phase, its max-min fair
+ * water filling, a pause below 6 A); its steps are what the decision panel shows.
  */
 import {
   buildSite,
@@ -24,6 +24,7 @@ import {
   StepLoad,
   SUPPLY_ID,
 } from '@wattsim/grid';
+import { type AllocConstraint, waterFill } from '@wattsim/site';
 import type {
   Allocation,
   AllocationEvse,
@@ -374,26 +375,21 @@ export class SimSite {
     const uses = new Map(
       active.map((a) => [a.ev.leafId, ancestors(a.ev.leafId).flatMap((n) => a.phases.map((p) => `${n}|${p}`))]),
     );
-    const budget = new Map<string, number>();
+    const constraints: AllocConstraint[] = [];
     for (const [id, c] of nodes)
-      for (const p of PHASES) if (c.node.phases[p]) budget.set(`${id}|${p}`, c.node.phases[p]?.budgetA ?? 0);
-    const paused = new Set<string>();
-    let amps = new Map<string, number>();
-    let binding = new Map<string, string>();
-    let first: string | undefined;
-    for (;;) {
-      ({ amps, binding, first } = waterFill(
-        active
-          .filter((a) => !paused.has(a.ev.leafId))
-          .map((a) => ({ id: a.ev.leafId, uses: uses.get(a.ev.leafId) ?? [], maxA: a.ev.maxA })),
-        budget,
-      ));
-      const short = active
-        .filter((a) => !paused.has(a.ev.leafId) && (amps.get(a.ev.leafId) ?? 0) < MIN_A - 1e-9)
-        .sort((a, b) => b.ev.arriveAt - a.ev.arriveAt);
-      if (short.length === 0) break;
-      paused.add((short[0] as (typeof short)[number]).ev.leafId);
-    }
+      for (const p of PHASES)
+        if (c.node.phases[p]) constraints.push({ key: `${id}|${p}`, budgetA: c.node.phases[p]?.budgetA ?? 0 });
+    // The newest EV (highest priority) is paused first when there is not enough for everyone.
+    const { amps, binding, first, paused } = waterFill(
+      constraints,
+      active.map((a) => ({
+        id: a.ev.leafId,
+        uses: uses.get(a.ev.leafId) ?? [],
+        maxA: a.ev.maxA,
+        minA: MIN_A,
+        priority: a.ev.arriveAt,
+      })),
+    );
     const sent: Allocation['sent'] = [];
     const evses: AllocationEvse[] = active.map((a) => {
       const id = a.ev.leafId;
@@ -644,45 +640,6 @@ function keyOf(k: string): { nodeId: string; phase: Phase } {
   return { nodeId: k.slice(0, i), phase: k.slice(i + 1) as Phase };
 }
 
-/** Max-min fair water filling (see `@wattsim/site` allocate.ts). */
-function waterFill(evs: Array<{ id: string; uses: string[]; maxA: number }>, budget: ReadonlyMap<string, number>) {
-  const left = new Map(budget);
-  const amps = new Map<string, number>(evs.map((e) => [e.id, 0]));
-  const binding = new Map<string, string>();
-  const active = new Set(evs.map((e) => e.id));
-  let first: string | undefined;
-  while (active.size > 0) {
-    let step = Number.POSITIVE_INFINITY;
-    for (const e of evs) if (active.has(e.id)) step = Math.min(step, e.maxA - (amps.get(e.id) ?? 0));
-    for (const [k, b] of left) {
-      const n = evs.filter((e) => active.has(e.id) && e.uses.includes(k)).length;
-      if (n > 0) step = Math.min(step, b / n);
-    }
-    step = Math.max(0, step);
-    for (const e of evs) {
-      if (!active.has(e.id)) continue;
-      amps.set(e.id, (amps.get(e.id) ?? 0) + step);
-      for (const k of e.uses) if (left.has(k)) left.set(k, (left.get(k) ?? 0) - step);
-    }
-    for (const [k, b] of left) {
-      if (b > 1e-9) continue;
-      for (const e of evs) {
-        if (!active.has(e.id) || !e.uses.includes(k)) continue;
-        active.delete(e.id);
-        binding.set(e.id, k);
-        first ??= k;
-      }
-    }
-    for (const e of evs) {
-      if (active.has(e.id) && (amps.get(e.id) ?? 0) >= e.maxA - 1e-9) {
-        active.delete(e.id);
-        binding.set(e.id, 'max');
-      }
-    }
-  }
-  return { amps, binding, first };
-}
-
 // ---- the mock routes -------------------------------------------------------------------------------------------
 
 type Emit = (msg: SiteStreamMessage) => void;
@@ -740,7 +697,7 @@ function seedSites(emit: Emit): void {
   }, 250);
 }
 
-const json = (body: unknown, status = 200) =>
+export const json = (body: unknown, status = 200) =>
   new Response(body === undefined ? null : JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json' },

@@ -17,7 +17,7 @@ import {
   TransactionCost,
   VirtualClock,
 } from '../src/index';
-import { connectInMemory, FakeCsms, until } from './fake-csms';
+import { FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-06-01T10:00:00Z');
 const MIN = 60_000;
@@ -42,7 +42,6 @@ async function booted(version: OcppVersion, cfg: Partial<StationConfig> = {}): P
     id: 'CS1',
     version,
     csmsUrl: csms.url,
-    socket: connectInMemory,
     clock,
     meterIntervalMs: MIN,
     ...cfg,
@@ -467,7 +466,6 @@ describe('reorder never holds an outbound CALL', () => {
     chaos.add({ match: { direction: 'out' }, effect: { kind: 'reorder' }, once: true });
     const conn = new Connection({
       url: csms.url,
-      socket: connectInMemory,
       identity: 'CP1',
       version: 'ocpp1.6',
       clock,
@@ -493,16 +491,16 @@ describe('reorder never holds an outbound CALL', () => {
   test('the engine skips reorder for an outbound CALL and matches every other frame', () => {
     const engine = new ChaosEngine();
     engine.add({ match: { direction: 'out' }, effect: { kind: 'reorder' }, once: true });
-    expect(engine.decide('out', { type: 2, id: 'a', action: 'Heartbeat', payload: {} }).fault).toBeUndefined();
+    expect(engine.decide('out', { type: 2, id: 'a', action: 'Heartbeat', payload: {} }).effect).toBeNull();
     expect(engine.size).toBe(1);
-    expect(engine.decide('in', { type: 2, id: 'b', action: 'Reset', payload: {} }).fault).toBeUndefined();
+    expect(engine.decide('in', { type: 2, id: 'b', action: 'Reset', payload: {} }).effect).toBeNull();
     const both = new ChaosEngine();
     both.add({ match: {}, effect: { kind: 'reorder' } });
-    expect(both.decide('in', { type: 2, id: 'c', action: 'Reset', payload: {} }).fault).toEqual({ kind: 'reorder' });
-    expect(both.decide('out', { type: 6, id: 'd', action: 'NotifyPeriodicEventStream', payload: {} }).fault).toEqual({
+    expect(both.decide('in', { type: 2, id: 'c', action: 'Reset', payload: {} }).effect).toEqual({ kind: 'reorder' });
+    expect(both.decide('out', { type: 6, id: 'd', action: 'NotifyPeriodicEventStream', payload: {} }).effect).toEqual({
       kind: 'reorder',
     });
-    expect(engine.decide('out', { type: 3, id: 'e', payload: {} }).fault).toEqual({ kind: 'reorder' });
+    expect(engine.decide('out', { type: 3, id: 'e', payload: {} }).effect).toEqual({ kind: 'reorder' });
     expect(engine.size).toBe(0);
   });
 });

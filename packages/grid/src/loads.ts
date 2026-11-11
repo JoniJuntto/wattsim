@@ -386,12 +386,6 @@ export function modelFromSpec(spec: LoadModelSpec, pf = 1): LoadModel {
         ...(spec.startMs !== undefined ? { startMs: spec.startMs } : {}),
         pf,
       });
-    case 'daily':
-      return dailyShape(spec.points, {
-        ...(spec.interpolation ? { interpolation: spec.interpolation } : {}),
-        ...(spec.utcOffsetMin !== undefined ? { utcOffsetMin: spec.utcOffsetMin } : {}),
-        pf,
-      });
     case 'shape':
       return shapeLoad(spec.preset, spec.peakW, {
         ...(spec.utcOffsetMin !== undefined ? { utcOffsetMin: spec.utcOffsetMin } : {}),

@@ -18,7 +18,7 @@ const scratch = await mkdtemp(join(tmpdir(), 'wattsim-quirk-'));
 afterAll(() => rm(scratch, { recursive: true, force: true }));
 
 async function quirkCli(...args: string[]) {
-  const proc = Bun.spawn(['bun', 'packages/cli/src/commands/quirk.ts', ...args], {
+  const proc = Bun.spawn(['bun', 'packages/cli/src/index.ts', 'quirk', ...args], {
     cwd: repoRoot,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -31,7 +31,7 @@ async function quirkCli(...args: string[]) {
   return { stdout, stderr, code };
 }
 
-/** `wattsim` in a child process whose stations reach its in-memory CSMS at `MEMORY_CSMS` (see in-memory.ts). */
+/** `wattsim` in a child process whose stations reach its own `FakeCsms` at `MEMORY_CSMS` (see in-memory.ts). */
 const wattsim = (...args: string[]) => runInMemory('packages/cli/src/index.ts', args);
 
 describe('quirkFlags', () => {

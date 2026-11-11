@@ -20,7 +20,8 @@ import { type Csms, startCsms } from '@wattsim/csms';
 import type { CheckIssue } from '@wattsim/grid';
 import { type DlmScore, type ViolationKind, validateSite } from '@wattsim/grid';
 import { type SiteRuntime, startSite } from '@wattsim/site';
-import type { Loc, Scenario, SiteCheck, SiteExpectStmt, StationBlock, StrExpr, StringExpr } from './ast';
+import type { Loc, Scenario, SiteCheck, SiteExpectStmt, StationBlock, StrExpr } from './ast';
+import { rawText } from './ast';
 import { ParseError } from './lexer';
 import { type Attachment, attachEvses, issueLoc, leafIdOf, type SiteSetup, siteSetup, VIOLATION_WORDS } from './site';
 
@@ -53,10 +54,6 @@ export type SiteRunOptions = {
    * it, so a fast real-time run records as much scenario time per point as a run at x1. Default 1.
    */
   speed?: number;
-  /** Time series resolution, clock ms. Default 10000 / `speed`. */
-  seriesMs?: number;
-  /** Load models are evaluated at least this often, clock ms. Default 10000 / `speed`. */
-  loadStepMs?: number;
   /**
    * The site's Modbus meters: `on` (default) listens on the ports the site names, `free` on free ports (several runs
    * of a site that pins a port can coexist), `off` serves none (e.g. runs started from the UI).
@@ -80,7 +77,7 @@ const DEFAULT_SITE_MS = Date.parse(DEFAULT_SITE_TIME);
 /** `ms` of scenario time in clock ms at `speed` (at least 100 ms). */
 const scaled = (ms: number, speed: number | undefined) => (speed && speed > 1 ? Math.max(100, ms / speed) : ms);
 
-const plain = (s: StringExpr) => s.parts.map((p) => (typeof p === 'string' ? p : `{${p.var}}`)).join('');
+const plain = rawText;
 
 export class SiteRun {
   readonly runtime: SiteRuntime;
@@ -192,8 +189,8 @@ export class SiteRun {
             },
           }
         : {}),
-      seriesMs: opts.seriesMs ?? scaled(10_000, opts.speed),
-      loadStepMs: opts.loadStepMs ?? scaled(10_000, opts.speed),
+      seriesMs: scaled(10_000, opts.speed),
+      loadStepMs: scaled(10_000, opts.speed),
       ...(modelStartMs !== now ? { timeOffsetMs: modelStartMs - now } : {}),
     });
     runtime.on('log', (m) => opts.log(m));
@@ -297,7 +294,7 @@ function checkNode(c: SiteCheck): string | undefined {
   return 'node' in c && c.node ? plain(c.node) : undefined;
 }
 
-export function describeCheck(c: SiteCheck, node?: string): string {
+function describeCheck(c: SiteCheck, node?: string): string {
   const n = node !== undefined ? ` "${node}"` : '';
   switch (c.kind) {
     case 'noTrip':

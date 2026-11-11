@@ -23,7 +23,7 @@ afterEach(async () => {
 /** Run one station block against a fresh CSMS and return the rules it flagged, in order, without repeats. */
 async function flagged(version: string, body: string): Promise<RuleId[]> {
   const clock = new VirtualClock(T0);
-  csms = startCsms({ listen: false, clock, topology: { evses: 1 } });
+  csms = startCsms({ clock, topology: { evses: 1 } });
   const stations: Station[] = [];
   const src = `wattsim 1\nstation "CP-1" {\n  version ${version}\n${body}\n}\n`;
   const running = run(parse(src), {

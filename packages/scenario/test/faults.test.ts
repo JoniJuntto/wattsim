@@ -6,7 +6,7 @@ import type { StationConfig } from '@wattsim/core';
 import { Station, VirtualClock } from '@wattsim/core';
 import type { CallFrame, v16, v201 } from '@wattsim/protocol';
 import { FakeCsms } from '../../core/test/fake-csms';
-import type { ChaosFaultStmt, MeterStmt, NetStmt, RunEvent, RunOptions, RunResult, Stmt } from '../src/index';
+import type { ChaosStmt, MeterStmt, NetStmt, RunEvent, RunOptions, RunResult, Stmt } from '../src/index';
 import { driveVirtual, EV_PROPS, evPropNames, format, isIdle, ParseError, parse } from '../src/index';
 import { run } from './in-memory';
 
@@ -52,8 +52,8 @@ describe('parse and format: milestone-4 chaos faults', () => {
   });
 
   test('the AST carries the fault, its arguments and the usual filters', () => {
-    const stmts = parse(src).stations[0]?.body as ChaosFaultStmt[];
-    expect(stmts.every((s) => s.kind === 'chaosFault')).toBe(true);
+    const stmts = parse(src).stations[0]?.body as ChaosStmt[];
+    expect(stmts.every((s) => s.kind === 'chaos')).toBe(true);
     expect(stmts[0]).toMatchObject({
       fault: { kind: 'jitter', min: { ms: 100 }, max: { ms: 2000 } },
       direction: 'out',
@@ -76,7 +76,7 @@ describe('parse and format: milestone-4 chaos faults', () => {
   });
 
   test('a word starting upper-case after invalidEnum / missingField is the action, not a path', () => {
-    const [a] = body('  chaos invalidEnum Heartbeat') as ChaosFaultStmt[];
+    const [a] = body('  chaos invalidEnum Heartbeat') as ChaosStmt[];
     expect(a?.fault).toEqual({ kind: 'invalidEnum' });
     expect(a?.action).toBe('Heartbeat');
   });

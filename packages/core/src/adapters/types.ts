@@ -4,12 +4,9 @@
  * lives on `EvseState.tx`.
  */
 import type { CallFrame, OcppVersion, v201 } from '@wattsim/protocol';
-import type { ProfileStore } from '../charging';
 import type { Clock } from '../clock';
 import type { MeterSample } from '../meter';
-import type { SecurityEventKind, SecurityProfile, StationSecurity } from '../security';
-import type { ConnectorStatus, EvseState, ResolvedStationConfig, StartOptions } from '../station';
-import type { Tariff, TariffSetStatus, TariffStore } from '../tariff';
+import type { ConnectorStatus, EvseState, ResolvedStationConfig, Station } from '../station';
 
 export type BootReason = v201.BootNotificationRequest['reason'];
 
@@ -58,75 +55,8 @@ export type CallOutcome =
   | { deferred: Promise<CallOutcome> }
   | null;
 
-/** The part of `Station` that adapters may use. `Station` implements it. */
-export interface StationContext {
-  readonly id: string;
-  readonly version: OcppVersion;
-  readonly clock: Clock;
-  readonly cfg: ResolvedStationConfig;
-  readonly evses: readonly EvseState[];
-  readonly connected: boolean;
-  readonly heartbeatMs: number | undefined;
-  readonly meterIntervalMs: number;
-  evse(id: number): EvseState | undefined;
-  request(action: string, payload: unknown): Promise<unknown>;
-  boot(reason?: BootReason): Promise<void>;
-  sendHeartbeat(): Promise<void>;
-  /** StatusNotification for one EVSE, or every EVSE when `evseId` is omitted. */
-  sendStatus(evseId?: number): Promise<void>;
-  /** MeterValues with `Trigger` context for one EVSE, or every EVSE when omitted. */
-  sendMeterValues(evseId?: number): Promise<void>;
-  /** Transaction update for the active transaction on one EVSE, or every active one when omitted. */
-  sendTransactionUpdate(evseId: number | undefined, trigger: TxUpdateTrigger): Promise<void>;
-  beginTransaction(evseId: number, opts?: StartOptions): Promise<void>;
-  endTransaction(evseId: number, reason?: string): Promise<void>;
-  setHeartbeatMs(ms: number): void;
-  setMeterIntervalMs(ms: number): void;
-  /** ChangeAvailability. `undefined` targets every EVSE. `Scheduled` when a transaction is still running. */
-  setOperative(evseId: number | undefined, operative: boolean): 'Accepted' | 'Scheduled';
-  /**
-   * Installed charging profiles. After changing them, call `chargingProfilesChanged()`. TxProfiles are removed when
-   * their transaction ends; every other purpose persists.
-   */
-  readonly charging: ProfileStore;
-  /** Re-evaluate every EVSE's limit now (power, status, 2.x ChargingRateChanged) and re-arm the boundary timer. */
-  chargingProfilesChanged(): void;
-  scheduleReset(req: ResetRequest): 'Accepted' | 'Scheduled';
-  /**
-   * 2.0.1 Reset with `evseId`: end that EVSE's transaction (`ImmediateReset`) and re-send its StatusNotification;
-   * no disconnect, no BootNotification. With `onIdle` and a running transaction, the status goes out once it ends.
-   */
-  resetEvse(evseId: number, onIdle: boolean): Promise<void>;
-  /** True while an OnIdle reset (station-wide, or for `evseId`) waits for transactions to end; no new ones start. */
-  resetPending(evseId?: number): boolean;
-  /** Certificate store and security profile; created on first use for stations configured without `security`. */
-  readonly security: StationSecurity;
-  /** Active security profile (1 when `security` was never configured or touched). */
-  readonly securityProfile: SecurityProfile;
-  /** The CSMS base URL the station connects to now. */
-  readonly csmsUrl: string;
-  /**
-   * SecurityEventNotification with the version's event name. Sent once the station has security state; held until
-   * a BootNotification is Accepted, queued while offline.
-   */
-  raiseSecurityEvent(kind: SecurityEventKind, techInfo?: string): void;
-  /** Certificates changed: the next connection uses the current CSMS roots and station certificate. */
-  securityChanged(): void;
-  /**
-   * Move to a (not lower) security profile, optionally on a new URL: reconnect with it, falling back to the previous
-   * profile when that first attempt fails. Resolves true when the new profile is in use.
-   */
-  switchSecurityProfile(next: { profile: SecurityProfile; url?: string }): Promise<boolean>;
-  /** IANA time zone (2.x `ClockCtrlr.TimeZone`); setting an unknown one throws. */
-  timeZone: string;
-  /** 2.1 default tariffs; created on first use. */
-  readonly tariffs: TariffStore;
-  /** 2.1 ChangeTransactionTariff on a running transaction (sends TransactionEvent `TariffChanged` when Accepted). */
-  changeTransactionTariff(
-    transactionId: string,
-    tariff: Tariff,
-  ): { status: TariffSetStatus | 'TxNotFound' | 'NoCurrencyChange'; reason?: string };
-}
+/** The station an adapter drives. Adapters never construct one, so the type is enough. */
+export type StationContext = Station;
 
 export interface VersionAdapter {
   readonly version: OcppVersion;

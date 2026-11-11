@@ -4,7 +4,6 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import * as schema from '../src/db/schema';
 import { Store } from '../src/db/store';
 import type { ServerOptions, StationView } from '../src/index';
 import { type Api, boot, freePort, until } from './helpers';
@@ -110,10 +109,7 @@ test('a bulk create saves every station', async () => {
 
 test('an invalid saved row is skipped and kept, and its id can be created again', async () => {
   const store = new Store(dir);
-  store.db
-    .insert(schema.stations)
-    .values({ id: 'BAD', spec: { id: 'BAD' }, createdAt: Date.now() })
-    .run();
+  store.db.run('INSERT INTO stations (id, spec, created_at) VALUES (?, ?, ?)', ['BAD', '{"id":"BAD"}', Date.now()]);
   store.close();
   let a = await start();
   expect(await stations(a)).toEqual([]);
@@ -178,4 +174,25 @@ test('a station re-created while its delete is still closing keeps its saved row
   } finally {
     hang.close();
   }
+});
+
+test('a folder is set on create, changed by a move, and kept across a restart', async () => {
+  let a = await start();
+  const csmsUrl = await loopback(a);
+  const base = { version: 'ocpp1.6', csmsUrl, autoBoot: false };
+  expect(
+    (await a.post('/api/stations', { ...base, template: 'CP-F{i}', from: 1, to: 2, folder: 'Depot A' })).status,
+  ).toBe(201);
+  expect((await a.post('/api/stations', { ...base, id: 'CP-LOOSE' })).status).toBe(201);
+  const folders = (l: StationView[]) => Object.fromEntries(l.map((s) => [s.id, s.folder]));
+  expect(folders(await stations(a))).toEqual({ 'CP-F1': 'Depot A', 'CP-F2': 'Depot A', 'CP-LOOSE': undefined });
+
+  expect((await a.post('/api/stations/folder', { ids: ['CP-F2', 'CP-LOOSE'], folder: 'Depot B' })).status).toBe(200);
+  expect((await a.post('/api/stations/folder', { ids: ['CP-F1'], folder: null })).status).toBe(200);
+  expect((await a.post('/api/stations/folder', { ids: ['CP-NOPE'], folder: 'X' })).status).toBe(404);
+  const moved = { 'CP-F1': undefined, 'CP-F2': 'Depot B', 'CP-LOOSE': 'Depot B' };
+  expect(folders(await stations(a))).toEqual(moved);
+
+  a = await restart();
+  expect(folders(await stations(a))).toEqual(moved);
 });

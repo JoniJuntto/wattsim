@@ -29,10 +29,10 @@
     "@types/react-dom": "19.3.0",
     "@wattsim/csms": "workspace:*",
     "@wattsim/mcp": "workspace:*",
+    "@wattsim/modbus": "workspace:*",
     "citty": "0.2.2",
     "postcss": "8.5.32",
     "tailwindcss": "4.3.3",
-    "typescript": "5.9.3",
-    "wattsim": "workspace:*"
+    "typescript": "5.9.3"
   }
 }

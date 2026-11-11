@@ -6,6 +6,7 @@
  * a paced virtual run stays deterministic.
  */
 import type { Clock } from './clock';
+import { sleep } from './clock';
 import type { Station } from './station';
 
 export class ConnectPacer {
@@ -28,7 +29,7 @@ export class ConnectPacer {
     const at = Math.max(now, this.next);
     this.next = at + this.gapMs;
     // Sub-millisecond waits are granted at once; the next slot still counts from `at`, so the average rate holds.
-    return at - now < 1 ? Promise.resolve() : this.clock.sleep(at - now);
+    return at - now < 1 ? Promise.resolve() : sleep(this.clock, at - now);
   }
 }
 

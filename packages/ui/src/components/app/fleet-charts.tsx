@@ -16,10 +16,9 @@ import { useNow } from '@/hooks/use-now';
 import { useTheme } from '@/hooks/use-theme';
 import { compact, cssVars, formatTick, formatTime, mix, timeStep, timeTicks, zeroDomain } from '@/lib/chart';
 import { kw as fmtKw, kwh } from '@/lib/format';
-import { STATUS_LABEL, STATUSES } from '@/lib/status';
+import { STATUSES, statusLabel } from '@/lib/status';
 
 const HEAT_BINS = 96;
-const statusLabel = (s: string) => STATUS_LABEL[s as keyof typeof STATUS_LABEL] ?? s;
 const stVar = (s: string) => `var(--st-${s.toLowerCase()}, var(--st-unknown))`;
 
 function PowerAndStatus({ data, now }: { data: FleetSeriesView; now: number }) {

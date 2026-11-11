@@ -3,8 +3,8 @@ import { spawn } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
-import { createMessageConnection, StreamMessageReader, StreamMessageWriter } from 'vscode-jsonrpc/node';
 import type { PublishDiagnosticsParams } from 'vscode-languageserver';
+import { createMessageConnection, StreamMessageReader, StreamMessageWriter } from 'vscode-languageserver/node';
 import { findBun, launch } from '../src/runtime';
 
 let dir: string;

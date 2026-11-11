@@ -2,7 +2,7 @@ import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query';
 import { useEffect } from 'react';
 import { toast } from 'sonner';
 import { useLive, useStore } from '@/state/live';
-import { api } from './http';
+import { api, errorText } from './http';
 import type {
   ChaosRuleBody,
   CreateStationBody,
@@ -12,10 +12,7 @@ import type {
   StationView,
 } from './types';
 
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
 export const useMeta = () => useQuery({ queryKey: ['meta'], queryFn: api.meta, staleTime: Number.POSITIVE_INFINITY });
-export const useHealth = () => useQuery({ queryKey: ['health'], queryFn: api.health, staleTime: 60_000 });
 
 /** Loads the station's frame history into the live store; reruns after every stream snapshot (reconnect). */
 export function useFrameHistory(stationId: string) {
@@ -79,6 +76,19 @@ export function useCreateStations() {
   });
 }
 
+export function useMoveStations() {
+  const store = useStore();
+  return useMutation({
+    mutationFn: ({ ids, folder }: { ids: string[]; folder: string | null }) => api.moveStations(ids, folder),
+    onSuccess: (stations, { folder }) => {
+      store.dispatch(stations.map((station) => ({ type: 'station' as const, station })));
+      const what = stations.length === 1 ? stations[0]?.id : `${stations.length} stations`;
+      toast.success(folder === null ? `Took ${what} out of its folder` : `Moved ${what} to ${folder}`);
+    },
+    onError: (e) => toast.error('Move failed', { description: errorText(e) }),
+  });
+}
+
 export function useDeleteStation() {
   const store = useStore();
   return useMutation({
@@ -103,10 +113,6 @@ export function useRemoveChaos(stationId: string) {
     mutationFn: (ruleId: string) => api.removeChaos(stationId, ruleId),
     onError: (e) => toast.error('Remove failed', { description: errorText(e) }),
   });
-}
-
-export function useLoopback() {
-  return useMutation({ mutationFn: api.startLoopback });
 }
 
 export type ValidateInput = { version: OcppVersion; action: string; payload: unknown };

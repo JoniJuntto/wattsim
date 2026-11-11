@@ -60,7 +60,6 @@ SecurityEventNotification starts once a station has security state: from boot wh
 |---|---|
 | `signCsr(ca, csrPem, { identity })` | The PEM chain for CertificateSigned. As the CSMS simulator's signer: `signer: ({ csr, identity }) => signCsr(ca, csr, { identity })` |
 | `ocspResponse(ca, hashData)` | A signed OCSP response for GetCertificateStatus, from the CA's revocation table (`revokeCertificate`) |
-| `cannedEv15118Response()` | An answer for Get15118EVCertificate |
 | `certificateHashData(pem, issuerPem)`, `verifyChain`, `fingerprint` | Hash data, chain checks and fingerprints |
 | `createCsr`, `generateKeyPair` | CSRs and key pairs, `'ec'` or `'rsa'` |
 

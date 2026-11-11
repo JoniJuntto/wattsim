@@ -8,7 +8,7 @@
  * dark and answers nothing, so a controller reading it times out, as it would on site. `deadMeter: 'zero'` keeps it
  * answering instead, with 0 V, 0 A, 0 Hz and power factor 0.
  */
-import { type Site, type SiteState, SUPPLY_ID } from '@wattsim/grid';
+import { type NodeDescription, type Site, type SiteState, SUPPLY_ID } from '@wattsim/grid';
 import { getMap, liveDevice, type MapId, type MeterReading, type ModbusServer, startModbus } from '@wattsim/modbus';
 
 export type ModbusMeter = {
@@ -67,7 +67,7 @@ export class SiteMeters {
     for (const m of opts.meters) {
       const node = this.site.nodes.find((n) => n.id === m.meterId);
       if (!node || node.kind !== 'meter') throw new Error(`modbus: "${m.meterId}" is not a meter node of the site`);
-      const desc = findDesc(this.site, m.meterId) as { model?: string; unitId?: number } | undefined;
+      const desc = findDesc(this.site.description.nodes, m.meterId) as { model?: string; unitId?: number } | undefined;
       const map = m.map ?? desc?.model ?? 'generic';
       getMap(map);
       const unitId = m.unitId ?? desc?.unitId ?? 1;
@@ -203,15 +203,12 @@ function accrue(
   }
 }
 
-/** The description of node `id`. */
-export function findDesc(site: Site, id: string): unknown {
-  const walk = (nodes: readonly { id: string; children?: unknown[] }[]): unknown => {
-    for (const n of nodes) {
-      if (n.id === id) return n;
-      const hit = n.children ? walk(n.children as { id: string; children?: unknown[] }[]) : undefined;
-      if (hit) return hit;
-    }
-    return undefined;
-  };
-  return walk(site.description.nodes);
+/** The description of node `id` in a tree of descriptions. */
+export function findDesc(nodes: readonly NodeDescription[], id: string): NodeDescription | undefined {
+  for (const n of nodes) {
+    if (n.id === id) return n;
+    const hit = n.children ? findDesc(n.children, id) : undefined;
+    if (hit) return hit;
+  }
+  return undefined;
 }

@@ -3,8 +3,8 @@ import { type FormEvent, useEffect, useId, useState } from 'react';
 import { ApiError, api } from '@/api/http';
 import { useCreateStations, useMeta } from '@/api/queries';
 import type { CreateStationOptions, OcppVersion } from '@/api/types';
+import { FolderInput } from '@/components/app/folder-input';
 import { Button } from '@/components/ui/button';
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import {
   Dialog,
   DialogClose,
@@ -59,8 +59,8 @@ export function AddStationDialog({ open, onOpenChange }: { open: boolean; onOpen
   const [to, setTo] = useState('10');
   const [prefs, setPrefs] = useState(loadPrefs);
   const [evses, setEvses] = useState('2');
+  const [folder, setFolder] = useState('');
   const [autoBoot, setAutoBoot] = useState(true);
-  const [advanced, setAdvanced] = useState(false);
   const [vendor, setVendor] = useState('');
   const [model, setModel] = useState('');
   const [heartbeatS, setHeartbeatS] = useState('');
@@ -124,6 +124,7 @@ export function AddStationDialog({ open, onOpenChange }: { open: boolean; onOpen
     const options: CreateStationOptions = {
       version: prefs.version,
       csmsUrl,
+      folder: folder.trim() || undefined,
       evses: int(evses),
       autoBoot,
       vendor: vendor.trim() || undefined,
@@ -252,6 +253,12 @@ export function AddStationDialog({ open, onOpenChange }: { open: boolean; onOpen
             )}
 
             <Field>
+              <FieldLabel htmlFor={f('folder')}>Folder</FieldLabel>
+              <FolderInput id={f('folder')} value={folder} onChange={(e) => setFolder(e.target.value)} />
+              <FieldDescription>Optional. Groups the stations on the fleet page.</FieldDescription>
+            </Field>
+
+            <Field>
               <FieldLabel id={f('version')}>OCPP version</FieldLabel>
               <ToggleGroup
                 type="single"
@@ -317,113 +324,109 @@ export function AddStationDialog({ open, onOpenChange }: { open: boolean; onOpen
               </Field>
             </div>
 
-            <Collapsible open={advanced} onOpenChange={setAdvanced}>
-              <CollapsibleTrigger asChild>
-                <Button type="button" variant="ghost" size="sm" className="-ml-2">
-                  <ChevronRightIcon data-icon="inline-start" className={advanced ? 'rotate-90' : ''} />
-                  Advanced
-                </Button>
-              </CollapsibleTrigger>
-              <CollapsibleContent>
-                <FieldSet className="mt-3">
-                  <div className="grid grid-cols-2 gap-3">
-                    <Field>
-                      <FieldLabel htmlFor={f('vendor')}>Vendor</FieldLabel>
-                      <Input
-                        id={f('vendor')}
-                        value={vendor}
-                        onChange={(e) => setVendor(e.target.value)}
-                        placeholder="wattsim"
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel htmlFor={f('model')}>Model</FieldLabel>
-                      <Input
-                        id={f('model')}
-                        value={model}
-                        onChange={(e) => setModel(e.target.value)}
-                        placeholder="wattsim-station"
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel htmlFor={f('hb')}>Heartbeat interval (s)</FieldLabel>
-                      <Input
-                        id={f('hb')}
-                        inputMode="numeric"
-                        value={heartbeatS}
-                        onChange={(e) => setHeartbeatS(e.target.value)}
-                        placeholder="From BootNotification"
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel htmlFor={f('meter')}>Meter values interval (s)</FieldLabel>
-                      <Input
-                        id={f('meter')}
-                        inputMode="numeric"
-                        value={meterS}
-                        onChange={(e) => setMeterS(e.target.value)}
-                        placeholder="60"
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel id={f('phases')}>Phases</FieldLabel>
-                      <ToggleGroup
-                        type="single"
-                        variant="outline"
-                        size="sm"
-                        value={phases}
-                        onValueChange={(v) => v && setPhases(v as '1' | '3')}
-                        aria-labelledby={f('phases')}
-                        className="w-fit"
-                      >
-                        <ToggleGroupItem value="1">1</ToggleGroupItem>
-                        <ToggleGroupItem value="3">3</ToggleGroupItem>
-                      </ToggleGroup>
-                    </Field>
-                    <Field>
-                      <FieldLabel htmlFor={f('amps')}>Max current per phase (A)</FieldLabel>
-                      <Input
-                        id={f('amps')}
-                        inputMode="numeric"
-                        value={maxCurrentA}
-                        onChange={(e) => setMaxCurrentA(e.target.value)}
-                        placeholder="32"
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel htmlFor={f('volts')}>Voltage (V)</FieldLabel>
-                      <Input
-                        id={f('volts')}
-                        inputMode="numeric"
-                        value={voltageV}
-                        onChange={(e) => setVoltageV(e.target.value)}
-                        placeholder="230"
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel htmlFor={f('auth-user')}>Basic auth user</FieldLabel>
-                      <Input
-                        id={f('auth-user')}
-                        autoComplete="off"
-                        value={authUser}
-                        onChange={(e) => setAuthUser(e.target.value)}
-                        placeholder="Security profile 1"
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel htmlFor={f('auth-password')}>Basic auth password</FieldLabel>
-                      <Input
-                        id={f('auth-password')}
-                        type="password"
-                        autoComplete="off"
-                        value={authPassword}
-                        onChange={(e) => setAuthPassword(e.target.value)}
-                      />
-                    </Field>
-                  </div>
-                </FieldSet>
-              </CollapsibleContent>
-            </Collapsible>
+            <details className="group">
+              <summary className="-ml-2 inline-flex h-7 cursor-default list-none items-center gap-1 rounded-md px-2 text-[0.8rem] font-medium select-none hover:bg-muted hover:text-foreground [&::-webkit-details-marker]:hidden [&_svg]:size-3.5">
+                <ChevronRightIcon className="transition-transform group-open:rotate-90" />
+                Advanced
+              </summary>
+              <FieldSet className="mt-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <Field>
+                    <FieldLabel htmlFor={f('vendor')}>Vendor</FieldLabel>
+                    <Input
+                      id={f('vendor')}
+                      value={vendor}
+                      onChange={(e) => setVendor(e.target.value)}
+                      placeholder="wattsim"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor={f('model')}>Model</FieldLabel>
+                    <Input
+                      id={f('model')}
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="wattsim-station"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor={f('hb')}>Heartbeat interval (s)</FieldLabel>
+                    <Input
+                      id={f('hb')}
+                      inputMode="numeric"
+                      value={heartbeatS}
+                      onChange={(e) => setHeartbeatS(e.target.value)}
+                      placeholder="From BootNotification"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor={f('meter')}>Meter values interval (s)</FieldLabel>
+                    <Input
+                      id={f('meter')}
+                      inputMode="numeric"
+                      value={meterS}
+                      onChange={(e) => setMeterS(e.target.value)}
+                      placeholder="60"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel id={f('phases')}>Phases</FieldLabel>
+                    <ToggleGroup
+                      type="single"
+                      variant="outline"
+                      size="sm"
+                      value={phases}
+                      onValueChange={(v) => v && setPhases(v as '1' | '3')}
+                      aria-labelledby={f('phases')}
+                      className="w-fit"
+                    >
+                      <ToggleGroupItem value="1">1</ToggleGroupItem>
+                      <ToggleGroupItem value="3">3</ToggleGroupItem>
+                    </ToggleGroup>
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor={f('amps')}>Max current per phase (A)</FieldLabel>
+                    <Input
+                      id={f('amps')}
+                      inputMode="numeric"
+                      value={maxCurrentA}
+                      onChange={(e) => setMaxCurrentA(e.target.value)}
+                      placeholder="32"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor={f('volts')}>Voltage (V)</FieldLabel>
+                    <Input
+                      id={f('volts')}
+                      inputMode="numeric"
+                      value={voltageV}
+                      onChange={(e) => setVoltageV(e.target.value)}
+                      placeholder="230"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor={f('auth-user')}>Basic auth user</FieldLabel>
+                    <Input
+                      id={f('auth-user')}
+                      autoComplete="off"
+                      value={authUser}
+                      onChange={(e) => setAuthUser(e.target.value)}
+                      placeholder="Security profile 1"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor={f('auth-password')}>Basic auth password</FieldLabel>
+                    <Input
+                      id={f('auth-password')}
+                      type="password"
+                      autoComplete="off"
+                      value={authPassword}
+                      onChange={(e) => setAuthPassword(e.target.value)}
+                    />
+                  </Field>
+                </div>
+              </FieldSet>
+            </details>
 
             {errors.form && (
               <p role="alert" className="text-destructive text-sm">

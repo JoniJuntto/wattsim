@@ -4,16 +4,13 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  CANNED_EXI,
   CsrError,
-  cannedEv15118Response,
   certificateHashData,
   certificateStatus,
   checkRootCertificate,
   createCsr,
   createTestCa,
   describeCertificate,
-  describeCsr,
   fingerprint,
   generateKeyPair,
   issueClientCert,
@@ -21,7 +18,6 @@ import {
   issueServerCert,
   ocspResponse,
   publicKeyMatches,
-  readOcspResponse,
   revokeCertificate,
   sameHashData,
   signCsr,
@@ -100,7 +96,6 @@ describe('CSR and signing', () => {
     const r = openssl(['req', '-in', file('cp1.csr', csr), '-noout', '-verify', '-subject']);
     expect(r.out).toMatch(/verify OK/i);
     expect(r.out).toContain('CP-1');
-    expect(describeCsr(csr)).toEqual({ commonName: 'CP-1', organization: 'Acme CPO' });
 
     const chain = await signCsr(ca, csr, { identity: 'CP-1', now: NOW });
     expect(splitPemChain(chain)).toHaveLength(2);
@@ -184,14 +179,17 @@ describe('certificate status (OCSP)', () => {
     expect(certificateStatus(ca, hx)).toBe('unknown');
 
     const good = await ocspResponse(ca, ha, NOW);
-    expect(readOcspResponse(good)).toEqual({ responseStatus: 0, certStatus: 'good' });
-    expect(readOcspResponse(await ocspResponse(ca, hb, NOW))).toEqual({ responseStatus: 0, certStatus: 'revoked' });
-    expect(readOcspResponse(await ocspResponse(ca, hx, NOW))).toEqual({ responseStatus: 6 });
     const der = file('resp.der', '');
     writeFileSync(der, Buffer.from(good, 'base64'));
     const r = openssl(['ocsp', '-respin', der, '-resp_text', '-noverify']);
     expect(r.out).toContain('successful');
     expect(r.out).toContain('Cert Status: good');
+    const revokedDer = file('revoked.der', '');
+    writeFileSync(revokedDer, Buffer.from(await ocspResponse(ca, hb, NOW), 'base64'));
+    expect(openssl(['ocsp', '-respin', revokedDer, '-resp_text', '-noverify']).out).toContain('Cert Status: revoked');
+    const foreignDer = file('foreign.der', '');
+    writeFileSync(foreignDer, Buffer.from(await ocspResponse(ca, hx, NOW), 'base64'));
+    expect(openssl(['ocsp', '-respin', foreignDer, '-resp_text', '-noverify']).out).toContain('unauthorized');
     // The response verifies against the CA as its own responder.
     const v = openssl([
       'ocsp',
@@ -203,12 +201,5 @@ describe('certificate status (OCSP)', () => {
       file('va.pem', ca.rootPem),
     ]);
     expect(v.out).toContain('Response verify OK');
-  });
-
-  test('canned ISO 15118 answers', () => {
-    expect(cannedEv15118Response()).toEqual({ status: 'Accepted', exiResponse: CANNED_EXI });
-    const failed = cannedEv15118Response(false);
-    expect(failed.status).toBe('Failed');
-    expect(failed.statusInfo?.reasonCode.length).toBeLessThanOrEqual(20);
   });
 });

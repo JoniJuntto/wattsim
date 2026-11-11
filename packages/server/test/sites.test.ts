@@ -1,17 +1,16 @@
 import { Database } from 'bun:sqlite';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSite, type SiteDescription } from '@wattsim/grid';
 import { parse } from '@wattsim/scenario';
 import { allocationCount, decodeAllocations } from '@wattsim/site';
-import { drizzle } from 'drizzle-orm/bun-sqlite';
-import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
 import { MIGRATIONS_DIR, Store } from '../src/db/store';
 import type { RunDetail, SiteDetail, SiteLive, SiteReportView, SiteSummary } from '../src/index';
 import { inferAllocation, limitAmps, profileLimit } from '../src/site-infer';
+import { MAX_SITE_LEAVES } from '../src/sites';
 import { type Api, boot, StreamClient, until } from './helpers';
 
 const SITE = `site "Yard" {
@@ -273,8 +272,8 @@ describe('a scenario run with a site', () => {
     expect(a?.binding?.nodeId).toBe('Q1');
     const allocs = await json<unknown[]>(api.get(`/api/sites/${ref.run.siteId}/allocations?limit=3`));
     expect(allocs).toHaveLength(3);
-    // Version 2: keyframes plus steps; the endpoint decodes every step.
-    expect(ref.report.version).toBe(2);
+    // Version 1: every step in `allocations`; the endpoint returns them all.
+    expect(ref.report.version).toBe(1);
     const all = await json<Array<{ t: number }>>(api.get(`/api/sites/${ref.run.siteId}/allocations?limit=20000`));
     expect(all).toHaveLength(allocationCount(ref.report));
     expect(all).toEqual(decodeAllocations(ref.report) as never);
@@ -436,17 +435,16 @@ describe('the site sandbox', () => {
 
 describe('limits', () => {
   test('a site over the leaf cap is refused, built or uploaded', async () => {
-    const small = await boot({ maxSiteLeaves: 1 });
-    try {
-      const res = await small.post('/api/sites', { source: SANDBOX });
-      expect(res.status).toBe(400);
-      expect(JSON.stringify(await res.json())).toContain('at most 1 EVSE leaves');
-      const report = await json<SiteReportView>(api.get(`/api/sites/${(await runSite('none')).run.siteId}/report`));
-      const up = await small.post('/api/sites/reports', report);
-      expect(up.status).toBe(400);
-    } finally {
-      await small.server.stop();
-    }
+    const tooMany = SANDBOX.replace('for i in 1..2', `for i in 1..${MAX_SITE_LEAVES + 1}`);
+    const res = await api.post('/api/sites', { source: tooMany });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain(`at most ${MAX_SITE_LEAVES} EVSE leaves`);
+    const report = await json<SiteReportView>(api.get(`/api/sites/${(await runSite('none')).run.siteId}/report`));
+    const leaf = report.leaves[0] as SiteReportView['leaves'][number];
+    const leaves = Array.from({ length: MAX_SITE_LEAVES + 1 }, (_, i) => ({ ...leaf, leafId: `L${i}` }));
+    const up = await api.post('/api/sites/reports', { ...report, leaves });
+    expect(up.status).toBe(400);
+    expect(JSON.stringify(await up.json())).toContain(`at most ${MAX_SITE_LEAVES} EVSE leaves`);
   });
 
   test('bodies over the size limit are a 413', async () => {
@@ -471,18 +469,23 @@ describe('limits', () => {
 });
 
 describe('the site_reports migration', () => {
+  /** A database as Drizzle left it after the migrations before `0002_site_reports`. */
+  function oldDatabase(path: string): Database {
+    const db = new Database(path, { create: true });
+    db.run('CREATE TABLE `__drizzle_migrations` (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    for (const f of ['0000_init.sql', '0001_run_csms.sql']) {
+      for (const statement of readFileSync(join(MIGRATIONS_DIR, f), 'utf8').split('--> statement-breakpoint')) {
+        if (statement.trim() !== '') db.run(statement);
+      }
+      db.run('INSERT INTO `__drizzle_migrations` (hash, created_at) VALUES (?, ?)', [f, Date.now()]);
+    }
+    return db;
+  }
+
   test('upgrades a database made before it, keeping its runs', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'wattsim-migrate-'));
     try {
-      // The migrations before this one, applied on their own.
-      const old = join(dir, 'old-migrations');
-      mkdirSync(join(old, 'meta'), { recursive: true });
-      for (const f of ['0000_init.sql', '0001_run_csms.sql']) cpSync(join(MIGRATIONS_DIR, f), join(old, f));
-      const journal = JSON.parse(readFileSync(join(MIGRATIONS_DIR, 'meta/_journal.json'), 'utf8'));
-      journal.entries = journal.entries.filter((e: { tag: string }) => e.tag < '0002_site_reports');
-      writeFileSync(join(old, 'meta/_journal.json'), JSON.stringify(journal));
-      const db = new Database(join(dir, 'wattsim.db'), { create: true });
-      migrate(drizzle(db), { migrationsFolder: old });
+      const db = oldDatabase(join(dir, 'wattsim.db'));
       db.run(
         `INSERT INTO runs (id, name, source, target, csms_url, virtual, status, started_at, events) VALUES ('r1', 'old', 'x', 'loopback', 'ws://x', 1, 'passed', 1, '[]')`,
       );
@@ -496,6 +499,9 @@ describe('the site_reports migration', () => {
       const after = new Database(join(dir, 'wattsim.db'));
       const cols = after.query('PRAGMA table_info(site_reports)').all() as Array<{ name: string }>;
       expect(cols.map((c) => c.name)).toEqual(expect.arrayContaining(['run_id', 'report', 'peak_pct']));
+      expect(after.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
+      // A second open applies nothing more.
+      new Store(dir).close();
       after.close();
     } finally {
       await rm(dir, { recursive: true, force: true });

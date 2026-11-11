@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mergeSeries, rowsOf, type SeriesRow } from '../src/api/charts';
 import { parseStreamMessage } from '../src/api/stream';
 import type { EvseSeriesView, FrameEvent, SeriesPoint } from '../src/api/types';
-import { formatTick, mix, niceTicks, percentile, timeTicks, zeroDomain } from '../src/lib/chart';
+import { formatTick, niceTicks, percentile, timeTicks, zeroDomain } from '../src/lib/chart';
 import { groupExchanges, pairFrames } from '../src/lib/frames';
 import { binFor, exchangeIn, latencyStats, messageRate, OTHER, problemRate } from '../src/lib/log-analytics';
 import { FLEET_BIN_CAP, initialState, reduce, reduceAll, SERIES_CAP } from '../src/state/store';
@@ -115,11 +115,6 @@ describe('scales and colors', () => {
     const ticks = timeTicks(T0, T0 + 3_600_000, 4);
     expect(ticks.every((t) => (t - T0) % (15 * 60_000) === 0 || new Date(t).getMinutes() % 15 === 0)).toBe(true);
     expect(formatTick(T0, 60_000)).toMatch(/^\d\d:\d\d$/);
-  });
-
-  test('mix runs from the surface to the hue in OKLab', () => {
-    expect(mix('#ffffff', '#000000', 0)).toBe('rgb(255 255 255)');
-    expect(mix('#ffffff', '#1f55b0', 1)).toBe('rgb(31 85 176)');
   });
 });
 

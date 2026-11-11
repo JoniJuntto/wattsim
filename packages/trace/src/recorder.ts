@@ -17,8 +17,6 @@ export type RecorderOptions = {
   clock?: Clock;
   /** Keep entries in `entries`; default true. Turn off for long proxy sessions that only need the file. */
   keep?: boolean;
-  /** Called for an entry the file format cannot represent; it stays in `entries` but is not written. */
-  onSkip?: (e: TraceEntry) => void;
 };
 
 export class Recorder {
@@ -48,10 +46,7 @@ export class Recorder {
 
   record(e: TraceEntry): void {
     if (this.keep) this.entries.push(e);
-    if (this.writer && !this.closed && !this.writer.write(e)) {
-      this.skipped++;
-      this.opts.onSkip?.(e);
-    }
+    if (this.writer && !this.closed && !this.writer.write(e)) this.skipped++;
   }
 
   /** Flush and close the file, if any. Entries recorded afterwards are kept in memory only. */

@@ -14,10 +14,6 @@ export class TrackedClock implements Clock {
     return this.base.now();
   }
 
-  date(): Date {
-    return this.base.date();
-  }
-
   setTimeout(fn: () => void, ms: number): Timer {
     if (this.disposed) return { cancel() {} };
     const t = this.base.setTimeout(() => {
@@ -45,12 +41,6 @@ export class TrackedClock implements Clock {
     };
     this.live.add(timer);
     return timer;
-  }
-
-  sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      this.setTimeout(resolve, ms);
-    });
   }
 
   /** Live timers (for tests). */

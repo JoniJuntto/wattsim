@@ -1,11 +1,12 @@
 /**
- * A small site for the controller safety tests: chargers under one rated board, 1.6 stations on an in-memory CSMS,
+ * A small site for the controller safety tests: chargers under one rated board, 1.6 stations on a local CSMS,
  * the reference controller, every score sample kept so a test can check the whole run, not just the series.
  */
 import { ChaosEngine, type EvConfig, Station, VirtualClock } from '@wattsim/core';
-import { type Csms, connectInMemory, startCsms } from '@wattsim/csms';
-import { type SiteDescription, SUPPLY_ID } from '@wattsim/grid';
+import { type Csms, startCsms } from '@wattsim/csms';
+import { type ScoreSample, type SiteDescription, SUPPLY_ID } from '@wattsim/grid';
 import { type ReferenceOptions, type SiteRuntime, startSite } from '../src/index';
+import { collectSamples } from './helpers';
 
 export const T0 = Date.parse('2026-06-01T08:00:00Z');
 export const S = 1000;
@@ -17,6 +18,8 @@ export type Rig = {
   clock: VirtualClock;
   csms: Csms;
   rt: SiteRuntime;
+  /** Every score sample so far (see `collectSamples`). */
+  samples: ScoreSample[];
   st: Record<string, Station>;
   chaos: Record<string, ChaosEngine>;
   /** Run `fn` at `ms` after the start. */
@@ -58,9 +61,10 @@ export function boardSite(o: RigOptions): SiteDescription {
 
 export async function rig(o: RigOptions): Promise<Rig> {
   const clock = new VirtualClock(T0);
-  const csms = startCsms({ listen: false, clock, callTimeoutMs: 10_000 });
+  const csms = startCsms({ clock, callTimeoutMs: 10_000 });
   const controller = o.controller === null ? null : { intervalMs: 10_000, marginPct: 5, ...o.controller };
-  const rt = startSite({ site: boardSite(o), clock, csms, controller, keepSamples: true });
+  const rt = startSite({ site: boardSite(o), clock, csms, controller });
+  const samples = collectSamples(rt);
   const st: Record<string, Station> = {};
   const chaos: Record<string, ChaosEngine> = {};
   for (const id of o.stations) {
@@ -69,7 +73,6 @@ export async function rig(o: RigOptions): Promise<Rig> {
       id,
       version: 'ocpp1.6',
       csmsUrl: csms.url,
-      socket: connectInMemory,
       clock,
       meterIntervalMs: MIN,
       heartbeatMs: 60 * MIN,
@@ -101,6 +104,7 @@ export async function rig(o: RigOptions): Promise<Rig> {
     clock,
     csms,
     rt,
+    samples,
     st,
     chaos,
     at: (ms, fn) => {
@@ -136,8 +140,8 @@ export async function charge(s: Station, ev: Partial<EvConfig> = {}): Promise<vo
 }
 
 /** The largest phase current at `nodeId` over every sample of the run, and the time it spent above `ratingA`. */
-export function overRun(rt: SiteRuntime, nodeId: string, ratingA: number): { peakA: number; overS: number } {
-  const samples = rt.samples();
+export function overRun(r: Rig, nodeId: string, ratingA: number): { peakA: number; overS: number } {
+  const { samples, rt } = r;
   let peakA = 0;
   let overS = 0;
   samples.forEach((s, i) => {

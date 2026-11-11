@@ -1,6 +1,5 @@
-import { useVirtualizer } from '@tanstack/react-virtual';
 import { ArrowDownToLineIcon, PauseIcon, PlayIcon, SearchIcon, TriangleAlertIcon, XIcon } from 'lucide-react';
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import type { FrameEvent, Violation } from '@/api/types';
 import { LogAnalytics, type LogFilter } from '@/components/app/log-analytics';
 import { Button } from '@/components/ui/button';
@@ -8,7 +7,6 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/in
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Toggle } from '@/components/ui/toggle';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
-import { useDebounced } from '@/hooks/use-debounced';
 import { formatTime } from '@/lib/chart';
 import { clockTime, duration, prettyJson } from '@/lib/format';
 import {
@@ -233,6 +231,9 @@ const Row = memo(function Row({
         focused && 'outline-2 outline-ring -outline-offset-2',
       )}
       data-focused={focused || undefined}
+      data-key={ex.key}
+      // Off-screen rows skip layout and paint; the placeholder height keeps the scrollbar honest.
+      style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 40px' }}
     >
       <Lanes />
       {bad && <span aria-hidden="true" className="absolute inset-y-0 left-0 w-[3px] bg-violation" />}
@@ -363,7 +364,7 @@ export function MessageLogView({
   /** A time slice picked in the analytics strip. */
   const [range, setRange] = useState<{ from: number; to: number } | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
-  const debouncedText = useDebounced(text, 150);
+  const debouncedText = useDeferredValue(text);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const pairing = useMemo(() => pairFrames(frames, { trimmed: isTrimmed(frames) }), [frames]);
@@ -412,20 +413,13 @@ export function MessageLogView({
     setProblemsOnly(f.problems ?? false);
   };
 
-  const virtualizer = useVirtualizer({
-    count: visible.length,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => 40,
-    overscan: 12,
-    getItemKey: (i) => (visible[i] as Exchange).key,
-  });
-
   // Follow the tail while autoscroll is on. `pausedAt` is the newest exchange key when autoscroll was paused.
   const [pausedAt, setPausedAt] = useState<number | null>(null);
   const follow = pausedAt === null;
   useEffect(() => {
-    if (follow && visible.length > 0) virtualizer.scrollToIndex(visible.length - 1, { align: 'end' });
-  }, [visible, follow, virtualizer]);
+    const el = scrollRef.current;
+    if (follow && visible.length > 0 && el) el.scrollTop = el.scrollHeight;
+  }, [visible, follow]);
   const unseen = useMemo(() => {
     if (pausedAt === null) return 0;
     let n = 0;
@@ -483,12 +477,12 @@ export function MessageLogView({
     setFocusedKey(ex.key);
     setPausedAt((p) => p ?? exchanges[exchanges.length - 1]?.key ?? 0);
     setExpanded((prev) => new Set(prev).add(ex.key));
-    // After the expanded row has been measured. On narrow screens the log may be below the fold.
+    // After the expanded row has rendered. On narrow screens the log may be below the fold.
     requestAnimationFrame(() => {
       sectionRef.current?.scrollIntoView({ block: 'nearest' });
-      virtualizer.scrollToIndex(index, { align: 'center' });
+      scrollRef.current?.querySelector(`[data-key="${ex.key}"]`)?.scrollIntoView({ block: 'center' });
     });
-  }, [focusFrameId, visible, exchanges, virtualizer]);
+  }, [focusFrameId, visible, exchanges]);
 
   const filtered = visible.length !== exchanges.length;
 
@@ -642,34 +636,17 @@ export function MessageLogView({
           ) : visible.length === 0 ? (
             <p className="p-4 text-muted-foreground text-sm">No exchanges match these filters.</p>
           ) : (
-            <div style={{ height: virtualizer.getTotalSize(), position: 'relative', width: '100%' }}>
-              {virtualizer.getVirtualItems().map((item) => {
-                const ex = visible[item.index] as Exchange;
-                return (
-                  <div
-                    key={item.key}
-                    data-index={item.index}
-                    ref={virtualizer.measureElement}
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      transform: `translateY(${item.start}px)`,
-                    }}
-                  >
-                    <Row
-                      ex={ex}
-                      pairing={pairing}
-                      violationsBySeq={violationsBySeq}
-                      expanded={expanded.has(ex.key)}
-                      focused={focusedKey === ex.key}
-                      onToggle={toggle}
-                    />
-                  </div>
-                );
-              })}
-            </div>
+            visible.map((ex) => (
+              <Row
+                key={ex.key}
+                ex={ex}
+                pairing={pairing}
+                violationsBySeq={violationsBySeq}
+                expanded={expanded.has(ex.key)}
+                focused={focusedKey === ex.key}
+                onToggle={toggle}
+              />
+            ))
           )}
         </div>
         {!follow && unseen > 0 && (

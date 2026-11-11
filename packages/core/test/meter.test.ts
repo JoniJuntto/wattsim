@@ -23,10 +23,10 @@ describe('MeterModel', () => {
   });
 
   test('energy accumulates across ticks', () => {
-    const m = new MeterModel({ initialEnergyWh: 1000 });
+    const m = new MeterModel();
     m.tick(3_600_000, 1);
     m.tick(3_600_000, 2);
-    expect(m.sample(new VirtualClock(0)).energyWh).toBeCloseTo(4000, 6);
+    expect(m.sample(new VirtualClock(0)).energyWh).toBeCloseTo(3000, 6);
   });
 
   test('single phase current', () => {
@@ -44,7 +44,7 @@ describe('MeterModel', () => {
   });
 
   test('reset zeroes energy, power and current', () => {
-    const m = new MeterModel({ initialEnergyWh: 500 });
+    const m = new MeterModel();
     m.tick(3_600_000, 7);
     m.reset();
     const s = m.sample(new VirtualClock(0));
@@ -62,28 +62,9 @@ describe('MeterModel', () => {
     expect(m.sample(new VirtualClock(0)).energyWh).toBeCloseTo(1100, 6);
   });
 
-  test('noise perturbs power, current and voltage but never energy, deterministically', () => {
-    const a = new MeterModel({ noise: 0.05 });
-    const b = new MeterModel({ noise: 0.05 });
-    a.tick(3_600_000, 10);
-    b.tick(3_600_000, 10);
-    const c = new VirtualClock(0);
-    const sa = a.sample(c);
-    const sb = b.sample(c);
-    expect(sa).toEqual(sb);
-    expect(sa.energyWh).toBeCloseTo(10_000, 6);
-    expect(sa.powerKw).toBeGreaterThanOrEqual(9.5);
-    expect(sa.powerKw).toBeLessThanOrEqual(10.5);
-    expect(sa.voltageV).toBeGreaterThanOrEqual(230 * 0.95);
-    expect(sa.voltageV).toBeLessThanOrEqual(230 * 1.05);
-    expect(sa.currentA).toBeCloseTo((sa.powerKw * 1000) / (3 * sa.voltageV), 9);
-    const sa2 = a.sample(c);
-    expect(sa2.powerKw).not.toBe(sa.powerKw); // successive samples differ
-  });
-
   test('rejects invalid options', () => {
     expect(() => new MeterModel({ voltageV: 0 })).toThrow();
-    expect(() => new MeterModel({ noise: -1 })).toThrow();
+    expect(() => new MeterModel({ phases: 2 as 1 })).toThrow();
   });
 
   test('negative power (V2X discharge) fills the export register; the import register never goes down', () => {

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import type { StationConfig } from '../src/index';
-import { attachMetrics, metrics, registry, Station, serveMetrics, VirtualClock } from '../src/index';
-import { connectInMemory, FakeCsms, until } from './fake-csms';
+import type { StationConfig } from '@wattsim/core';
+import { Station, VirtualClock } from '@wattsim/core';
+import { FakeCsms, until } from '../../core/test/fake-csms';
+import { attachMetrics, metrics, registry, serveMetrics } from '../src/metrics';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MINUTE = 60_000;
@@ -16,7 +17,6 @@ function make(opts: Partial<StationConfig> = {}): Station {
     id: 'CP1',
     version: 'ocpp1.6',
     csmsUrl: csms.url,
-    socket: connectInMemory,
     clock,
     ...opts,
   });

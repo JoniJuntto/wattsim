@@ -1,16 +1,14 @@
 /**
  * Station realism against FakeCsms: phase switching, cable rating, temperature derating, V2X discharge (2.1), tariffs
- * and running cost (2.1), CostUpdated (2.0.1), ISO 15118 charging needs and Plug & Charge, the constant model and the
- * model factories. Every frame the station sends is checked against its version's schemas, and every meter value
+ * and running cost (2.1), CostUpdated (2.0.1) and ISO 15118 charging needs. Every frame the station sends is checked against its version's schemas, and every meter value
  * against the physics: P = V x I x phases, energy = the integral of power.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { certificateHashData, createTestCa, signCsr, splitPemChain } from '@wattsim/pki';
 import type { CallFrame, Frame, OcppVersion, v21, v201 } from '@wattsim/protocol';
 import { MessageType, validatePayload } from '@wattsim/protocol';
-import type { EvConfig, MeterOptions, StationConfig, Tariff } from '../src/index';
-import { EvModel, MeterModel, ocpp201, PNC_OCSP_RESPONDER, Station, VirtualClock } from '../src/index';
-import { connectInMemory, FakeCsms, until } from './fake-csms';
+import type { StationConfig, Tariff } from '../src/index';
+import { ocpp201, Station, VirtualClock } from '../src/index';
+import { FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MIN = 60_000;
@@ -34,7 +32,6 @@ async function booted(version: OcppVersion, cfg: Partial<StationConfig> = {}): P
     id: 'CS1',
     version,
     csmsUrl: csms.url,
-    socket: connectInMemory,
     clock,
     meterIntervalMs: MIN,
     ...cfg,
@@ -495,88 +492,9 @@ describe('ISO 15118', () => {
     expect(await st.notifyEvChargingNeeds(1)).toBe('Accepted');
     expect(wireProblems('ocpp2.1')).toEqual([]);
   });
-
-  test('Plug & Charge: Authorize carries the eMAID and the installed V2G chain hash data, then the transaction starts', async () => {
-    const st = await booted('ocpp2.0.1');
-    const v2g = await createTestCa({ name: 'V2G Root', subCa: true, now: new Date(T0) });
-    expect(
-      await call('InstallCertificate', { certificateType: 'V2GRootCertificate', certificate: v2g.rootPem }),
-    ).toEqual({ status: 'Accepted' });
-    csms.respondWith('SignCertificate', () => ({ status: 'Accepted' }));
-    await st.signCertificate('V2GCertificate');
-    const csr = (csms.callsFrom('CS1', 'SignCertificate')[0]?.payload as { csr: string } | undefined)?.csr ?? '';
-    const chain = await signCsr(v2g, csr, { now: new Date(T0) });
-    expect(await call('CertificateSigned', { certificateChain: chain, certificateType: 'V2GCertificate' })).toEqual({
-      status: 'Accepted',
-    });
-    const [leaf, sub] = splitPemChain(chain);
-    await st.plugIn(1, { emaid: 'FI-WSM-C12345678-X' });
-    expect(await st.plugAndCharge(1)).toBe(true);
-    await idle(st);
-    const auth = csms.callsFrom('CS1', 'Authorize')[0]?.payload as v201.AuthorizeRequest;
-    expect(auth).toEqual({
-      idToken: { idToken: 'FI-WSM-C12345678-X', type: 'eMAID' },
-      iso15118CertificateHashData: [
-        { ...certificateHashData(leaf ?? '', sub), responderURL: PNC_OCSP_RESPONDER },
-        { ...certificateHashData(sub ?? '', v2g.rootPem), responderURL: PNC_OCSP_RESPONDER },
-      ],
-    });
-    const started = events().find((e) => e.eventType === 'Started');
-    expect(started?.idToken).toEqual({ idToken: 'FI-WSM-C12345678-X', type: 'eMAID' });
-    expect(wireProblems('ocpp2.0.1')).toEqual([]);
-  });
-
-  test('Plug & Charge refused by the CSMS: no transaction', async () => {
-    csms.respondWith('Authorize', () => ({
-      idTokenInfo: { status: 'Accepted' },
-      certificateStatus: 'CertificateRevoked',
-    }));
-    const st = await booted('ocpp2.1');
-    await st.plugIn(1, { emaid: 'FI-WSM-C1' });
-    expect(await st.plugAndCharge(1)).toBe(false);
-    expect(st.evse(1)?.tx).toBeUndefined();
-    const auth = csms.callsFrom('CS1', 'Authorize')[0]?.payload as v201.AuthorizeRequest;
-    expect(auth.iso15118CertificateHashData).toBeUndefined();
-  });
 });
 
 describe('models', () => {
-  test("meterModel 'constant': the power stays put while the soc does not move", async () => {
-    const st = await booted('ocpp2.0.1', { meterModel: 'constant' });
-    await st.plugIn(1, { batteryKwh: 10, initialSoc: 0.75, targetSoc: 0.8 });
-    await st.startTransaction(1, 'TAG');
-    await advance(st, 30 * MIN);
-    const powers = events()
-      .filter((e) => e.eventType === 'Updated')
-      .map((e) => reading(e).powerW);
-    expect(new Set(powers)).toEqual(new Set([22_080]));
-    expect(st.evse(1)?.ev?.soc).toBe(0.75);
-    expect(st.evse(1)?.meter.energy).toBeCloseTo(22.08 * 500, 6);
-  });
-
-  test('evFactory and meterFactory plug in other models', async () => {
-    class HalfPowerEv extends EvModel {
-      override drawKw(offeredKw: number, voltageV: number, phases: number, targetKw?: number): number {
-        return super.drawKw(offeredKw, voltageV, phases, targetKw) / 2;
-      }
-    }
-    const meters: MeterModel[] = [];
-    const st = await booted('ocpp1.6', {
-      evFactory: (cfg: Partial<EvConfig>) => new HalfPowerEv(cfg),
-      meterFactory: (o: MeterOptions) => {
-        const m = new MeterModel({ ...o, initialEnergyWh: 1000 });
-        meters.push(m);
-        return m;
-      },
-    });
-    expect(meters).toHaveLength(1);
-    await st.plugIn(1);
-    expect(st.evse(1)?.ev).toBeInstanceOf(HalfPowerEv);
-    await st.startTransaction(1, 'TAG');
-    await advance(st, 6 * MIN);
-    expect(st.evse(1)?.meter.energy).toBeCloseTo(1000 + 11.04 * 100, 6);
-  });
-
   test('an unknown time zone is refused', () => {
     expect(
       () => new Station({ id: 'X', version: 'ocpp2.1', csmsUrl: 'ws://x', clock, timeZone: 'Nowhere/Here' }),

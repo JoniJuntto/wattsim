@@ -6,79 +6,37 @@ import { connect } from 'node:net';
 import { resolve } from 'node:path';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { WallClock } from '@wattsim/core';
+import { sleep, WallClock } from '@wattsim/core';
 import { OCPP_VERSIONS } from '@wattsim/protocol';
-import type { FrameEvent, StationView } from '@wattsim/server';
+import {
+  ACTION_SCHEMAS,
+  ALL_CHAOS_FAULTS,
+  CONNECTOR_STATUSES,
+  type FrameEvent,
+  type ScenarioCheck,
+  type StationView,
+} from '@wattsim/server';
 import { z } from 'zod';
 import pkg from '../package.json' with { type: 'json' };
 import { Api } from './api';
 import {
-  checkScenario,
   DEFAULT_FAILURE_FRAMES,
   DEFAULT_WALL_TIMEOUT_MS,
-  formatScenario,
   MAX_TIMER_MS,
   MAX_VIRTUAL_MS,
+  parseScenario,
   runScenario,
 } from './scenario';
 
-export const DSL_DOC_PATH = resolve(import.meta.dir, '../../../docs/dsl.md');
-export const DEFAULT_FRAME_LIMIT = 100;
+const DSL_DOC_PATH = resolve(import.meta.dir, '../../../docs/dsl.md');
+const DEFAULT_FRAME_LIMIT = 100;
 /** The server's ring buffer per station. */
 const FRAMES_PER_STATION = 2000;
 const BOOT_WAIT_MS = 10_000;
 const BOOT_POLL_MS = 100;
 
-// Mirrors of the server's enums (packages/server/src/schemas.ts is not exported); the server still validates.
-const ACTION_TYPES = [
-  'connect',
-  'disconnect',
-  'boot',
-  'heartbeat',
-  'plug',
-  'unplug',
-  'ready',
-  'suspend',
-  'resume',
-  'authorize',
-  'start',
-  'stop',
-  'status',
-  'send',
-  'bootLoop',
-  'fault',
-  'meter',
-  'reset',
-] as const;
-const CONNECTOR_STATUSES = [
-  'Available',
-  'Preparing',
-  'Charging',
-  'SuspendedEV',
-  'SuspendedEVSE',
-  'Finishing',
-  'Reserved',
-  'Unavailable',
-  'Faulted',
-] as const;
-const CHAOS_FAULTS = [
-  'drop',
-  'delay',
-  'duplicate',
-  'corrupt',
-  'wrongId',
-  'callError',
-  'noResponse',
-  'jitter',
-  'reorder',
-  'halfOpen',
-  'slowRead',
-  'reconnectStorm',
-  'invalidEnum',
-  'missingField',
-  'timestamp',
-  'oversized',
-] as const;
+/** The server's action names; it validates each action's fields. */
+const ACTION_TYPES = Object.keys(ACTION_SCHEMAS);
 
 const INSTRUCTIONS = `wattsim simulates OCPP charge points (stations) that connect to a CSMS (the backend that manages \
 them) over WebSocket. A station has one or more EVSEs (charging outlets, numbered from 1). To charge: create_station \
@@ -242,7 +200,7 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
         if (waitForBoot && (args.autoBoot ?? true)) {
           const deadline = wall.now() + BOOT_WAIT_MS;
           while (views.some((s) => !s.booted) && wall.now() < deadline) {
-            await wall.sleep(BOOT_POLL_MS);
+            await sleep(wall, BOOT_POLL_MS);
             views = (await api.get<StationView[]>('/api/stations')).filter((s) => ids.has(s.id));
           }
         }
@@ -333,7 +291,7 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
         'Returns the rule with its id.',
       inputSchema: {
         stationId,
-        fault: z.enum(CHAOS_FAULTS),
+        fault: z.enum(ALL_CHAOS_FAULTS),
         direction: z.enum(['in', 'out']).optional().describe('in = CSMS to station, out = station to CSMS'),
         action: z.string().min(1).optional().describe('Only frames of this OCPP action, e.g. MeterValues'),
         nth: z.number().int().min(1).optional().describe('Only the nth matching frame'),
@@ -459,23 +417,23 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
     {
       title: 'Check scenario',
       description:
-        'Parse a wattsim scenario. Returns ok with the station count, or ok:false with the first error and its ' +
-        'line:col.',
+        'Parse and link a wattsim scenario as the server does. Returns ok with the station count, or ok:false with ' +
+        'diagnostics (message, line, col).',
       inputSchema: { text: scenarioText },
       annotations: { readOnlyHint: true },
     },
-    ({ text }) => guard(async () => checkScenario(text)),
+    ({ text }) => guard(() => api.post<ScenarioCheck>('/api/scenario/check', { source: text })),
   );
 
   server.registerTool(
     'format_scenario',
     {
       title: 'Format scenario',
-      description: 'Return a scenario in canonical formatting (what `wattsim fmt` writes) and whether it changed.',
+      description: 'Return a scenario in canonical formatting (what `wattsim fmt` writes) as source.',
       inputSchema: { text: scenarioText },
       annotations: { readOnlyHint: true },
     },
-    ({ text }) => guard(async () => formatScenario(text)),
+    ({ text }) => guard(() => api.post<{ source: string }>('/api/scenario/format', { source: text })),
   );
 
   server.registerTool(
@@ -511,8 +469,7 @@ export function createWattsimMcp(opts: WattsimMcpOptions): McpServer {
     ({ text, csmsUrl, virtual, seed, speed, failureFrames, timeoutSeconds }) =>
       guard(async () => {
         // Parse first so a syntax error does not start the test CSMS.
-        const checked = checkScenario(text);
-        if (!checked.ok) throw new Error(checked.error.text);
+        parseScenario(text);
         return runScenario(text, {
           csmsUrl: csmsUrl ?? (await scenarioCsms()),
           virtual,

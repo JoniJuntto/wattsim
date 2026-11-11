@@ -18,6 +18,7 @@
     "@wattsim/csms": "workspace:*",
     "@wattsim/grid": "workspace:*",
     "@wattsim/protocol": "workspace:*",
+    "@wattsim/site": "workspace:*",
     "react": "19.3.1",
     "react-dom": "19.3.1",
     "three": "0.187.0"

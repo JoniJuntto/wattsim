@@ -2,8 +2,39 @@
  * The in-memory trace: one `TraceEntry` per WebSocket message, whatever file format it came from or goes to.
  * `raw` is the source of truth; `frame` is what it decodes to under the entry's OCPP version.
  */
+import type { Clock, SocketLike } from '@wattsim/core';
 import type { Frame, OcppVersion } from '@wattsim/protocol';
 import { decodeFrame, MessageType } from '@wattsim/protocol';
+
+/**
+ * Wait for a WebSocket handshake: `ok` once it opens, else why not (the error event's message when it had one; a
+ * handshake past `timeoutMs` closes the socket). The open/error/close handlers are released either way.
+ */
+export function openSocket(
+  ws: SocketLike,
+  clock: Clock,
+  timeoutMs: number,
+): Promise<{ ok: true } | { ok: false; timedOut: boolean; message: string }> {
+  return new Promise((resolve) => {
+    let message = 'connection closed during the handshake';
+    const done = (r: { ok: true } | { ok: false; timedOut: boolean; message: string }) => {
+      timer.cancel();
+      ws.onopen = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      resolve(r);
+    };
+    const timer = clock.setTimeout(() => {
+      ws.close();
+      done({ ok: false, timedOut: true, message: 'handshake timed out' });
+    }, timeoutMs);
+    ws.onopen = () => done({ ok: true });
+    ws.onerror = (ev) => {
+      message = (ev as ErrorEvent).message || message;
+    };
+    ws.onclose = () => done({ ok: false, timedOut: false, message });
+  });
+}
 
 /**
  * Station-relative, as in core `frame` events and DSL chaos rules: `out` travels from the charge point to the CSMS,

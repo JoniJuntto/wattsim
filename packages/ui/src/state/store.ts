@@ -26,9 +26,9 @@ export const isTrimmed = (frames: readonly FrameEvent[]) => frames.length >= FRA
 /** How much power history the sparklines keep. */
 export const POWER_WINDOW_MS = 5 * 60_000;
 /** Samples closer together than this overwrite the previous one instead of appending. */
-export const POWER_SAMPLE_MS = 1000;
-export const VIOLATION_CAP = 500;
-export const ERROR_CAP = 50;
+const POWER_SAMPLE_MS = 1000;
+const VIOLATION_CAP = 500;
+const ERROR_CAP = 50;
 /** `run.event` messages kept per run; the server streams at most 200 per run. */
 export const RUN_EVENT_CAP = 200;
 /** Test-CSMS findings kept in the browser. */
@@ -36,12 +36,12 @@ export const CSMS_VIOLATION_CAP = 2000;
 /** Streamed series points kept per EVSE (history beyond this comes from `/api/stations/:id/series`). */
 export const SERIES_CAP = 3000;
 /** A point within this of the previous one with the same status replaces its values (not its time), as on the server. */
-export const SERIES_MERGE_MS = 250;
+const SERIES_MERGE_MS = 250;
 /** Streamed fleet bins kept: 6 h of 10 s bins. */
 export const FLEET_BIN_CAP = 2160;
 /** Streamed control steps and site events kept per watched site (history comes from the report). */
-export const SITE_ALLOCATION_CAP = 2000;
-export const SITE_EVENT_CAP = 500;
+const SITE_ALLOCATION_CAP = 2000;
+const SITE_EVENT_CAP = 500;
 
 /** A watched site's live state: the merged `site` messages, and what streamed since the page loaded. */
 export type SiteLiveState = {
@@ -144,11 +144,8 @@ function without<T>(record: Record<string, T>, key: string): Record<string, T> {
   return rest;
 }
 
-function pick<T>(record: Record<string, T>, keep: Set<string>): Record<string, T> {
-  const out: Record<string, T> = {};
-  for (const [k, v] of Object.entries(record)) if (keep.has(k)) out[k] = v;
-  return out;
-}
+const pick = <T>(record: Record<string, T>, keep: Set<string>): Record<string, T> =>
+  Object.fromEntries(Object.entries(record).filter(([k]) => keep.has(k)));
 
 function samplePower(prev: Record<number, PowerSample[]> | undefined, station: StationView, now: number) {
   const next: Record<number, PowerSample[]> = {};
@@ -218,7 +215,7 @@ function appendFrame(state: State, frame: FrameEvent): State {
 }
 
 /** Merges two frame lists by `seq`, dropping duplicates and keeping the newest `FRAME_CAP`. */
-export function mergeFrames(a: FrameEvent[], b: FrameEvent[]): FrameEvent[] {
+function mergeFrames(a: FrameEvent[], b: FrameEvent[]): FrameEvent[] {
   const bySeq = new Map<number, FrameEvent>();
   for (const f of a) bySeq.set(f.seq, f);
   for (const f of b) bySeq.set(f.seq, f);

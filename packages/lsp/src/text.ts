@@ -1,4 +1,4 @@
-import type { Position, Range } from 'vscode-languageserver';
+import type { Range } from 'vscode-languageserver';
 
 /** A token of one source line, read leniently: an unterminated string runs to the end of the line. */
 export type LineToken = {
@@ -64,5 +64,3 @@ export function tokenRange(text: string, line: number, col: number): Range {
   const end = tok ? tok.end : Math.min(start + 1, src.length);
   return { start: { line: l, character: tok ? tok.start : start }, end: { line: l, character: end } };
 }
-
-export const pos = (line: number, character: number): Position => ({ line, character });

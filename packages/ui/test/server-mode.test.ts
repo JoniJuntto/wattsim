@@ -1,11 +1,26 @@
 import { describe, expect, test } from 'bun:test';
+import { StringStream } from '@codemirror/language';
 import { Text } from '@codemirror/state';
 import { KEYWORDS as LEXER_KEYWORDS } from '../../scenario/src/lexer';
 import { parseStreamMessage } from '../src/api/stream';
 import type { ConformanceViolation, CsmsSessionView, CsmsSummary, RunSummary } from '../src/api/types';
 import { toDiagnostics, toOffset } from '../src/components/app/scenario-editor';
-import { KEYWORDS, tokenizeLine } from '../src/lib/dsl';
+import { dslParser, KEYWORDS } from '../src/lib/dsl';
 import { CSMS_VIOLATION_CAP, initialState, RUN_EVENT_CAP, reduceAll } from '../src/state/store';
+
+/** `[text, style]` pairs of one line, whitespace skipped. */
+function tokenizeLine(line: string) {
+  const state = dslParser.startState?.(2) ?? { inString: false, depth: 0 };
+  const out: [string, string | null][] = [];
+  const stream = new StringStream(line, 2, 2);
+  while (!stream.eol()) {
+    const style = dslParser.token(stream, state);
+    const text = stream.current();
+    if (text.trim() !== '') out.push([text, style]);
+    stream.start = stream.pos;
+  }
+  return out;
+}
 
 const run = (p: Partial<RunSummary> = {}): RunSummary => ({
   id: 'r1',

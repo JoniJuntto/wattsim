@@ -29,7 +29,7 @@ export const STATUS_LABEL: Record<Status, string> = {
 /** Statuses an operator can force with the `status` action; the rest follow from the EV and transaction. */
 export const MANUAL_STATUSES: Status[] = ['Available', 'Unavailable', 'Faulted', 'Reserved'];
 
-export const isKnownStatus = (s: string): s is Status => (STATUSES as readonly string[]).includes(s);
+const isKnownStatus = (s: string): s is Status => (STATUSES as readonly string[]).includes(s);
 
 /** CSS custom properties `--st` / `--st-on` for a status, consumed by `.status-fill`. */
 export function statusStyle(status: string): CSSProperties {

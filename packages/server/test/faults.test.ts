@@ -220,8 +220,7 @@ describe('session export', () => {
     const stations = parse(text).stations.map((s) => s.name.raw);
     expect(stations).toEqual(['CH-1', 'CH-2', 'CH-3']);
     const kinds = new Set(parse(text).stations.flatMap((s) => s.body.map((b) => b.kind)));
-    for (const kind of ['chaosFault', 'fault', 'meter', 'reset', 'bootLoop'])
-      expect(kinds.has(kind as never)).toBe(true);
+    for (const kind of ['chaos', 'fault', 'meter', 'reset', 'bootLoop']) expect(kinds.has(kind as never)).toBe(true);
     expect(await checkScenario(text, { dir: process.cwd() })).toMatchObject({ ok: true, diagnostics: [] });
   });
 });

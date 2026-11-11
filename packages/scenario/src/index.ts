@@ -1,4 +1,5 @@
 export * from './ast';
+export * from './chaos';
 export * from './ev-props';
 export * from './format';
 export * from './interpret';

@@ -1,42 +1,152 @@
 /**
- * The server-mode database. `open(dir)` keeps `<dir>/wattsim.db` on disk; `open()` keeps it in memory, so the library
- * API (`startServer` without `dataDir`), its tests and the MCP server write nothing to disk. Migrations under
- * `packages/server/drizzle` are applied on every open.
+ * The server-mode database (DESIGN.md §5): run history, saved scenarios, recordings, CSMS conformance reports, site
+ * reports and kept stations, in SQLite through `bun:sqlite`. `open(dir)` keeps `<dir>/wattsim.db` on disk; `open()`
+ * keeps it in memory, so the library API (`startServer` without `dataDir`), its tests and the MCP server write nothing
+ * to disk.
+ *
+ * The schema is the `.sql` files under `packages/server/drizzle`, applied in name order on every open; `PRAGMA
+ * user_version` counts the files applied. Change a table by adding a new file there. Times are epoch ms; JSON columns
+ * hold the wire types of `../types.ts`.
  */
 import { Database } from 'bun:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { ConformanceReport } from '@wattsim/csms';
-import { desc, eq, sql } from 'drizzle-orm';
-import { type BunSQLiteDatabase, drizzle } from 'drizzle-orm/bun-sqlite';
-import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
-import type { SQLiteColumn } from 'drizzle-orm/sqlite-core';
 import type { CreateStation } from '../schemas';
 import type {
   CsmsReportSummary,
   RecordingView,
+  RunCsmsView,
   RunDetail,
+  RunEventView,
+  RunResultView,
+  RunStatus,
   RunSummary,
   SavedScenario,
   SavedScenarioSummary,
   SiteReportView,
   SiteSummary,
 } from '../types';
-import * as schema from './schema';
 
 export const MIGRATIONS_DIR = resolve(import.meta.dir, '../../drizzle');
 export const DB_FILE = 'wattsim.db';
+/** Separates the statements of one migration file. */
+const STATEMENT_BREAK = '--> statement-breakpoint';
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
-export type RunRow = typeof schema.runs.$inferSelect;
-export type RunInsert = typeof schema.runs.$inferInsert;
-export type RecordingInsert = typeof schema.recordings.$inferInsert;
-export type SiteReportRow = typeof schema.siteReports.$inferSelect;
-export type SiteReportInsert = typeof schema.siteReports.$inferInsert;
+export type RunRow = {
+  id: string;
+  scenarioId: string | null;
+  name: string;
+  source: string;
+  target: 'loopback' | 'url';
+  csmsUrl: string;
+  virtual: boolean;
+  speed: number | null;
+  seed: number | null;
+  status: RunStatus;
+  startedAt: number;
+  finishedAt: number | null;
+  durationMs: number | null;
+  error: string | null;
+  frames: number;
+  result: RunResultView | null;
+  events: RunEventView[];
+  eventsDropped: number;
+  recordingId: string | null;
+  /** The dedicated test CSMS of a virtual loopback run: its saved report and finding totals. */
+  csms: RunCsmsView | null;
+  /** The run's electrical site; its report is in `site_reports` once the run ended. */
+  siteId: string | null;
+};
+
+type RecordingInsert = {
+  kind: 'session' | 'run';
+  name: string;
+  runId?: string | null;
+  /** Messages written to the trace. */
+  entries: number;
+  /** Messages Open OCPP Trace v1.1 cannot carry (left out of `trace`). */
+  skipped: number;
+  /** The Open OCPP Trace v1.1 JSONL text. */
+  trace: string;
+};
+
+/** Site reports: a finished run's site (`runId`), a sandbox, or a `--site-report` file uploaded for replay. */
+type SiteReportRow = {
+  id: string;
+  kind: 'run' | 'sandbox' | 'upload';
+  runId: string | null;
+  name: string;
+  createdAt: number;
+  controller: 'reference' | 'none';
+  start: number;
+  end: number;
+  nodes: number;
+  leaves: number;
+  trips: number;
+  peakNode: string | null;
+  peakPct: number | null;
+  fairness: number | null;
+  /** The `SiteReportView` JSON (the `--site-report` file plus inferred allocations). */
+  report: SiteReportView;
+};
 
 /** History lists are capped so a long-lived data directory never turns a page load into a dump of everything. */
-export const LIST_LIMIT = 200;
+const LIST_LIMIT = 200;
+
+type Raw = Record<string, string | number | null>;
+const parse = <T>(json: string | number | null): T => JSON.parse(json as string) as T;
+const parseOr = <T>(json: string | number | null): T | null => (json === null ? null : parse<T>(json));
+
+/** A value as SQLite takes it: booleans as 0/1, objects and arrays as JSON. */
+function sql(v: unknown): string | number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  if (typeof v === 'object') return JSON.stringify(v);
+  return v as string | number;
+}
+
+const RUN_COLUMNS: Record<keyof RunRow, string> = {
+  id: 'id',
+  scenarioId: 'scenario_id',
+  name: 'name',
+  source: 'source',
+  target: 'target',
+  csmsUrl: 'csms_url',
+  virtual: 'virtual',
+  speed: 'speed',
+  seed: 'seed',
+  status: 'status',
+  startedAt: 'started_at',
+  finishedAt: 'finished_at',
+  durationMs: 'duration_ms',
+  error: 'error',
+  frames: 'frames',
+  result: 'result',
+  events: 'events',
+  eventsDropped: 'events_dropped',
+  recordingId: 'recording_id',
+  csms: 'csms',
+  siteId: 'site_id',
+};
+const RUN_KEYS = Object.keys(RUN_COLUMNS) as (keyof RunRow)[];
+const RUN_SELECT = `SELECT ${RUN_KEYS.map((k) => (RUN_COLUMNS[k] === k ? k : `${RUN_COLUMNS[k]} AS ${k}`)).join(', ')} FROM runs`;
+
+function runRow(r: Raw): RunRow {
+  return {
+    ...(r as unknown as RunRow),
+    virtual: r.virtual === 1,
+    result: parseOr<RunResultView>(r.result as string | null),
+    events: parse<RunEventView[]>(r.events as string),
+    csms: parseOr<RunCsmsView>(r.csms as string | null),
+  };
+}
+
+const SITE_SELECT =
+  'SELECT id, kind, run_id AS runId, name, created_at AS createdAt, controller, start, end, nodes, leaves, trips, ' +
+  'peak_node AS peakNode, peak_pct AS peakPct, fairness';
 
 export function runSummary(r: RunRow): RunSummary {
   const stations = r.result?.stations ?? [];
@@ -98,7 +208,7 @@ export function siteSummary(r: Omit<SiteReportRow, 'report'>): SiteSummary {
   return s;
 }
 
-function recordingView(r: Omit<typeof schema.recordings.$inferSelect, 'trace'> & { bytes: number }): RecordingView {
+function recordingView(r: Omit<RecordingInsert, 'trace'> & { id: string; createdAt: number; bytes: number }) {
   const v: RecordingView = {
     id: r.id,
     kind: r.kind,
@@ -112,119 +222,161 @@ function recordingView(r: Omit<typeof schema.recordings.$inferSelect, 'trace'> &
   return v;
 }
 
+/**
+ * Apply the migration files not yet applied, in name order. `PRAGMA user_version` is the number applied. A database
+ * migrated by Drizzle before has `__drizzle_migrations` instead, one row per file it applied.
+ */
+function migrate(db: Database): void {
+  const files = readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+  const count = (q: string) => (db.query(q).get() as { n: number }).n;
+  let applied = (db.query('PRAGMA user_version').get() as { user_version: number }).user_version;
+  if (applied === 0 && count("SELECT count(*) AS n FROM sqlite_master WHERE name = '__drizzle_migrations'") > 0) {
+    applied = count('SELECT count(*) AS n FROM __drizzle_migrations');
+    db.run(`PRAGMA user_version = ${applied}`); // so the store no longer depends on that table
+  }
+  for (const [i, file] of files.entries()) {
+    if (i < applied) continue;
+    db.transaction(() => {
+      for (const statement of readFileSync(join(MIGRATIONS_DIR, file), 'utf8').split(STATEMENT_BREAK)) {
+        if (statement.trim() !== '') db.run(statement);
+      }
+      db.run(`PRAGMA user_version = ${i + 1}`);
+    })();
+  }
+}
+
 export class Store {
-  readonly db: BunSQLiteDatabase<typeof schema>;
+  readonly db: Database;
   /** Absolute path of the database file; undefined in memory. */
   readonly path: string | undefined;
-  private readonly sqlite: Database;
 
   constructor(dataDir?: string) {
     if (dataDir !== undefined) {
       mkdirSync(dataDir, { recursive: true });
       this.path = resolve(join(dataDir, DB_FILE));
     }
-    this.sqlite = new Database(this.path ?? ':memory:', { create: true });
-    this.sqlite.run('PRAGMA journal_mode = WAL');
-    this.sqlite.run('PRAGMA foreign_keys = ON');
-    this.db = drizzle(this.sqlite, { schema });
-    migrate(this.db, { migrationsFolder: MIGRATIONS_DIR });
+    this.db = new Database(this.path ?? ':memory:', { create: true });
+    this.db.run('PRAGMA journal_mode = WAL');
+    this.db.run('PRAGMA foreign_keys = ON');
+    migrate(this.db);
     // A run that was going when the last process stopped can never finish.
-    this.db
-      .update(schema.runs)
-      .set({ status: 'error', error: 'the server stopped during the run' })
-      .where(eq(schema.runs.status, 'running'))
-      .run();
+    this.db.run(
+      "UPDATE runs SET status = 'error', error = 'the server stopped during the run' WHERE status = 'running'",
+    );
   }
 
   close(): void {
-    this.sqlite.close();
+    this.db.close();
   }
 
   // ---- stations -------------------------------------------------------------------------------------------------
 
   /** Upsert by id, so a row a failed restore kept is replaced when its id is created again. */
   saveStations(specs: CreateStation[]): void {
-    if (specs.length === 0) return;
     const now = Date.now();
-    this.db
-      .insert(schema.stations)
-      .values(specs.map((spec) => ({ id: spec.id, spec, createdAt: now })))
-      .onConflictDoUpdate({ target: schema.stations.id, set: { spec: sql`excluded.spec` } })
-      .run();
+    const insert = this.db.query(
+      'INSERT INTO stations (id, spec, created_at) VALUES (?, ?, ?) ON CONFLICT (id) DO UPDATE SET spec = excluded.spec',
+    );
+    for (const spec of specs) insert.run(spec.id, JSON.stringify(spec), now);
+  }
+
+  setStationFolder(ids: string[], folder: string | undefined): void {
+    const update = this.db.query(
+      folder === undefined
+        ? "UPDATE stations SET spec = json_remove(spec, '$.folder') WHERE id = ?2"
+        : "UPDATE stations SET spec = json_set(spec, '$.folder', ?1) WHERE id = ?2",
+    );
+    this.db.transaction(() => {
+      for (const id of ids) update.run(folder ?? null, id);
+    })();
   }
 
   deleteStation(id: string): void {
-    this.db.delete(schema.stations).where(eq(schema.stations.id, id)).run();
+    this.db.run('DELETE FROM stations WHERE id = ?', [id]);
   }
 
   /** Every saved spec, oldest first; not validated (they may predate a schema change). */
   savedStations(): { id: string; spec: unknown }[] {
-    return this.db
-      .select({ id: schema.stations.id, spec: schema.stations.spec })
-      .from(schema.stations)
-      .orderBy(schema.stations.createdAt, schema.stations.id)
-      .all();
+    return (this.db.query('SELECT id, spec FROM stations ORDER BY created_at, id').all() as Raw[]).map((r) => ({
+      id: r.id as string,
+      spec: parse<unknown>(r.spec as string),
+    }));
   }
 
   // ---- scenarios ------------------------------------------------------------------------------------------------
 
   scenarios(): SavedScenarioSummary[] {
-    return this.db
-      .select({
-        id: schema.scenarios.id,
-        name: schema.scenarios.name,
-        createdAt: schema.scenarios.createdAt,
-        updatedAt: schema.scenarios.updatedAt,
-      })
-      .from(schema.scenarios)
-      .orderBy(desc(schema.scenarios.updatedAt))
-      .limit(LIST_LIMIT)
-      .all()
-      .map((r) => ({ ...r, createdAt: iso(r.createdAt), updatedAt: iso(r.updatedAt) }));
+    const rows = this.db
+      .query(
+        'SELECT id, name, created_at AS createdAt, updated_at AS updatedAt FROM scenarios ORDER BY updated_at DESC LIMIT ?',
+      )
+      .all(LIST_LIMIT) as Array<
+      Omit<SavedScenarioSummary, 'createdAt' | 'updatedAt'> & { createdAt: number; updatedAt: number }
+    >;
+    return rows.map((r) => ({ ...r, createdAt: iso(r.createdAt), updatedAt: iso(r.updatedAt) }));
   }
 
   scenario(id: string): SavedScenario | undefined {
-    const r = this.db.select().from(schema.scenarios).where(eq(schema.scenarios.id, id)).get();
-    return r && { ...r, createdAt: iso(r.createdAt), updatedAt: iso(r.updatedAt) };
+    const r = this.db
+      .query('SELECT id, name, source, created_at AS createdAt, updated_at AS updatedAt FROM scenarios WHERE id = ?')
+      .get(id) as (Omit<SavedScenario, 'createdAt' | 'updatedAt'> & { createdAt: number; updatedAt: number }) | null;
+    return r ? { ...r, createdAt: iso(r.createdAt), updatedAt: iso(r.updatedAt) } : undefined;
   }
 
   saveScenario(s: { id?: string; name: string; source: string }): SavedScenario {
     const now = Date.now();
     if (s.id !== undefined) {
       const updated = this.db
-        .update(schema.scenarios)
-        .set({ name: s.name, source: s.source, updatedAt: now })
-        .where(eq(schema.scenarios.id, s.id))
-        .returning()
-        .get();
+        .query(
+          'UPDATE scenarios SET name = ?, source = ?, updated_at = ? WHERE id = ? RETURNING created_at AS createdAt',
+        )
+        .get(s.name, s.source, now, s.id) as { createdAt: number } | null;
       if (!updated) throw new Error(`no scenario ${s.id}`);
-      return { ...updated, createdAt: iso(updated.createdAt), updatedAt: iso(updated.updatedAt) };
+      return { id: s.id, name: s.name, source: s.source, createdAt: iso(updated.createdAt), updatedAt: iso(now) };
     }
-    const row = { id: crypto.randomUUID(), name: s.name, source: s.source, createdAt: now, updatedAt: now };
-    this.db.insert(schema.scenarios).values(row).run();
-    return { ...row, createdAt: iso(now), updatedAt: iso(now) };
+    const id = crypto.randomUUID();
+    this.db.run('INSERT INTO scenarios (id, name, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
+      id,
+      s.name,
+      s.source,
+      now,
+      now,
+    ]);
+    return { id, name: s.name, source: s.source, createdAt: iso(now), updatedAt: iso(now) };
   }
 
   deleteScenario(id: string): boolean {
-    return this.db.delete(schema.scenarios).where(eq(schema.scenarios.id, id)).returning().all().length > 0;
+    return this.db.run('DELETE FROM scenarios WHERE id = ?', [id]).changes > 0;
   }
 
   // ---- runs -----------------------------------------------------------------------------------------------------
 
-  insertRun(row: RunInsert): void {
-    this.db.insert(schema.runs).values(row).run();
+  insertRun(row: RunRow): void {
+    this.db.run(
+      `INSERT INTO runs (${RUN_KEYS.map((k) => RUN_COLUMNS[k]).join(', ')}) VALUES (${RUN_KEYS.map(() => '?').join(', ')})`,
+      RUN_KEYS.map((k) => sql(row[k])),
+    );
   }
 
-  updateRun(id: string, set: Partial<RunInsert>): void {
-    this.db.update(schema.runs).set(set).where(eq(schema.runs.id, id)).run();
+  /** Set the given columns; an undefined value is left as it is. */
+  updateRun(id: string, set: Partial<RunRow>): void {
+    const keys = RUN_KEYS.filter((k) => set[k] !== undefined);
+    if (keys.length === 0) return;
+    this.db.run(`UPDATE runs SET ${keys.map((k) => `${RUN_COLUMNS[k]} = ?`).join(', ')} WHERE id = ?`, [
+      ...keys.map((k) => sql(set[k])),
+      id,
+    ]);
   }
 
   run(id: string): RunRow | undefined {
-    return this.db.select().from(schema.runs).where(eq(schema.runs.id, id)).get();
+    const r = this.db.query(`${RUN_SELECT} WHERE id = ?`).get(id) as Raw | null;
+    return r ? runRow(r) : undefined;
   }
 
   runs(limit = LIST_LIMIT): RunRow[] {
-    return this.db.select().from(schema.runs).orderBy(desc(schema.runs.startedAt)).limit(limit).all();
+    return (this.db.query(`${RUN_SELECT} ORDER BY started_at DESC LIMIT ?`).all(limit) as Raw[]).map(runRow);
   }
 
   deleteRun(id: string): boolean {
@@ -232,56 +384,50 @@ export class Store {
     if (!row) return false;
     if (row.recordingId) this.deleteRecording(row.recordingId);
     if (row.csms) this.deleteReport(row.csms.reportId);
-    this.db.delete(schema.siteReports).where(eq(schema.siteReports.runId, id)).run();
-    this.db.delete(schema.runs).where(eq(schema.runs.id, id)).run();
+    this.db.run('DELETE FROM site_reports WHERE run_id = ?', [id]);
+    this.db.run('DELETE FROM runs WHERE id = ?', [id]);
     return true;
   }
 
   // ---- recordings -----------------------------------------------------------------------------------------------
 
-  insertRecording(r: Omit<RecordingInsert, 'id' | 'createdAt'>): RecordingView {
-    const row = { ...r, id: crypto.randomUUID(), createdAt: Date.now() };
-    this.db.insert(schema.recordings).values(row).run();
-    const { trace, ...rest } = row;
-    return recordingView({ ...rest, runId: rest.runId ?? null, bytes: Buffer.byteLength(trace) });
+  insertRecording(r: RecordingInsert): RecordingView {
+    const id = crypto.randomUUID();
+    const createdAt = Date.now();
+    this.db.run(
+      'INSERT INTO recordings (id, kind, name, run_id, created_at, entries, skipped, trace) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, r.kind, r.name, r.runId ?? null, createdAt, r.entries, r.skipped, r.trace],
+    );
+    return recordingView({ ...r, id, createdAt, bytes: Buffer.byteLength(r.trace) });
   }
 
   recordings(): RecordingView[] {
-    const t = schema.recordings;
-    return this.db
-      .select({
-        id: t.id,
-        kind: t.kind,
-        name: t.name,
-        runId: t.runId,
-        createdAt: t.createdAt,
-        entries: t.entries,
-        skipped: t.skipped,
-        bytes: sqlLength(t.trace),
-      })
-      .from(t)
-      .orderBy(desc(t.createdAt))
-      .limit(LIST_LIMIT)
-      .all()
-      .map(recordingView);
+    // The byte length is computed in SQLite, so listing recordings never loads their traces.
+    const rows = this.db
+      .query(
+        'SELECT id, kind, name, run_id AS runId, created_at AS createdAt, entries, skipped, ' +
+          'length(CAST(trace AS BLOB)) AS bytes FROM recordings ORDER BY created_at DESC LIMIT ?',
+      )
+      .all(LIST_LIMIT) as Array<Parameters<typeof recordingView>[0]>;
+    return rows.map(recordingView);
   }
 
   recordingTrace(id: string): { name: string; trace: string } | undefined {
-    return this.db
-      .select({ name: schema.recordings.name, trace: schema.recordings.trace })
-      .from(schema.recordings)
-      .where(eq(schema.recordings.id, id))
-      .get();
+    const r = this.db.query('SELECT name, trace FROM recordings WHERE id = ?').get(id) as {
+      name: string;
+      trace: string;
+    } | null;
+    return r ?? undefined;
   }
 
   deleteRecording(id: string): boolean {
-    return this.db.delete(schema.recordings).where(eq(schema.recordings.id, id)).returning().all().length > 0;
+    return this.db.run('DELETE FROM recordings WHERE id = ?', [id]).changes > 0;
   }
 
   // ---- CSMS reports ---------------------------------------------------------------------------------------------
 
   saveReport(name: string, csmsUrl: string, report: ConformanceReport): CsmsReportSummary {
-    const row = {
+    const summary = {
       id: crypto.randomUUID(),
       name,
       createdAt: Date.now(),
@@ -290,98 +436,89 @@ export class Store {
       total: report.total,
       errors: report.errors,
       warnings: report.warnings,
-      report,
     };
-    this.db.insert(schema.csmsReports).values(row).run();
-    const { report: _, ...summary } = row;
-    return { ...summary, createdAt: iso(row.createdAt) };
+    this.db.run(
+      'INSERT INTO csms_reports (id, name, created_at, csms_url, stations, total, errors, warnings, report) ' +
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        summary.id,
+        name,
+        summary.createdAt,
+        csmsUrl,
+        summary.stations,
+        report.total,
+        report.errors,
+        report.warnings,
+        JSON.stringify(report),
+      ],
+    );
+    return { ...summary, createdAt: iso(summary.createdAt) };
   }
 
   reports(): CsmsReportSummary[] {
-    const t = schema.csmsReports;
-    return this.db
-      .select({
-        id: t.id,
-        name: t.name,
-        createdAt: t.createdAt,
-        csmsUrl: t.csmsUrl,
-        stations: t.stations,
-        total: t.total,
-        errors: t.errors,
-        warnings: t.warnings,
-      })
-      .from(t)
-      .orderBy(desc(t.createdAt))
-      .limit(LIST_LIMIT)
-      .all()
-      .map((r) => ({ ...r, createdAt: iso(r.createdAt) }));
+    const rows = this.db
+      .query(
+        'SELECT id, name, created_at AS createdAt, csms_url AS csmsUrl, stations, total, errors, warnings ' +
+          'FROM csms_reports ORDER BY created_at DESC LIMIT ?',
+      )
+      .all(LIST_LIMIT) as Array<Omit<CsmsReportSummary, 'createdAt'> & { createdAt: number }>;
+    return rows.map((r) => ({ ...r, createdAt: iso(r.createdAt) }));
   }
 
   report(id: string): { name: string; report: ConformanceReport } | undefined {
-    return this.db
-      .select({ name: schema.csmsReports.name, report: schema.csmsReports.report })
-      .from(schema.csmsReports)
-      .where(eq(schema.csmsReports.id, id))
-      .get();
+    const r = this.db.query('SELECT name, report FROM csms_reports WHERE id = ?').get(id) as Raw | null;
+    return r ? { name: r.name as string, report: parse<ConformanceReport>(r.report as string) } : undefined;
   }
 
   deleteReport(id: string): boolean {
-    return this.db.delete(schema.csmsReports).where(eq(schema.csmsReports.id, id)).returning().all().length > 0;
+    return this.db.run('DELETE FROM csms_reports WHERE id = ?', [id]).changes > 0;
   }
 
   // ---- site reports ---------------------------------------------------------------------------------------------
 
-  saveSiteReport(row: SiteReportInsert): SiteSummary {
-    this.db.insert(schema.siteReports).values(row).run();
-    const { report: _, ...rest } = row;
-    return siteSummary({
-      ...rest,
-      runId: rest.runId ?? null,
-      peakNode: rest.peakNode ?? null,
-      peakPct: rest.peakPct ?? null,
-      fairness: rest.fairness ?? null,
-    });
+  saveSiteReport(row: SiteReportRow): SiteSummary {
+    this.db.run(
+      'INSERT INTO site_reports (id, kind, run_id, name, created_at, controller, start, end, nodes, leaves, trips, ' +
+        'peak_node, peak_pct, fairness, report) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        row.id,
+        row.kind,
+        row.runId,
+        row.name,
+        row.createdAt,
+        row.controller,
+        row.start,
+        row.end,
+        row.nodes,
+        row.leaves,
+        row.trips,
+        row.peakNode,
+        row.peakPct,
+        row.fairness,
+        JSON.stringify(row.report),
+      ],
+    );
+    return siteSummary(row);
   }
 
   siteReports(): SiteSummary[] {
-    const t = schema.siteReports;
-    return this.db
-      .select({
-        id: t.id,
-        kind: t.kind,
-        runId: t.runId,
-        name: t.name,
-        createdAt: t.createdAt,
-        controller: t.controller,
-        start: t.start,
-        end: t.end,
-        nodes: t.nodes,
-        leaves: t.leaves,
-        trips: t.trips,
-        peakNode: t.peakNode,
-        peakPct: t.peakPct,
-        fairness: t.fairness,
-      })
-      .from(t)
-      .orderBy(desc(t.createdAt))
-      .limit(LIST_LIMIT)
-      .all()
-      .map(siteSummary);
+    return (
+      this.db.query(`${SITE_SELECT} FROM site_reports ORDER BY created_at DESC LIMIT ?`).all(LIST_LIMIT) as Array<
+        Omit<SiteReportRow, 'report'>
+      >
+    ).map(siteSummary);
   }
 
   siteReport(id: string): { summary: SiteSummary; report: SiteReportView } | undefined {
-    const r = this.db.select().from(schema.siteReports).where(eq(schema.siteReports.id, id)).get();
+    const r = this.db.query(`${SITE_SELECT}, report FROM site_reports WHERE id = ?`).get(id) as
+      | (Omit<SiteReportRow, 'report'> & { report: string })
+      | null;
     if (!r) return undefined;
     const { report, ...rest } = r;
-    return { summary: siteSummary(rest), report };
+    return { summary: siteSummary(rest), report: parse<SiteReportView>(report) };
   }
 
   deleteSiteReport(id: string): boolean {
-    return this.db.delete(schema.siteReports).where(eq(schema.siteReports.id, id)).returning().all().length > 0;
+    return this.db.run('DELETE FROM site_reports WHERE id = ?', [id]).changes > 0;
   }
-}
-
-/** Byte length of a text column, computed in SQLite so listing recordings never loads their traces. */
-function sqlLength(col: SQLiteColumn) {
-  return sql<number>`length(CAST(${col} AS BLOB))`.mapWith(Number);
 }

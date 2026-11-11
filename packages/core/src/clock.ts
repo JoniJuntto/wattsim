@@ -8,24 +8,25 @@ export type Timer = { cancel(): void };
 export interface Clock {
   /** Epoch milliseconds in this clock's view of time. */
   now(): number;
-  date(): Date;
   setTimeout(fn: () => void, ms: number): Timer;
   setInterval(fn: () => void, ms: number): Timer;
-  sleep(ms: number): Promise<void>;
+}
+
+/** Resolves after `ms` of `clock`'s time. */
+export function sleep(clock: Clock, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    clock.setTimeout(resolve, ms);
+  });
 }
 
 /** ISO 8601 with millisecond precision and a `Z` suffix, e.g. `2026-10-29T12:34:56.789Z`. */
 export function isoTimestamp(c: Clock): string {
-  return c.date().toISOString();
+  return new Date(c.now()).toISOString();
 }
 
 export class WallClock implements Clock {
   now(): number {
     return Date.now();
-  }
-
-  date(): Date {
-    return new Date(this.now());
   }
 
   setTimeout(fn: () => void, ms: number): Timer {
@@ -36,12 +37,6 @@ export class WallClock implements Clock {
   setInterval(fn: () => void, ms: number): Timer {
     const handle = globalThis.setInterval(fn, ms);
     return { cancel: () => globalThis.clearInterval(handle) };
-  }
-
-  sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      globalThis.setTimeout(resolve, ms);
-    });
   }
 }
 
@@ -95,10 +90,6 @@ export class VirtualClock implements Clock {
     return this.current;
   }
 
-  date(): Date {
-    return new Date(this.current);
-  }
-
   setTimeout(fn: () => void, ms: number): Timer {
     return this.schedule(fn, ms, undefined);
   }
@@ -107,12 +98,6 @@ export class VirtualClock implements Clock {
     // Zero or negative periods would never let advance() terminate.
     const period = Math.max(1, ms);
     return this.schedule(fn, period, period);
-  }
-
-  sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      this.setTimeout(resolve, ms);
-    });
   }
 
   pendingTimers(): number {
@@ -285,20 +270,12 @@ export class SkewedClock implements Clock {
     return baseNow + this.offsetMs + (baseNow - this.baseStart) * (this.rate - 1);
   }
 
-  date(): Date {
-    return new Date(this.now());
-  }
-
   setTimeout(fn: () => void, ms: number): Timer {
     return this.base.setTimeout(fn, this.toBaseMs(ms));
   }
 
   setInterval(fn: () => void, ms: number): Timer {
     return this.base.setInterval(fn, this.toBaseMs(ms));
-  }
-
-  sleep(ms: number): Promise<void> {
-    return this.base.sleep(this.toBaseMs(ms));
   }
 
   private toBaseMs(skewedMs: number): number {

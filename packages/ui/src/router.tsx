@@ -41,7 +41,7 @@ const fleetRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', com
 
 export type StationSearch = { frame?: string; view?: 'telemetry'; window?: TimeWindow };
 
-export const stationRoute = createRoute({
+const stationRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: 'stations/$stationId',
   /** `view=telemetry` shows the charts instead of the controls; `window` their time range. */
@@ -54,7 +54,7 @@ export const stationRoute = createRoute({
   component: StationPage,
 });
 
-export const scenariosRoute = createRoute({
+const scenariosRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: 'scenarios',
   /** `scenario`: the saved scenario in the editor; `run`: the run shown on the right. */
@@ -72,7 +72,7 @@ export const scenariosRoute = createRoute({
 
 export type CsmsSearch = { rule?: string; station?: string; from?: number; to?: number };
 
-export const csmsRoute = createRoute({
+const csmsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: 'csms',
   /** A filter on the finding list, set by clicking the findings charts. */
@@ -96,7 +96,7 @@ export const csmsRoute = createRoute({
 const PHASE_WORDS = ['L1', 'L2', 'L3', 'N'] as const;
 export type SiteSearch = { node?: string; phase?: (typeof PHASE_WORDS)[number] };
 
-export const sitesRoute = createRoute({
+const sitesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: 'sites',
   // The Site page and its diagram live in their own chunk.
@@ -117,7 +117,7 @@ export const siteRoute = createRoute({
   component: lazyRouteComponent(() => import('@/routes/site'), 'SitePage'),
 });
 
-export const csmsSessionRoute = createRoute({
+const csmsSessionRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: 'csms/sessions/$identity',
   validateSearch: frameSearch,

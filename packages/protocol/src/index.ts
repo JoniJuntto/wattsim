@@ -13,8 +13,8 @@ export type {
   Frame,
   SendFrame,
 } from './frame';
-export { decodeFrame, encodeFrame, FrameDecodeError, MAX_MESSAGE_ID_LENGTH, MessageType, newMessageId } from './frame';
+export { decodeFrame, encodeFrame, FrameDecodeError, MessageType, newMessageId } from './frame';
 export type { Direction, ValidationResult, Violation, ViolationCode } from './validate';
 export { isKnownAction, validatePayload } from './validate';
 export type { OcppVersion } from './version';
-export { isOcppVersion, OCPP_VERSIONS, schemaDir } from './version';
+export { isOcppVersion, OCPP_VERSIONS } from './version';

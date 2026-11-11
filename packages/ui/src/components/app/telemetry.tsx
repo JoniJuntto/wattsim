@@ -3,7 +3,7 @@
  * smart-charging limit, current and voltage per phase, SoC with its target, energy, running cost), a crosshair
  * synced across every panel, and the composite schedule ahead.
  */
-import { type ReactNode, useMemo } from 'react';
+import { useMemo } from 'react';
 import { type SeriesRow, type TimeWindow, useSchedule, useStationSeries, windowMs } from '@/api/charts';
 import type { EvseView, StationView } from '@/api/types';
 import { StatusLabel } from '@/components/app/status';
@@ -25,25 +25,6 @@ const f1 = (v: number | null | undefined) =>
   v === null || v === undefined || !Number.isFinite(v) ? '–' : v.toFixed(1);
 const f2 = (v: number | null | undefined) =>
   v === null || v === undefined || !Number.isFinite(v) ? '–' : v.toFixed(2);
-
-/** A row of the small multiples: label and readout above, the plot below. */
-function Multiple({
-  title,
-  readout,
-  legend,
-  children,
-}: {
-  title: string;
-  readout?: ReactNode;
-  legend?: LegendItem[];
-  children: ReactNode;
-}) {
-  return (
-    <ChartFrame title={title} readout={readout} legend={legend} dense>
-      {children}
-    </ChartFrame>
-  );
-}
 
 function panelTable(rows: SeriesRow[], currency: string | undefined): TableData {
   return {
@@ -189,7 +170,8 @@ function EvsePanel({
 
   return (
     <div className="flex flex-col gap-2">
-      <Multiple
+      <ChartFrame
+        dense
         title="Power (kW)"
         legend={powerLegend}
         readout={
@@ -212,8 +194,9 @@ function EvsePanel({
           format={compact}
           ariaLabel={`EVSE ${evse.id} power in kW with offered power${series.hasLimit ? ' and limit' : ''}`}
         />
-      </Multiple>
-      <Multiple
+      </ChartFrame>
+      <ChartFrame
+        dense
         title="Current per phase (A)"
         legend={phaseLegend}
         readout={phases.map((p, i) => (
@@ -229,8 +212,9 @@ function EvsePanel({
           format={compact}
           ariaLabel={`EVSE ${evse.id} current per phase in A`}
         />
-      </Multiple>
-      <Multiple
+      </ChartFrame>
+      <ChartFrame
+        dense
         title="Voltage per phase (V)"
         legend={phaseLegend}
         readout={phases.map((p, i) => (
@@ -249,8 +233,9 @@ function EvsePanel({
           format={(v) => v.toFixed(0)}
           ariaLabel={`EVSE ${evse.id} voltage per phase in V`}
         />
-      </Multiple>
-      <Multiple
+      </ChartFrame>
+      <ChartFrame
+        dense
         title="State of charge (%)"
         readout={
           hasSoc ? (
@@ -293,8 +278,9 @@ function EvsePanel({
           snapTimes={times}
           ariaLabel={`EVSE ${evse.id} state of charge in percent with the target`}
         />
-      </Multiple>
-      <Multiple
+      </ChartFrame>
+      <ChartFrame
+        dense
         title="Energy delivered in window (kWh)"
         readout={
           <Reading value={f2(hover === null ? energyValues.at(-1) : valueAt(times, series.energy, t))} label="kWh" />
@@ -318,9 +304,10 @@ function EvsePanel({
           snapTimes={times}
           ariaLabel={`EVSE ${evse.id} energy delivered since the window start in kWh`}
         />
-      </Multiple>
+      </ChartFrame>
       {series.hasCost && (
-        <Multiple
+        <ChartFrame
+          dense
           title={`Running cost (${currency ?? 'tariff currency'})`}
           readout={<Reading value={f2(at?.cost)} label={currency ?? ''} />}
         >
@@ -332,7 +319,7 @@ function EvsePanel({
             xAxis
             ariaLabel={`EVSE ${evse.id} running cost of the transaction`}
           />
-        </Multiple>
+        </ChartFrame>
       )}
     </div>
   );
@@ -439,7 +426,7 @@ export function Telemetry({
           {query.isError
             ? `History did not load: ${query.error.message}`
             : resolution && resolution > from
-              ? `Every sample since ${formatTime(resolution)}; earlier, the lowest and highest per 5 min`
+              ? `Every sample since ${formatTime(resolution)}; older samples were dropped (each EVSE keeps its last 1024)`
               : 'Sampled at every meter value and state change'}
         </span>
         {query.isFetching && <Spinner className="size-3.5" />}

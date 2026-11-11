@@ -481,5 +481,3 @@ function NodeHistoryCharts({
     </div>
   );
 }
-
-export const kindLabel = (k: string) => KIND[k] ?? k;

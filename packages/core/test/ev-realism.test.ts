@@ -33,17 +33,17 @@ describe('temperature', () => {
   test('a cold battery charges at the derated power: curve x derate x phases x V x A', () => {
     const ev = charging({ ambientC: 0 });
     expect(ev.temperatureC).toBe(0);
-    expect(ev.requestedPowerKw(50, 230)).toBeCloseTo(0.5 * 22.08, 9);
+    expect(ev.drawKw(50, 230, ev.config.phases)).toBeCloseTo(0.5 * 22.08, 9);
     const warm = charging({ ambientC: -5, batteryTempC: 25 });
-    expect(warm.requestedPowerKw(50, 230)).toBeCloseTo(22.08, 9);
+    expect(warm.drawKw(50, 230, warm.config.phases)).toBeCloseTo(22.08, 9);
   });
 
   test('heating grows with the square of power, cooling pulls towards ambient; exact for any step size', () => {
     const cfg = { batteryKwh: 60, initialSoc: 0.1, targetSoc: 1, heatPerHourC: 6, coolingPerHour: 0.5 };
     const a = charging(cfg);
     const b = charging(cfg);
-    a.requestedPowerKw(1, 230);
-    b.requestedPowerKw(1, 230);
+    a.drawKw(1, 230, a.config.phases);
+    b.drawKw(1, 230, b.config.phases);
     // 120 kW on 60 kWh is 2C: 6 * 4 = 24 °C/h of heat; equilibrium 20 + 24 / 0.5 = 68 °C. 20 min of it:
     a.tick(20 * MIN, 120);
     for (let i = 0; i < 20; i++) b.tick(MIN, 120);
@@ -58,17 +58,12 @@ describe('temperature', () => {
 
   test('AC charging barely warms the pack; a hot pack is derated', () => {
     const ev = charging({ batteryKwh: 60, initialSoc: 0.1, targetSoc: 1 });
-    ev.requestedPowerKw(22, 230);
+    ev.drawKw(22, 230, ev.config.phases);
     for (let i = 0; i < 60; i++) ev.tick(MIN, 22);
     expect(ev.temperatureC).toBeLessThan(21);
     const hot = charging({ batteryTempC: 50 });
     expect(hot.derate).toBeCloseTo(0.5, 9);
-    expect(hot.requestedPowerKw(50, 230)).toBeCloseTo(11.04, 9);
-  });
-
-  test('a custom derate function is honoured', () => {
-    const ev = charging({ temperatureDerate: () => 0.25 });
-    expect(ev.requestedPowerKw(50, 230)).toBeCloseTo(5.52, 9);
+    expect(hot.drawKw(50, 230, hot.config.phases)).toBeCloseTo(11.04, 9);
   });
 });
 
@@ -76,7 +71,7 @@ describe('current limits and phases', () => {
   test('cableMaxA caps the current below the EV maximum', () => {
     const ev = charging({ maxCurrentA: 32, cableMaxA: 20 });
     expect(ev.maxCurrentA).toBe(20);
-    expect(ev.requestedPowerKw(50, 230)).toBeCloseTo((20 * 3 * 230) / 1000, 9);
+    expect(ev.drawKw(50, 230, ev.config.phases)).toBeCloseTo((20 * 3 * 230) / 1000, 9);
   });
 
   test('drawKw on fewer phases than the EV has', () => {
@@ -141,7 +136,7 @@ describe('V2X', () => {
 
   test('a Full EV wakes up to discharge, then charges back to its target', () => {
     const ev = charging({ v2x: true, batteryKwh: 10, initialSoc: 0.8, targetSoc: 0.8 });
-    expect(ev.requestedPowerKw(22, 230)).toBe(0);
+    expect(ev.drawKw(22, 230, ev.config.phases)).toBe(0);
     expect(ev.state).toBe('Full');
     expect(ev.drawKw(22, 230, 3, -2)).toBe(-2);
     ev.tick(HOUR / 2, -2); // -1 kWh -> 0.7
@@ -159,7 +154,7 @@ describe('V2X', () => {
 describe('ISO 15118 pause', () => {
   test('resumeAfterMs: a suspended EV asks for energy again after the pause', () => {
     const ev = charging({ batteryKwh: 10, initialSoc: 0.4, targetSoc: 0.9, suspendAt: 0.5, resumeAfterMs: 10 * MIN });
-    ev.requestedPowerKw(22, 230);
+    ev.drawKw(22, 230, ev.config.phases);
     ev.tick(HOUR, 1.5);
     expect(ev.state).toBe('Suspended');
     ev.tick(9 * MIN, 0);

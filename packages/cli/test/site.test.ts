@@ -10,7 +10,7 @@ process.env.WATTSIM_MODBUS_FREE_PORTS = '1';
 const repoRoot = new URL('../../..', import.meta.url).pathname;
 const depot = join(repoRoot, 'examples/dlm-depot.ws');
 
-/** `wattsim` in a child process; the site's own CSMS is reached in memory (see in-memory.ts). */
+/** `wattsim` in a child process; the site block starts its own CSMS on a free port (see in-memory.ts). */
 const cli = (...args: string[]) => runInMemory('packages/cli/src/index.ts', args);
 
 test('the depot under the reference controller: score table, site report and JUnit properties', async () => {
@@ -26,10 +26,10 @@ test('the depot under the reference controller: score table, site report and JUn
   expect(json.format).toBe('wattsim-site-report');
   expect(json.leaves).toHaveLength(20);
   expect(json.series.t.length).toBeGreaterThan(100);
-  // Version 2: `allocations` holds the keyframes, `allocationSteps` every step (see `decodeAllocations`).
-  expect(json.version).toBe(2);
-  expect(json.allocationSteps.length).toBeGreaterThan(100);
-  expect(json.allocations.length).toBeGreaterThan(0);
+  // Version 1: every controller step in `allocations`.
+  expect(json.version).toBe(1);
+  expect(json.allocationSteps).toBeUndefined();
+  expect(json.allocations.length).toBeGreaterThan(100);
   expect(json.score.trips).toBe(0);
   const xml = await Bun.file(junit).text();
   expect(xml).toContain('<property name="dlm.trips" value="0"/>');

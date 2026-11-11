@@ -14,7 +14,7 @@ import { decodeValue, registerCount } from './encoding';
 import type { Block, Device, RegisterEntry, RegisterMap } from './map';
 import { startModbus, startModbusPerPort } from './server';
 
-const USAGE = `usage:
+export const USAGE = `usage:
   cli.ts serve --map <sdm630|em24|generic> [--unit 1[,2,...]] [--port 1502] [--host 0.0.0.0]
                [--const quantity=value,...] [--per-port]
   cli.ts read  [--host 127.0.0.1] --port <port> [--unit 1] (--map <id> [--fc 3|4] | --fc 3|4 --address <a> --count <n>)
@@ -137,13 +137,15 @@ async function read(args: string[]) {
   }
 }
 
-const [command, ...rest] = process.argv.slice(2);
-try {
-  if (command === 'serve') serve(rest);
-  else if (command === 'read') await read(rest);
-  else if (command === 'map') console.log(describeMap(getMap(rest[0] ?? fail('map needs a map id'))));
-  else fail(command ? `unknown command "${command}"` : 'no command');
-} catch (err) {
-  console.error(err instanceof Error ? err.message : err);
-  process.exit(1);
+if (import.meta.main) {
+  const [command, ...rest] = process.argv.slice(2);
+  try {
+    if (command === 'serve') serve(rest);
+    else if (command === 'read') await read(rest);
+    else if (command === 'map') console.log(describeMap(getMap(rest[0] ?? fail('map needs a map id'))));
+    else fail(command ? `unknown command "${command}"` : 'no command');
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  }
 }

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { CallFrame, Violation, v16 } from '@wattsim/protocol';
 import type { StationConfig } from '../src/index';
 import { CallError, RequestTimeoutError, Station, ViolationError, VirtualClock } from '../src/index';
-import { CsmsCallError, connectInMemory, FakeCsms, until } from './fake-csms';
+import { CsmsCallError, FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MINUTE = 60_000;
@@ -20,7 +20,6 @@ function make(opts: Partial<StationConfig> = {}): Station {
     id: 'CP1',
     version: 'ocpp1.6',
     csmsUrl: csms.url,
-    socket: connectInMemory,
     clock,
     ...opts,
   });
@@ -308,7 +307,6 @@ describe('Review Focus 5: many stations, one clock, independent timers', () => {
         id: `CP-${i}`,
         version: 'ocpp1.6',
         csmsUrl: csms.url,
-        socket: connectInMemory,
         clock,
         heartbeatMs: hbMs(i),
       });

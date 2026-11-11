@@ -1,37 +1,18 @@
 import { basename } from 'node:path';
 import type { Clock, StationConfig } from '@wattsim/core';
-import { attachMetrics, ConnectPacer, pace, Station, serveMetrics, VirtualClock, WallClock } from '@wattsim/core';
+import { ConnectPacer, pace, Station, VirtualClock, WallClock } from '@wattsim/core';
 import type { Frame } from '@wattsim/protocol';
 import { MessageType } from '@wattsim/protocol';
 import type { FleetSelection, RunEvent, RunOptions, RunResult, SiteRun } from '@wattsim/scenario';
 import { driveVirtual, isIdle, ParseError, QuirkError, run as runScenario, toJUnit } from '@wattsim/scenario';
 import { defineCommand } from 'citty';
-import { err, loadScenario, out, parseIds, parseShard } from '../load';
+import { clockTime, compact, err, fail, loadScenario, Printer, parseIds, parseShard } from '../load';
+import { attachMetrics, serveMetrics } from '../metrics';
 import { quirkFlags } from './quirk';
 
 const MAX_VIRTUAL_MS = 24 * 3_600_000;
-const JSON_WIDTH = 120;
 
-/** Serialise stdout writes so event lines land in order and `process.exit` cannot truncate them. */
-class Printer {
-  private pending: Promise<unknown> = Promise.resolve();
-  write(text: string): void {
-    this.pending = this.pending.then(() => out(text));
-  }
-  flush(): Promise<unknown> {
-    return this.pending;
-  }
-}
-
-function compactJson(value: unknown): string {
-  const text = JSON.stringify(value) ?? '';
-  return text.length > JSON_WIDTH ? `${text.slice(0, JSON_WIDTH - 1)}…` : text;
-}
-
-/** `HH:MM:SS.mmm` in UTC from run-clock epoch ms. */
-function clockTime(at: number): string {
-  return new Date(at).toISOString().slice(11, 23);
-}
+const compactJson = (value: unknown) => compact(JSON.stringify(value) ?? '');
 
 function seconds(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
@@ -162,11 +143,6 @@ function summary(result: RunResult): string {
   ].join('\n');
 }
 
-async function badFlag(message: string): Promise<never> {
-  await err(`${message}\n`);
-  process.exit(2);
-}
-
 async function parseNumber(
   flag: string,
   raw: string | undefined,
@@ -174,7 +150,7 @@ async function parseNumber(
 ): Promise<number | undefined> {
   if (raw === undefined) return undefined;
   const n = Number(raw);
-  if (!Number.isFinite(n) || !check(n)) return badFlag(`invalid --${flag}: ${raw}`);
+  if (!Number.isFinite(n) || !check(n)) return fail(2, `invalid --${flag}: ${raw}`);
   return n;
 }
 
@@ -227,16 +203,16 @@ export const run = defineCommand({
   async run({ args, rawArgs }) {
     const { scenario } = await loadScenario(args.file, 2);
     const quirks = quirkFlags(rawArgs);
-    if (!args.csms && !scenario.csms && !scenario.site) await badFlag('no CSMS URL: pass --csms or add a csms line');
+    if (!args.csms && !scenario.csms && !scenario.site) await fail(2, 'no CSMS URL: pass --csms or add a csms line');
     const siteController = args.controller;
     if (siteController !== undefined && siteController !== 'reference' && siteController !== 'none') {
-      await badFlag(`invalid --controller: ${siteController} (expected reference or none)`);
+      await fail(2, `invalid --controller: ${siteController} (expected reference or none)`);
     }
     if (
       (siteController !== undefined || args['site-report'] !== undefined || args['modbus-host'] !== undefined) &&
       !scenario.site
     ) {
-      await badFlag('--controller, --site-report and --modbus-host need a scenario with a site block');
+      await fail(2, '--controller, --site-report and --modbus-host need a scenario with a site block');
     }
     const speed = await parseNumber('speed', args.speed, (n) => n > 0);
     const seed = await parseNumber('seed', args.seed, Number.isInteger);
@@ -244,21 +220,21 @@ export const run = defineCommand({
     const shard =
       args.shard === undefined
         ? undefined
-        : (parseShard(args.shard) ?? (await badFlag(`invalid --shard: ${args.shard} (expected i/n with 0 <= i < n)`)));
+        : (parseShard(args.shard) ?? (await fail(2, `invalid --shard: ${args.shard} (expected i/n with 0 <= i < n)`)));
     const ids =
       args.ids === undefined
         ? undefined
-        : (parseIds(args.ids) ?? (await badFlag(`invalid --ids: ${args.ids} (expected a..b with a <= b)`)));
+        : (parseIds(args.ids) ?? (await fail(2, `invalid --ids: ${args.ids} (expected a..b with a <= b)`)));
     const select: FleetSelection | undefined = shard || ids ? { shard, ids } : undefined;
     const connectRate = await parseNumber('connect-rate', args['connect-rate'], (n) => n > 0);
     if (args.metrics !== undefined && args['metrics-port-base'] !== undefined) {
-      await badFlag('--metrics and --metrics-port-base exclude each other');
+      await fail(2, '--metrics and --metrics-port-base exclude each other');
     }
     const portBase = await parseNumber('metrics-port-base', args['metrics-port-base'], isPort);
     const metricsPort =
       portBase !== undefined ? portBase + (shard?.index ?? 0) : await parseNumber('metrics', args.metrics, isPort);
     if (metricsPort !== undefined && !isPort(metricsPort)) {
-      await badFlag(`--metrics-port-base ${portBase} + shard ${shard?.index} is past port 65535`);
+      await fail(2, `--metrics-port-base ${portBase} + shard ${shard?.index} is past port 65535`);
     }
 
     const printer = new Printer();

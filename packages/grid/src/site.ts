@@ -17,7 +17,7 @@ import { type CheckIssue, checkCompiled, type SelectivityResult, selectivityPair
 import { type CNode, type CompiledSite, compileSite, SiteValidationError } from './compile';
 import { heatAfter, type TripCause, type TripCurve, timeToTrip } from './curves';
 import { createLoadModel, type LoadModel } from './loads';
-import { currentPhasor, PHASE_ANGLE, PHASES, type Phase, type Triple } from './phases';
+import { currentPhasor, PHASE_ANGLE, PHASES, type Phase, phaseIndex, type Triple } from './phases';
 import { type Draws, type LeafDraw, type NodeKind, type SiteDescription, SUPPLY_ID } from './types';
 
 const K = [0, 1, 2] as const;
@@ -26,7 +26,7 @@ type Bool3 = [boolean, boolean, boolean];
 /** Two events closer than this (ms) happen together. */
 const SAME_INSTANT_MS = 1e-6;
 /** EN 50160: supply voltage within ±10 % of the nominal voltage. */
-export const VOLTAGE_BAND = 0.1;
+const VOLTAGE_BAND = 0.1;
 
 export type NodeState = {
   id: string;
@@ -360,7 +360,7 @@ export class Site {
     const live = flow.live[n.index] as Bool3;
     const out: LeafSupply = { phases: [], voltageV: [], leafPhases: [], frequencyHz: this.c.frequencyHz };
     n.mapping.forEach((p, i) => {
-      const k = PHASES.indexOf(p) as Kx;
+      const k = phaseIndex(p);
       if (!live[k]) return;
       out.phases.push(p);
       out.voltageV.push(Math.hypot((flow.vre[n.index] as Triple)[k], (flow.vim[n.index] as Triple)[k]));
@@ -418,7 +418,7 @@ export class Site {
       const im = zero();
       n.mapping.forEach((p, i) => {
         const ph = currentPhasor(amps[i] as number, p, pf);
-        const k = PHASES.indexOf(p) as Kx;
+        const k = phaseIndex(p);
         re[k] += ph.re;
         im[k] += ph.im;
       });

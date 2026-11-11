@@ -11,8 +11,6 @@ export function useTick(world: World, ms = 200): number {
   return v;
 }
 
-export const clock = (t: number) => new Date(t).toISOString().slice(11, 16);
-
 /** Colour for a loading percentage: calm teal, amber near the limit, red over it. */
 export function loadColour(pct: number | undefined): string {
   if (pct === undefined) return '#38e8c6';

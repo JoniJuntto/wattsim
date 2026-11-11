@@ -16,7 +16,8 @@
 import { realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Clock, Station } from '@wattsim/core';
-import type { Loc, NumExpr, QuirkDecl, Scenario, SiteNode, Stmt, UseStmt } from './ast';
+import type { Loc, NumExpr, QuirkDecl, Scenario, SiteNode, Stmt, StringExpr, UseStmt } from './ast';
+import { forEachStmt, rawText } from './ast';
 import { ParseError } from './lexer';
 import { parse } from './parser';
 
@@ -78,19 +79,14 @@ export type QuirkPluginContext = {
 // biome-ignore lint/suspicious/noConfusingVoidType: a plugin that returns nothing is the common case
 export type QuirkPlugin = (station: Station, ctx: QuirkPluginContext) => void | (() => void);
 
-const literal = (u: { name: { parts: (string | { var: string })[] } }) => u.name.parts.join('');
+const literal = (u: { name: StringExpr }) => rawText(u.name);
 
 /** Every `use` statement in `body`, nested blocks included. */
 export function useStatements(body: Stmt[]): UseStmt[] {
   const out: UseStmt[] = [];
-  const walk = (stmts: Stmt[]) => {
-    for (const s of stmts) {
-      if (s.kind === 'use') out.push(s);
-      else if (s.kind === 'at' || s.kind === 'repeat') walk(s.body);
-      else if (s.kind === 'choose') for (const b of s.branches) walk(b.body);
-    }
-  };
-  walk(body);
+  forEachStmt(body, (s) => {
+    if (s.kind === 'use') out.push(s);
+  });
   return out;
 }
 
@@ -323,25 +319,21 @@ function checkCycles(quirks: Map<string, QuirkSource>): void {
 }
 
 /** Every load profile file the scenario names (site block and `load ... profile` statements), as written. */
-export function profileRefs(scenario: Scenario): Array<{ path: string; loc: Loc }> {
+function profileRefs(scenario: Scenario): Array<{ path: string; loc: Loc }> {
   const out: Array<{ path: string; loc: Loc }> = [];
   const nodes = (list: readonly SiteNode[]) => {
     for (const n of list) {
       for (const a of n.args)
-        if (a.key === 'profile' && a.value.kind === 'string')
-          out.push({ path: a.value.value.parts.join(''), loc: a.loc });
+        if (a.key === 'profile' && a.value.kind === 'string') out.push({ path: rawText(a.value.value), loc: a.loc });
       if (n.children) nodes(n.children);
     }
   };
   if (scenario.site) nodes(scenario.site.body.filter((i): i is SiteNode => i.kind === 'node'));
-  const walk = (body: Stmt[]) => {
-    for (const st of body) {
-      if (st.kind === 'load' && st.op === 'profile') out.push({ path: st.file.parts.join(''), loc: st.file.loc });
-      if (st.kind === 'at' || st.kind === 'repeat') walk(st.body);
-      if (st.kind === 'choose') for (const b of st.branches) walk(b.body);
-    }
-  };
-  for (const b of [...scenario.stations, ...scenario.procs]) walk(b.body);
+  for (const b of [...scenario.stations, ...scenario.procs]) {
+    forEachStmt(b.body, (st) => {
+      if (st.kind === 'load' && st.op === 'profile') out.push({ path: rawText(st.file), loc: st.file.loc });
+    });
+  }
   return out;
 }
 

@@ -17,7 +17,7 @@ afterEach(async () => {
   r = undefined;
 });
 
-const steps = (rig: Rig) => rig.rt.allocationList();
+const steps = (rig: Rig) => rig.rt.allocationsSince(0);
 
 const sentTo = (rig: Rig, station: string) =>
   (rig.csms.session(station)?.sent ?? []).filter(
@@ -33,7 +33,7 @@ test('a station that goes offline while charging keeps its last limit reserved (
   r.at(60 * S, () => st.A?.disconnect());
   r.at(180 * S, () => st.A?.connect());
   await r.until(5 * MIN);
-  const { peakA, overS } = overRun(r.rt, 'B', 40);
+  const { peakA, overS } = overRun(r, 'B', 40);
   expect(overS).toBe(0);
   expect(peakA).toBeLessThanOrEqual(40);
   // The offline station is shown as uncontrolled load while it is away.
@@ -55,7 +55,7 @@ test('a charger that refuses every profile is reserved at its rating; the others
   r.at(0, () => charge(st.A as never));
   r.at(45 * S, () => charge(st.C as never));
   await r.until(5 * MIN);
-  expect(overRun(r.rt, 'B', 40).overS).toBe(0);
+  expect(overRun(r, 'B', 40).overS).toBe(0);
   // C still charges, with what A leaves.
   expect(r.rt.state()?.nodes.C?.currentA[0]).toBeGreaterThanOrEqual(6 - 1e-9);
   // Retries back off instead of going out every step.
@@ -71,7 +71,7 @@ test('a decrease refused mid-session holds the increases that depend on it (reje
   );
   r.at(45 * S, () => charge(st.C as never));
   await r.until(330 * S);
-  expect(overRun(r.rt, 'B', 40).overS).toBe(0);
+  expect(overRun(r, 'B', 40).overS).toBe(0);
   expect(r.rt.state()?.nodes.C?.currentA[0]).toBeGreaterThanOrEqual(6 - 1e-9);
 }, 30_000);
 
@@ -88,7 +88,7 @@ test('a slow answer to a decrease holds the increases until it lands (slow)', as
   );
   r.at(45 * S, () => charge(st.C as never));
   await r.until(330 * S);
-  expect(overRun(r.rt, 'B', 40).overS).toBe(0);
+  expect(overRun(r, 'B', 40).overS).toBe(0);
   // Both end up sharing the board.
   expect(r.rt.state()?.nodes.C?.currentA[0]).toBeGreaterThan(15);
 }, 30_000);
@@ -107,7 +107,7 @@ test('a charger that accepts profiles but keeps drawing more is cut out of the b
   r.at(0, () => charge(st.A as never));
   r.at(45 * S, () => charge(st.C as never));
   await r.until(5 * MIN);
-  const over = overRun(r.rt, 'B', 40);
+  const over = overRun(r, 'B', 40);
   // Measured feedback: whatever the cause, the overshoot lasts at most the time to the next step.
   expect(over.overS).toBeLessThanOrEqual(2);
   const last = steps(r).at(-1);
@@ -148,13 +148,17 @@ test('an EV that stops drawing gives its share back, keeps a reserve, and gets i
   await r.until(5 * MIN);
   expect(lastEvse('A')?.limitA).toBeCloseTo(19, 0);
   expect(c()).toBeCloseTo(19, 0);
-  expect(overRun(r.rt, 'B', 40).overS).toBe(0);
+  expect(overRun(r, 'B', 40).overS).toBe(0);
 }, 30_000);
 
 test('an allocation is stamped with the clock, not the last site evaluation', async () => {
   r = await rig({ boardA: 63, stations: ['A'] });
   r.at(0, () => charge(rig_().st.A as never));
   await r.until(95 * S);
-  const a = r.rt.controlNow();
-  expect(a?.t).toBe(r.clock.now());
+  // Restarting the controller runs a step at once, between two site evaluations.
+  const got: number[] = [];
+  r.rt.on('allocation', (a) => got.push(a.t));
+  r.rt.setController('none');
+  r.rt.setController('reference');
+  expect(got).toEqual([r.clock.now()]);
 }, 30_000);

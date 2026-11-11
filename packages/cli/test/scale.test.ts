@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { parseIds, parseShard } from '../src/load';
 import { type CliRun, MEMORY_CSMS, runInMemory } from './in-memory';
 
-/** `wattsim` in a child process with its own in-memory CSMS at `MEMORY_CSMS` (see in-memory.ts). */
+/** `wattsim` in a child process with its own `FakeCsms` at `MEMORY_CSMS` (see in-memory.ts). */
 const cli = (...args: string[]) => runInMemory('packages/cli/src/index.ts', args);
 
 const scratch = await mkdtemp(join(tmpdir(), 'wattsim-scale-'));

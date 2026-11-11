@@ -23,7 +23,6 @@
   },
   "devDependencies": {
     "@types/bun": "catalog:",
-    "typescript": "catalog:",
-    "vscode-jsonrpc": "10.0.0"
+    "typescript": "catalog:"
   }
 }

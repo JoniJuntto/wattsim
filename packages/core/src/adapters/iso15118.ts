@@ -1,37 +1,11 @@
 /**
- * ISO 15118 behaviour modelled at the OCPP level (2.0.1 / 2.1): Plug & Charge authorization and the EV's charging
- * needs. There is no ISO 15118 wire stack; these build the OCPP payloads a station with one would send.
+ * ISO 15118 behaviour modelled at the OCPP level (2.0.1 / 2.1): the EV's charging needs. There is no ISO 15118 wire
+ * stack; this builds the OCPP payload a station with one would send.
  */
 import type { v21, v201 } from '@wattsim/protocol';
 import type { EvModel } from '../ev';
-import type { StationSecurity } from '../security';
 import type { EvseState } from '../station';
 import type { Ocpp2xVersion } from './ocpp201';
-
-/** `responderURL` for the contract chain's OCSP request data (the chain carries no AIA wattsim reads). */
-export const PNC_OCSP_RESPONDER = 'http://ocsp.wattsim.test/';
-
-type OcspRequestData = NonNullable<v201.AuthorizeRequest['iso15118CertificateHashData']>[number];
-
-/**
- * Authorize for Plug & Charge: idToken `emaid` of type eMAID and, when a V2G certificate chain is installed
- * (SignCertificate V2GCertificate + CertificateSigned), the OCSP request data of its certificates, leaf first, at
- * most four.
- */
-export async function authorizePncPayload(
-  _version: Ocpp2xVersion,
-  emaid: string,
-  sec: StationSecurity | undefined,
-): Promise<v201.AuthorizeRequest> {
-  const payload: v201.AuthorizeRequest = { idToken: { idToken: emaid, type: 'eMAID' } };
-  const [chain] = sec ? await sec.list(['V2GCertificateChain']) : [];
-  if (chain) {
-    payload.iso15118CertificateHashData = [chain.hashData, ...(chain.childHashData ?? [])]
-      .slice(0, 4)
-      .map((h): OcspRequestData => ({ ...h, responderURL: PNC_OCSP_RESPONDER }));
-  }
-  return payload;
-}
 
 function transferMode(phases: number): 'AC_single_phase' | 'AC_two_phase' | 'AC_three_phase' {
   return phases === 1 ? 'AC_single_phase' : phases === 2 ? 'AC_two_phase' : 'AC_three_phase';

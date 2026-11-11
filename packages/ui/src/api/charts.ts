@@ -2,54 +2,8 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo } from 'react';
 import { useLive, useStore } from '@/state/live';
-import type {
-  EvseSeriesView,
-  FindingsBinsView,
-  FleetBin,
-  FleetSeriesView,
-  FleetStationsView,
-  RunStatus,
-  RunTimeline,
-  ScheduleView,
-  SeriesPoint,
-  StationSeriesView,
-} from './types';
-
-async function get<T>(path: string): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(path, { headers: { accept: 'application/json' } });
-  } catch {
-    throw new Error('The wattsim server is not reachable.');
-  }
-  if (!res.ok) {
-    let message = `GET ${path} failed with HTTP ${res.status}`;
-    try {
-      const body = (await res.json()) as { error?: unknown };
-      if (typeof body.error === 'string') message = body.error;
-    } catch {
-      // keep the generic message
-    }
-    throw new Error(message);
-  }
-  return (await res.json()) as T;
-}
-
-const enc = encodeURIComponent;
-
-export const chartsApi = {
-  series: (id: string, from: number, to: number, step: number) =>
-    get<StationSeriesView>(`/api/stations/${enc(id)}/series?from=${from}&to=${to}&step=${step}`),
-  schedule: (id: string, evse: number, durationS: number) =>
-    get<ScheduleView>(`/api/stations/${enc(id)}/schedule?evse=${evse}&duration=${durationS}`),
-  fleet: (from: number, to: number, step: number) =>
-    get<FleetSeriesView>(`/api/fleet/series?from=${from}&to=${to}&step=${step}`),
-  fleetStations: (from: number, to: number, bins: number, metric: 'power' | 'status') =>
-    get<FleetStationsView>(`/api/fleet/stations?from=${from}&to=${to}&bins=${bins}&metric=${metric}`),
-  findings: (from: number, to: number, step: number) =>
-    get<FindingsBinsView>(`/api/csms/findings/bins?from=${from}&to=${to}&step=${step}`),
-  timeline: (id: string) => get<RunTimeline>(`/api/runs/${enc(id)}/timeline`),
-};
+import { api } from './http';
+import type { EvseSeriesView, FleetBin, FleetSeriesView, RunStatus, SeriesPoint } from './types';
 
 /** The time windows every chart page offers. `all` is everything the server keeps (24 h). */
 export type TimeWindow = '5m' | '1h' | '6h' | 'all';
@@ -134,7 +88,7 @@ export function useStationSeries(stationId: string, window: TimeWindow) {
     queryFn: () => {
       const to = Date.now();
       const from = to - windowMs(window);
-      return chartsApi.series(stationId, from, to, Math.floor((to - from) / TARGET_POINTS));
+      return api.series(stationId, from, to, Math.floor((to - from) / TARGET_POINTS));
     },
     staleTime: Number.POSITIVE_INFINITY,
     placeholderData: keepPreviousData,
@@ -154,7 +108,7 @@ export function useStationSeries(stationId: string, window: TimeWindow) {
 export function useSchedule(stationId: string, evse: number, limitKey: unknown) {
   return useQuery({
     queryKey: ['schedule', stationId, evse, limitKey],
-    queryFn: () => chartsApi.schedule(stationId, evse, 86_400),
+    queryFn: () => api.schedule(stationId, evse, 86_400),
     refetchInterval: 60_000,
     placeholderData: keepPreviousData,
     retry: 1,
@@ -172,7 +126,7 @@ export function useFleetSeries(window: TimeWindow) {
     queryFn: () => {
       const to = Date.now();
       const from = to - windowMs(window);
-      return chartsApi.fleet(from, to, Math.max(10_000, Math.floor((to - from) / 360)));
+      return api.fleetSeries(from, to, Math.max(10_000, Math.floor((to - from) / 360)));
     },
     staleTime: Number.POSITIVE_INFINITY,
     placeholderData: keepPreviousData,
@@ -204,7 +158,7 @@ export function useFleetStations(window: TimeWindow, metric: 'power' | 'status',
     queryKey: ['fleet-stations', window, metric, bins],
     queryFn: () => {
       const to = Date.now();
-      return chartsApi.fleetStations(to - windowMs(window), to, bins, metric);
+      return api.fleetStations(to - windowMs(window), to, bins, metric);
     },
     refetchInterval: 10_000,
     placeholderData: keepPreviousData,
@@ -218,7 +172,7 @@ export function useFindingsBins(window: TimeWindow, running: boolean) {
     queryFn: () => {
       const to = Date.now();
       const from = to - windowMs(window);
-      return chartsApi.findings(from, to, Math.max(10_000, niceBin((to - from) / 60)));
+      return api.findingsBins(from, to, Math.max(10_000, niceBin((to - from) / 60)));
     },
     enabled: running,
     refetchInterval: running ? 5000 : false,
@@ -228,13 +182,13 @@ export function useFindingsBins(window: TimeWindow, running: boolean) {
 
 const BINS = [10_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000, 3_600_000];
 /** The smallest round bin width at least `ms`. */
-export const niceBin = (ms: number) => BINS.find((b) => b >= ms) ?? 3_600_000 * Math.ceil(ms / 3_600_000);
+const niceBin = (ms: number) => BINS.find((b) => b >= ms) ?? 3_600_000 * Math.ceil(ms / 3_600_000);
 
 /** A run's timeline; refetched while the run is running and once when its status changes. */
 export function useRunTimeline(runId: string | undefined, status: RunStatus | undefined) {
   return useQuery({
     queryKey: ['run-timeline', runId, status],
-    queryFn: () => chartsApi.timeline(runId as string),
+    queryFn: () => api.runTimeline(runId as string),
     enabled: runId !== undefined,
     refetchInterval: status === 'running' ? 2000 : false,
     placeholderData: (prev) => (prev?.runId === runId ? prev : undefined),

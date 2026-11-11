@@ -3,16 +3,7 @@ import type { ConformanceViolation } from '@wattsim/csms';
 import { findingsBins } from '../src/analytics';
 import { FLEET_STATUSES, FleetAggregate } from '../src/fleet';
 import { Registry } from '../src/registry';
-import {
-  COARSE_CAPACITY,
-  EvseSeries,
-  effectiveStep,
-  MAX_BUCKETS,
-  MERGE_MS,
-  RAW_CAPACITY,
-  RAW_SPAN_MS,
-  StationSeries,
-} from '../src/series';
+import { CAPACITY, EvseSeries, effectiveStep, MAX_BUCKETS, MERGE_MS, StationSeries } from '../src/series';
 import type { SeriesSample } from '../src/types';
 
 const T0 = Date.UTC(2026, 9, 30, 8);
@@ -68,52 +59,29 @@ describe('EvseSeries ring buffer', () => {
     expect(q.limitKw).toEqual([null, null, null, null]);
   });
 
-  test('memory stays bounded however many samples arrive', () => {
+  test('the series keeps the last CAPACITY samples however many arrive', () => {
     const s = new EvseSeries(1);
-    let peak = 0;
-    for (let i = 0; i < 200_000; i++) {
-      s.record(sample(T0 + i * 1000, 5 + (i % 7)));
-      peak = Math.max(peak, s.bytes());
-    }
-    expect(s.size).toBeLessThanOrEqual(RAW_CAPACITY + COARSE_CAPACITY + 2);
-    // Columns: float64 time, 13 float32 values, one status byte per row, at capacity in both tiers.
-    const perRow = 8 + 13 * 4 + 1;
-    expect(peak).toBeLessThanOrEqual((RAW_CAPACITY + COARSE_CAPACITY) * perRow + 256);
-    expect(s.bytes()).toBe((RAW_CAPACITY + COARSE_CAPACITY) * perRow + 2 * (13 * 4 + 16));
+    const n = 3 * CAPACITY;
+    for (let i = 0; i < n; i++) s.record(sample(T0 + i * 1000, 5 + (i % 7)));
+    expect(s.size).toBe(CAPACITY);
+    expect(s.rawFrom).toBe(T0 + (n - CAPACITY) * 1000);
+    const all = s.query(T0, T0 + n * 1000, 0);
+    expect(all.t.length).toBe(CAPACITY);
+    expect(all.t[0]).toBe(T0 + (n - CAPACITY) * 1000);
+    expect(all.t.at(-1)).toBe(T0 + (n - 1) * 1000);
   });
 
-  test('an idle EVSE costs almost nothing', () => {
+  test('an idle EVSE keeps one sample', () => {
     const st = new StationSeries(2);
     for (let i = 0; i < 10_000; i++) for (const e of st.evses) e.record(sample(T0 + i * 1000, 0, { wh: 42 }));
-    expect(st.evses.every((e) => e.size === 1)).toBe(true);
-    expect(st.bytes()).toBeLessThanOrEqual(2 * 8 * 61);
-  });
-
-  test('samples older than the raw span move to the coarse tier, which keeps min and max per bucket', () => {
-    const s = new EvseSeries(1);
-    // One sample a minute for 12 h, 5 kW, with a 1-minute 48 kW spike and a Faulted dip to 0 kW in the first hours.
-    const spikeAt = T0 + 61 * MIN;
-    const dipAt = T0 + 133 * MIN;
-    for (let i = 0; i < 12 * 60; i++) {
-      const t = T0 + i * MIN;
-      if (t === spikeAt) s.record(sample(t, 48));
-      else if (t === dipAt) s.record(sample(t, 0, { status: 'Faulted' }));
-      else s.record(sample(t, 5 + (i % 2) * 0.5));
-    }
-    expect(s.rawFrom).toBeGreaterThanOrEqual(T0 + 12 * 60 * MIN - RAW_SPAN_MS - MIN);
-    const all = s.query(T0, T0 + 12 * 60 * MIN, 0);
-    expect(all.t.length).toBeLessThan(12 * 60);
-    expect(Math.max(...all.kw)).toBe(48);
-    expect(all.t[all.kw.indexOf(48)]).toBe(spikeAt);
-    expect(all.status).toContain('Faulted');
-    expect(all.t[all.status.indexOf('Faulted')]).toBe(dipAt);
+    expect(st.evses.every((e) => e.size === 1 && e.rawFrom === null)).toBe(true);
   });
 
   test('downsampling keeps the lowest and highest sample of every bucket, so spikes survive', () => {
     const s = new EvseSeries(1);
-    for (let i = 0; i < 3600; i++) s.record(sample(T0 + i * 1000, i === 1234 ? 50 : i === 2345 ? 0.5 : 7 + (i % 3)));
-    const q = s.query(T0, T0 + 3600_000, MIN);
-    expect(q.t.length).toBeLessThanOrEqual(2 * 60);
+    for (let i = 0; i < 1000; i++) s.record(sample(T0 + i * 1000, i === 234 ? 50 : i === 745 ? 0.5 : 7 + (i % 3)));
+    const q = s.query(T0, T0 + 1000_000, MIN);
+    expect(q.t.length).toBeLessThanOrEqual(2 * 17);
     expect(Math.max(...q.kw)).toBe(50);
     expect(Math.min(...q.kw)).toBe(0.5);
     // In time order.

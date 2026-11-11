@@ -3,10 +3,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
 import { toast } from 'sonner';
 import { useLive, useStore } from '@/state/live';
-import { api } from './http';
+import { api, errorText } from './http';
 import type { RunStatus, StartRunBody } from './types';
-
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export const useScenarios = () => useQuery({ queryKey: ['scenarios'], queryFn: api.scenarios });
 

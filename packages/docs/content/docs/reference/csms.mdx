@@ -28,24 +28,20 @@ From a checkout, import from `./packages/csms/src/index.ts` instead of `@wattsim
 |---|---|---|
 | `port` | `0` (a free port) | Port to listen on |
 | `host` | `127.0.0.1` | Interface to bind; `0.0.0.0` for chargers on the network |
-| `versions` | 1.6, 2.0.1 and 2.1 | Subprotocols accepted. The first one in the charger's offer that is in this list wins; a charger offering none gets HTTP 400 |
 | `clock` | wall clock | A core `VirtualClock` fits, for tests that step time |
 | `tls` | none | `{ cert, key, ca?, requestCert?, rejectUnauthorized?, passphrase? }` serves `wss://`. `requestCert` asks stations for a client certificate that must chain to `ca` (security profile 3) |
 | `basicAuth` | none | A password per identity, or a check function. The user name must be the identity, as in security profile 1; a failed check is HTTP 401 |
 | `heartbeatInterval` | `300` | BootNotification `interval`, in seconds |
-| `blockedIdTokens` | none | Tags answered `Blocked` in Authorize, StartTransaction and TransactionEvent |
 | `signer` | none | Signs CSRs: every accepted SignCertificate is followed by a CertificateSigned CALL carrying the chain it returns |
 | `topology` | none | EVSE layout per station, for the `topology.unknown-evse` rule. Unset, that rule only flags transactions on EVSE or connector 0 |
 | `callTimeoutMs` | `30000` | Timeout of CSMS-to-station CALLs |
-| `strict` | `true` | A reply that fails its own schema is not sent; the station gets `InternalError` |
-| `checker` | | Thresholds: `clockSkewMs` (5 min), `stationCallTimeoutMs` (30 s), `heartbeatMinFraction` (0.5), `bootRetrySlackMs` (1 s), `requireBoot` (true), `offlineDrainMs` (60 s, past timestamps this soon after a reconnect are not skew) |
 | `frameHistory` | `1000` | Frames kept per session |
 | `maxViolations` | `10000` | Violations kept in `csms.violations`; `report()` counts every one regardless |
 | `forgetAfterMs` | 1 hour | Forget the session of a station disconnected this long; it is checked like a new station if it comes back |
 
 ## Default behavior
 
-Out of the box the simulator answers every station-initiated action of 1.6 (with the security extension), 2.0.1 and 2.1 like a reasonable CSMS: BootNotification Accepted with `heartbeatInterval`, Authorize Accepted unless the token is in `blockedIdTokens`, StartTransaction with increasing transaction ids, TransactionEvent and notifications accepted, DataTransfer `UnknownVendorId`, SignCertificate Accepted.
+Out of the box the simulator answers every station-initiated action of 1.6 (with the security extension), 2.0.1 and 2.1 like a reasonable CSMS: BootNotification Accepted with `heartbeatInterval`, Authorize Accepted, StartTransaction with increasing transaction ids, TransactionEvent and notifications accepted, DataTransfer `UnknownVendorId`, SignCertificate Accepted.
 
 A session keeps its boot and transaction state across reconnects, since a 1.6 station does not boot again after a network drop.
 

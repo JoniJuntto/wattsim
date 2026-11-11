@@ -15,7 +15,6 @@ import { fallbacks as v21Fallbacks, schemas as v21Schemas, sendActions as v21Sen
 import { fallbacks as v201Fallbacks, schemas as v201Schemas } from '../generated/v201';
 import type { Direction } from '../src/validate';
 import type { OcppVersion } from '../src/version';
-import { schemaDir } from '../src/version';
 
 type Json = Record<string, unknown>;
 
@@ -77,6 +76,9 @@ function dummy(schema: Json): unknown {
   }
 }
 
+/** Schema directory under `schemas/` per version. */
+const SCHEMA_DIRS = { 'ocpp1.6': 'v16', 'ocpp2.0.1': 'v201', 'ocpp2.1': 'v21' } as const;
+
 /** `undefined` for the response of a SEND-only action: it has no schema file. */
 function fileFor(
   version: OcppVersion,
@@ -84,7 +86,7 @@ function fileFor(
   direction: Direction,
   sendActions: readonly string[],
 ): string | undefined {
-  const dir = schemaDir(version);
+  const dir = SCHEMA_DIRS[version];
   if (sendActions.includes(action))
     return direction === 'request' ? join(schemasRoot, dir, `${action}.json`) : undefined;
   const suffix = direction === 'response' ? 'Response' : dir === 'v16' ? '' : 'Request';
@@ -111,7 +113,7 @@ for (const { version, schemas, fallbacks, sendActions } of cases) {
     });
 
     test('every schema file has a generated counterpart', () => {
-      const files = readdirSync(join(schemasRoot, schemaDir(version))).filter((f) => f.endsWith('.json'));
+      const files = readdirSync(join(schemasRoot, SCHEMA_DIRS[version])).filter((f) => f.endsWith('.json'));
       // A SEND-only action has one file (its payload) but a request/response pair in the registry.
       const expected = files.length + sendActions.length;
       const generated = Object.keys(schemas).length * 2;

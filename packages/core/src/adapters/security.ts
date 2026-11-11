@@ -9,6 +9,7 @@
  */
 import type { CallFrame, v16, v201 } from '@wattsim/protocol';
 import type { CertificateSigningUse, ListedCertificateType, RootCertificateType, SecurityProfile } from '../security';
+import { triggered } from './shared';
 import type { CallOutcome, StationContext } from './types';
 
 type StatusInfo = { reasonCode: string; additionalInfo?: string };
@@ -68,7 +69,11 @@ export function handleSecurity16(st: StationContext, call: CallFrame): CallOutco
     case 'CertificateSigned': {
       const p = call.payload as v16.CertificateSignedRequest;
       return deferred(async () => {
-        const res = await st.security.acceptSigned(p.certificateChain, 'ChargingStationCertificate', st.clock.date());
+        const res = await st.security.acceptSigned(
+          p.certificateChain,
+          'ChargingStationCertificate',
+          new Date(st.clock.now()),
+        );
         if (!res.ok) {
           st.raiseSecurityEvent('InvalidChargingStationCertificate', res.reason);
           return { result: { status: 'Rejected' } satisfies v16.CertificateSignedResponse };
@@ -80,7 +85,11 @@ export function handleSecurity16(st: StationContext, call: CallFrame): CallOutco
     case 'InstallCertificate': {
       const p = call.payload as v16.InstallCertificateRequest;
       return deferred(async () => {
-        const res = await st.security.install(ROOT_TYPES_16[p.certificateType], p.certificate, st.clock.date());
+        const res = await st.security.install(
+          ROOT_TYPES_16[p.certificateType],
+          p.certificate,
+          new Date(st.clock.now()),
+        );
         if (res.status === 'Accepted') st.securityChanged();
         return { result: { status: res.status } satisfies v16.InstallCertificateResponse };
       });
@@ -112,37 +121,20 @@ export function handleSecurity16(st: StationContext, call: CallFrame): CallOutco
       if (evseId !== undefined && !st.evse(evseId)) {
         return { result: { status: 'Rejected' } satisfies v16.ExtendedTriggerMessageResponse };
       }
-      let after: () => Promise<unknown>;
-      switch (p.requestedMessage) {
-        case 'BootNotification':
-          after = () => st.boot('Triggered');
-          break;
-        case 'Heartbeat':
-          after = () => st.sendHeartbeat();
-          break;
-        case 'StatusNotification':
-          after = () => st.sendStatus(evseId);
-          break;
-        case 'MeterValues':
-          after = () => st.sendMeterValues(evseId);
-          break;
-        case 'SignChargePointCertificate':
-          after = () => sendSignCertificate(st, 'ChargingStationCertificate');
-          break;
-        default:
-          return { result: { status: 'NotImplemented' } satisfies v16.ExtendedTriggerMessageResponse };
-      }
-      return {
-        result: { status: 'Accepted' } satisfies v16.ExtendedTriggerMessageResponse,
-        after: async () => {
-          await after();
-        },
-      };
+      const after =
+        triggered(st, p.requestedMessage, evseId) ??
+        (p.requestedMessage === 'SignChargePointCertificate'
+          ? async () => {
+              await sendSignCertificate(st, 'ChargingStationCertificate');
+            }
+          : undefined);
+      if (!after) return { result: { status: 'NotImplemented' } satisfies v16.ExtendedTriggerMessageResponse };
+      return { result: { status: 'Accepted' } satisfies v16.ExtendedTriggerMessageResponse, after };
     }
     case 'SignedUpdateFirmware': {
       const p = call.payload as v16.SignedUpdateFirmwareRequest;
       return deferred(async () => {
-        const check = await st.security.checkFirmwareSigner(p.firmware.signingCertificate, st.clock.date());
+        const check = await st.security.checkFirmwareSigner(p.firmware.signingCertificate, new Date(st.clock.now()));
         if (!check.ok) {
           st.raiseSecurityEvent('InvalidFirmwareSigningCertificate', check.reason);
           return { result: { status: 'InvalidCertificate' } satisfies v16.SignedUpdateFirmwareResponse };
@@ -197,7 +189,7 @@ export function handleSecurity2x(st: StationContext, call: CallFrame): CallOutco
         };
       }
       return deferred(async () => {
-        const res = await st.security.acceptSigned(p.certificateChain, use, st.clock.date());
+        const res = await st.security.acceptSigned(p.certificateChain, use, new Date(st.clock.now()));
         if (!res.ok) {
           // A02/A03: a station certificate that fails the checks is reported as a security event.
           if (use === 'ChargingStationCertificate')
@@ -216,7 +208,11 @@ export function handleSecurity2x(st: StationContext, call: CallFrame): CallOutco
     case 'InstallCertificate': {
       const p = call.payload as v201.InstallCertificateRequest;
       return deferred(async () => {
-        const res = await st.security.install(p.certificateType as InstallUse201, p.certificate, st.clock.date());
+        const res = await st.security.install(
+          p.certificateType as InstallUse201,
+          p.certificate,
+          new Date(st.clock.now()),
+        );
         if (res.status === 'Rejected') {
           return {
             result: { status: 'Rejected', statusInfo: statusInfo('InvalidCertificate', res.reason) },
@@ -272,7 +268,7 @@ export function handleSecurity2x(st: StationContext, call: CallFrame): CallOutco
         };
       }
       return deferred(async () => {
-        const check = await st.security.checkFirmwareSigner(signer, st.clock.date());
+        const check = await st.security.checkFirmwareSigner(signer, new Date(st.clock.now()));
         if (!check.ok) {
           st.raiseSecurityEvent('InvalidFirmwareSigningCertificate', check.reason);
           return {

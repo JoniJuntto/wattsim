@@ -4,16 +4,14 @@ import { TypedEmitter } from '../src/index';
 type E = { ping: [number]; empty: [] };
 
 describe('TypedEmitter', () => {
-  test('on, once, off and listenerCount', () => {
+  test('on, once and off', () => {
     const em = new TypedEmitter<E>();
     const seen: number[] = [];
     const off = em.on('ping', (n) => seen.push(n));
     em.once('ping', (n) => seen.push(n * 10));
-    expect(em.listenerCount('ping')).toBe(2);
     expect(em.emit('ping', 1)).toBe(true);
     expect(em.emit('ping', 2)).toBe(true);
     expect(seen).toEqual([1, 10, 2]);
-    expect(em.listenerCount('ping')).toBe(1);
     off();
     expect(em.emit('ping', 3)).toBe(false);
     expect(em.emit('empty')).toBe(false);
@@ -28,9 +26,9 @@ describe('TypedEmitter', () => {
     });
     em.on('ping', () => seen.push('c'));
     expect(() => em.emit('ping', 1)).toThrow('boom');
-    expect(seen).toEqual(['a', 'c']);
     // listeners stay registered and emit keeps working
-    expect(em.listenerCount('ping')).toBe(3);
+    expect(() => em.emit('ping', 2)).toThrow('boom');
+    expect(seen).toEqual(['a', 'c', 'a', 'c']);
   });
 
   test('several throwing listeners surface as an AggregateError', () => {
@@ -57,7 +55,7 @@ describe('TypedEmitter', () => {
       throw new Error('boom');
     });
     expect(() => em.emit('ping', 1)).toThrow('boom');
-    expect(em.listenerCount('ping')).toBe(0);
+    expect(em.emit('ping', 2)).toBe(false);
   });
   test('listeners added or removed during an emit take effect from the next emit', () => {
     const em = new TypedEmitter<E>();
@@ -77,6 +75,5 @@ describe('TypedEmitter', () => {
     em.emit('ping', 2);
     em.emit('ping', 3);
     expect(seen).toEqual(['a1', 'b1', 'once1', 'a2', 'late2', 'lateOnce2', 'a3', 'late3']);
-    expect(em.listenerCount('ping')).toBe(2);
   });
 });

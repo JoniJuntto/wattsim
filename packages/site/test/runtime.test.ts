@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Station, VirtualClock } from '@wattsim/core';
-import { type Csms, connectInMemory, startCsms } from '@wattsim/csms';
+import { type Csms, startCsms } from '@wattsim/csms';
 import { dlmScore, type SiteDescription } from '@wattsim/grid';
 import { decodeValue, ModbusClient } from '@wattsim/modbus';
 import { type SiteRuntime, startSite } from '../src/index';
-import { drive, quiet, settle } from './helpers';
+import { collectSamples, drive, quiet, settle } from './helpers';
 
 const T0 = Date.parse('2026-06-01T00:00:00Z');
 const MIN = 60_000;
@@ -83,14 +83,13 @@ describe('evaluation on the clock', () => {
       },
       clock,
       loadStepMs: 5 * MIN,
-      keepSamples: true,
     });
+    const samples = collectSamples(rt);
     for (let h = 0; h < 24; h++) {
       if (h === 7 || h === 15) rt.setLoad('Kettle', { on: true });
       if (h === 8 || h === 16) rt.setLoad('Kettle', { on: false });
       await clock.advance(60 * MIN);
     }
-    const samples = rt.samples();
     expect(samples.length).toBeGreaterThan(200);
     expect(rt.scoreNow()).toEqual(dlmScore(samples));
     expect(rt.maxImbalance()).toBeGreaterThan(10);
@@ -114,13 +113,12 @@ describe('stations on the site', () => {
 
   test("a station's draw trips its breaker at the predicted instant; the reclose boots it again", async () => {
     const clock = new VirtualClock(T0);
-    csms = startCsms({ listen: false, clock });
+    csms = startCsms({ clock });
     rt = startSite({ site, clock });
     const st = new Station({
       id: 'CP-1',
       version: 'ocpp1.6',
       csmsUrl: csms.url,
-      socket: connectInMemory,
       clock,
       ...rt.hooks('CP-1'),
     });

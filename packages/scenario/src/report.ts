@@ -5,19 +5,12 @@
  */
 import type { RunResult } from './interpret';
 
-function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
+const esc = (s: string) => Bun.escapeHTML(s);
 
 const seconds = (ms: number) => (ms / 1000).toFixed(3);
 
 /** The DLM score as JUnit properties: `dlm.trips`, `dlm.energyWh`, ..., `dlm.node.<id>.peakUtilisationPct`, ... */
-export function dlmProperties(site: NonNullable<RunResult['site']>): Array<[string, string]> {
+function dlmProperties(site: NonNullable<RunResult['site']>): Array<[string, string]> {
   const s = site.score;
   const round = (x: number) => String(Math.round(x * 1000) / 1000);
   const out: Array<[string, string]> = [

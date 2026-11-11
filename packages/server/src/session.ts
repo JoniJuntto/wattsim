@@ -3,7 +3,7 @@
  * Text is emitted directly (not through the AST + formatter) because it only needs the stable surface syntax;
  * the tests parse the output with `@wattsim/scenario` to keep it honest.
  */
-import { formatDuration } from '@wattsim/scenario';
+import { DSL_VERSION, dslString, formatDuration } from '@wattsim/scenario';
 import type { OcppVersion } from './types';
 
 type Entry = { at: number; line: string };
@@ -17,43 +17,12 @@ type StationRecord = {
   entries: Entry[];
 };
 
-const DSL_VERSION: Record<OcppVersion, string> = { 'ocpp1.6': '1.6', 'ocpp2.0.1': '2.0.1', 'ocpp2.1': '2.1' };
-const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/** A DSL string literal. `{` starts an interpolation in the DSL, so it is escaped along with `"` and `\`. */
-export function dslString(s: string): string {
-  return `"${s
-    .replace(/[\\"{]/g, (c) => `\\${c}`)
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t')}"`;
-}
-
-/** Plain decimal digits, never exponent form: the DSL lexer reads no exponents. */
-export function dslNumber(n: number): string {
-  return n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 20 });
-}
-
-/** A JSON value in the DSL's payload syntax: strings always quoted (a bare word is a variable reference). */
-export function dslJson(v: unknown): string {
-  if (v === null || v === undefined) return 'null';
-  if (typeof v === 'string') return dslString(v);
-  if (typeof v === 'number') return Number.isFinite(v) ? dslNumber(v) : 'null';
-  if (typeof v === 'boolean') return String(v);
-  if (Array.isArray(v)) return `[${v.map(dslJson).join(', ')}]`;
-  if (typeof v === 'object') {
-    const entries = Object.entries(v as Record<string, unknown>).filter(([, x]) => x !== undefined);
-    return `{${entries.map(([k, x]) => `${IDENT_RE.test(k) ? k : dslString(k)}: ${dslJson(x)}`).join(', ')}}`;
-  }
-  return 'null';
-}
-
 /** One-line comment text: no line breaks can leak into the scenario. */
 function comment(text: string): string {
   return `// ${text.replace(/[\r\n]+/g, ' ')}`;
 }
 
-export type StationSetup = {
+type StationSetup = {
   id: string;
   version: OcppVersion;
   csmsUrl: string;

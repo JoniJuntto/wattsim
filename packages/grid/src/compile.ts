@@ -44,7 +44,7 @@ export class SiteValidationError extends Error {
   }
 }
 
-export type LimitKind = 'overcurrent' | 'cable-ampacity' | 'transformer-overload';
+type LimitKind = 'overcurrent' | 'cable-ampacity' | 'transformer-overload';
 
 /** A node after validation, in pre-order (a parent always comes before its children). */
 export type CNode = {
@@ -53,7 +53,6 @@ export type CNode = {
   kind: NodeKind;
   desc: NodeDescription;
   parent: number;
-  depth: number;
   children: number[];
   leaf: boolean;
   /** Site phases carried (nodes) or wired (leaves, as a set). */
@@ -123,7 +122,7 @@ export function compileSite(desc: SiteDescription): { site?: CompiledSite; issue
   const nodes: CNode[] = [];
   const ids = new Map<string, string>();
 
-  const visit = (d: NodeDescription, path: string, parent: number, parentPhases: Phase[], depth: number) => {
+  const visit = (d: NodeDescription, path: string, parent: number, parentPhases: Phase[]) => {
     if (!d || typeof d !== 'object') {
       add(path, 'node must be an object');
       return;
@@ -147,7 +146,6 @@ export function compileSite(desc: SiteDescription): { site?: CompiledSite; issue
       kind,
       desc: d,
       parent,
-      depth,
       children: [],
       leaf,
       carried: parentPhases,
@@ -368,7 +366,7 @@ export function compileSite(desc: SiteDescription): { site?: CompiledSite; issue
       case 'load':
         if (d.ratedW !== undefined) need('ratedW', d.ratedW);
         if (d.model !== undefined) {
-          if (!['constant', 'profile', 'daily', 'shape'].includes(d.model?.type)) {
+          if (!['constant', 'profile', 'shape'].includes(d.model?.type)) {
             add(`${path}.model.type`, `unknown load model "${String(d.model?.type)}"`, id);
           } else {
             try {
@@ -417,14 +415,14 @@ export function compileSite(desc: SiteDescription): { site?: CompiledSite; issue
       if (!Array.isArray(d.children)) add(`${path}.children`, 'children must be an array', id);
       else {
         d.children.forEach((c, i) => {
-          visit(c, `${path}.children[${i}]`, n.index, n.carried, depth + 1);
+          visit(c, `${path}.children[${i}]`, n.index, n.carried);
         });
       }
     }
   };
 
   desc.nodes.forEach((d, i) => {
-    visit(d, `nodes[${i}]`, -1, supplyPhases, 0);
+    visit(d, `nodes[${i}]`, -1, supplyPhases);
   });
   if (issues.length > 0) return { issues };
   return {

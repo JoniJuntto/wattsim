@@ -14,7 +14,6 @@ import {
   newConnectionState,
   newSessionState,
   recordStationCall,
-  registers2x,
   startConnection,
 } from '../src/conformance';
 import { defaultReply } from '../src/defaults';
@@ -60,7 +59,6 @@ function harness(version: OcppVersion, cfg: Partial<CheckerConfig> = {}) {
                 now: iso(now),
                 nowMs: now,
                 heartbeatInterval: 300,
-                blocked: new Set(),
                 nextTransactionId: () => txId++,
               })
             : reply;
@@ -767,10 +765,6 @@ describe('meter.backwards', () => {
     expect(
       h.call('MeterValues', { connectorId: 1, transactionId: 1, meterValue: [mv16('1.5', h.now, 'kWh')] }),
     ).toEqual([]);
-    const readings = registers2x([
-      { timestamp: iso(T0), sampledValue: [{ value: 2, unitOfMeasure: { unit: 'kWh', multiplier: 1 } }] },
-    ]);
-    expect(readings).toEqual([{ key: '|Outlet', wh: 20_000 }]);
   });
 
   test('1.6: a whole-Wh meterStop or reading may sit less than 1 Wh below a finer reading', () => {

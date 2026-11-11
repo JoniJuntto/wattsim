@@ -126,11 +126,6 @@ export class StationSecurity {
     return this.stationCert !== undefined;
   }
 
-  /** PEM of the installed station certificate chain, if any. */
-  get stationCertificate(): string | undefined {
-    return this.stationCert?.chainPem;
-  }
-
   /** Installed root PEMs of one type. */
   rootsOf(type: RootCertificateType): readonly string[] {
     return this.roots.get(type) ?? [];
@@ -169,11 +164,6 @@ export class StationSecurity {
     const keys = await pki.generateKeyPair(this.keyType);
     this.pendingKeys.set(use, keys);
     return pki.createCsr(keys, { commonName, organization: this.organization });
-  }
-
-  /** Whether a CSR for `use` awaits its certificate. */
-  awaitingCertificate(use: CertificateSigningUse): boolean {
-    return this.pendingKeys.has(use);
   }
 
   /**
@@ -248,19 +238,16 @@ export class StationSecurity {
   }
 
   /** GetInstalledCertificateIds: every installed certificate of `types` (all types when omitted). */
-  async list(
-    types?: readonly ListedCertificateType[],
-    hashAlgorithm: Pki.HashAlgorithm = 'SHA256',
-  ): Promise<InstalledCertificate[]> {
+  async list(types?: readonly ListedCertificateType[]): Promise<InstalledCertificate[]> {
     const pki = await loadPki();
     const want = (t: ListedCertificateType) => !types || types.length === 0 || types.includes(t);
     const out: InstalledCertificate[] = [];
     for (const [type, list] of this.roots) {
       if (!want(type)) continue;
-      for (const pem of list) out.push({ type, hashData: pki.certificateHashData(pem, undefined, hashAlgorithm) });
+      for (const pem of list) out.push({ type, hashData: pki.certificateHashData(pem) });
     }
     if (this.v2gChain && want('V2GCertificateChain')) {
-      const [leaf, ...children] = this.chainHashes(pki, this.v2gChain.chainPem, hashAlgorithm);
+      const [leaf, ...children] = this.chainHashes(pki, this.v2gChain.chainPem, 'SHA256');
       if (leaf) {
         const entry: InstalledCertificate = { type: 'V2GCertificateChain', hashData: leaf };
         if (children.length > 0) entry.childHashData = children;

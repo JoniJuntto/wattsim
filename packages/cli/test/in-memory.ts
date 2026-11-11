@@ -1,13 +1,12 @@
 /**
- * Spawning `wattsim` for tests with its stations on the in-memory transport (see `in-memory-preload.ts`): pass
- * `--csms ${MEMORY_CSMS}/...` to reach the `FakeCsms` that lives in the child, and read what it received with
- * `calls`. No TCP socket is opened unless the test asks for one (a `--metrics` port, a CSMS of its own).
+ * Spawning `wattsim` for tests with a `FakeCsms` in the child (see `in-memory-preload.ts`): pass
+ * `--csms ${MEMORY_CSMS}/...` to reach it, and read what it received with `calls`.
  */
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-/** Where the child's in-memory `FakeCsms` listens. */
+/** The URL the preload redirects to the child's `FakeCsms` (no DNS resolves it, so nothing else answers). */
 export const MEMORY_CSMS = 'ws://wattsim-cli-test.invalid';
 
 const PRELOAD = new URL('./in-memory-preload.ts', import.meta.url).pathname;

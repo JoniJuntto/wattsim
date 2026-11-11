@@ -7,9 +7,12 @@
  */
 
 import type { TestCa } from '@wattsim/pki';
-import { cannedEv15118Response, ocspResponse, signCsr } from '@wattsim/pki';
+import { ocspResponse, signCsr } from '@wattsim/pki';
 import type { CallFrame, Frame, OcppVersion, Violation } from '@wattsim/protocol';
 import { decodeFrame, encodeFrame, isOcppVersion, MessageType, newMessageId, validatePayload } from '@wattsim/protocol';
+
+/** Base64 of the ASCII text `wattsim-canned-15118-exi`: recognisable, and not a real EXI stream. */
+export const CANNED_EXI = Buffer.from('wattsim-canned-15118-exi').toString('base64');
 
 type SocketData = { identity: string; protocol: OcppVersion; authorization: string | undefined };
 type Socket = Bun.ServerWebSocket<SocketData>;
@@ -195,7 +198,7 @@ export class SecureCsms {
           return { status: 'Accepted', ocspResult: await ocspResponse(ca, req, this.opts.now?.()) };
         };
       case 'Get15118EVCertificate':
-        return () => cannedEv15118Response(protocol !== 'ocpp1.6');
+        return () => ({ status: 'Accepted', exiResponse: CANNED_EXI });
       default:
         return undefined;
     }

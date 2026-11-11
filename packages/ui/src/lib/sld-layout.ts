@@ -64,7 +64,7 @@ export type LayoutOptions = {
 };
 
 /** Column widths. */
-export const COL = { ev: 44, leaf: 76, group: 136, device: 76, board: 104 } as const;
+const COL = { ev: 44, leaf: 76, group: 136, device: 76, board: 104 } as const;
 /** Heights of each symbol's box, full and compact. */
 const H: Record<SldKind, number> = {
   supply: 52,
@@ -83,8 +83,8 @@ const H: Record<SldKind, number> = {
 };
 const H_COMPACT: Partial<Record<SldKind, number>> = { breaker: 52, fuse: 50, cable: 28, meter: 44, transformer: 58 };
 /** Wire between two items. */
-export const GAP = 16;
-export const MARGIN = 16;
+const GAP = 16;
+const MARGIN = 16;
 /** Room a right-hand label takes from the symbol's centre. */
 const LABEL_RIGHT = 132;
 const SYMBOL_HALF = 16;
@@ -293,20 +293,4 @@ export function layoutSld(desc: SiteDescription, opts: LayoutOptions = {}): SldL
   const width = Math.max(measure(root, memo) + 2 * MARGIN, ...items.map((i) => i.x1 + MARGIN));
   const height = Math.max(...items.map((i) => i.y + i.h)) + MARGIN;
   return { width, height, items, wires, grouped: [...fold].filter((id) => items.some((i) => i.busId === id)) };
-}
-
-/** Pairs of items whose boxes overlap (for tests and debugging); empty for a good layout. */
-export function overlaps(layout: SldLayout): Array<[string, string]> {
-  const out: Array<[string, string]> = [];
-  const it = layout.items;
-  for (let a = 0; a < it.length; a++) {
-    for (let b = a + 1; b < it.length; b++) {
-      const p = it[a] as SldItem;
-      const q = it[b] as SldItem;
-      const x = Math.min(p.x1, q.x1) - Math.max(p.x0, q.x0);
-      const y = Math.min(p.y + p.h, q.y + q.h) - Math.max(p.y, q.y);
-      if (x > 0.5 && y > 0.5) out.push([p.id, q.id]);
-    }
-  }
-  return out;
 }

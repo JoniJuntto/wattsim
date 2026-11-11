@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { CallFrame, CallResultFrame } from '@wattsim/protocol';
-import { ChaosEngine, isFault, lcg } from '../src/index';
+import { ChaosEngine, lcg } from '../src/index';
 
 function call(action: string, id = 'm1'): CallFrame {
   return { type: 2, id, action, payload: {} };
@@ -210,20 +210,18 @@ describe('ChaosEngine: milestone-4 faults', () => {
   test('protocol faults match outbound frames only, even without a direction', () => {
     const engine = new ChaosEngine();
     engine.add({ match: { action: 'Heartbeat' }, effect: { kind: 'missingField' }, once: true });
-    expect(engine.decide('in', call('Heartbeat')).fault).toBeUndefined();
+    expect(engine.decide('in', call('Heartbeat')).effect).toBeNull();
     const d = engine.decide('out', call('Heartbeat'));
-    expect(d.effect).toBeNull();
-    expect(d.fault).toEqual({ kind: 'missingField' });
+    expect(d.effect).toEqual({ kind: 'missingField' });
     expect(engine.size).toBe(0); // the inbound frame did not spend `once`
   });
 
-  test('a non-delay fault is reported in `fault` and composes with a delay declared before it', () => {
+  test('a non-delay fault composes with a delay declared before it', () => {
     const engine = new ChaosEngine(lcg(1));
     engine.add({ id: 'net', match: {}, effect: { kind: 'jitter', minMs: 10, maxMs: 10 } });
     engine.add({ id: 'r', match: { direction: 'in' }, effect: { kind: 'reorder', after: 2 } });
     const d = engine.decide('in', result());
-    expect(d.effect).toBeNull();
-    expect(d.fault).toEqual({ kind: 'reorder', after: 2 });
+    expect(d.effect).toEqual({ kind: 'reorder', after: 2 });
     expect(d.rule?.id).toBe('r');
     expect(d.delayed).toEqual({ ms: 10, rule: expect.objectContaining({ id: 'net' }) });
     // First match among the other faults: an older rule wins over a newer one.
@@ -250,13 +248,6 @@ describe('ChaosEngine: milestone-4 faults', () => {
     expect(
       engine.decide('out', { type: 4, id: 'e', code: 'InternalError', description: '', details: {} }).effect,
     ).toBeNull();
-  });
-
-  test('isFault tells milestone-4 faults from the original effects', () => {
-    expect(isFault({ kind: 'drop' })).toBe(false);
-    expect(isFault({ kind: 'mutate', fn: (p) => p })).toBe(false);
-    expect(isFault({ kind: 'halfOpen' })).toBe(true);
-    expect(isFault({ kind: 'oversized', bytes: 10 })).toBe(true);
   });
 });
 

@@ -1,4 +1,4 @@
-import type { Device, RegisterMap } from './map';
+import type { Device, RegisterEntry, RegisterMap } from './map';
 import { em24 } from './maps/em24';
 import { generic } from './maps/generic';
 import { sdm630 } from './maps/sdm630';
@@ -57,24 +57,44 @@ export function parseConstants(text: string): Partial<MeterReading> {
   return out;
 }
 
-/** The map as a Markdown table (FC 04 table, then FC 03 when it differs). */
+const hex = (n: number) => `0x${n.toString(16).toUpperCase().padStart(4, '0')}`;
+
+/** Text for a Markdown table cell: no newlines, pipes escaped. */
+const cell = (text: string) => text.replace(/\s*\n\s*/g, ' ').replace(/\|/g, '\\|');
+
+/** Where a register's value comes from, in words. */
+function registerSource(e: RegisterEntry): string {
+  if (e.writable) {
+    const initial = typeof e.writable.initial === 'number' ? `, default ${e.writable.initial}` : '';
+    return e.writable.command ? `command \`${e.key}\`` : `writable \`${e.key}\`${initial}`;
+  }
+  if (typeof e.value === 'string') return `\`${e.value}\``;
+  if (typeof e.value === 'number') return `constant ${e.value}`;
+  if (typeof e.value === 'function') return 'derived';
+  return '0';
+}
+
+/** One register table as Markdown, by address. */
+export function registerTable(entries: readonly RegisterEntry[]): string {
+  const rows = [...entries]
+    .sort((a, b) => a.address - b.address)
+    .map(
+      (e) =>
+        `| ${hex(e.address)} | ${e.address} | ${e.type} | ${e.scale ? `×${e.scale}` : ''} | ${cell(e.name)}${e.alone ? ' (one-register read only)' : ''} | ${cell(e.unit ?? '')} | ${registerSource(e)} |`,
+    );
+  return ['| Address | Dec | Type | Scale | Name | Unit | Value |', '|---|---|---|---|---|---|---|', ...rows].join(
+    '\n',
+  );
+}
+
+/** The map as Markdown: title, source, then its register table(s) (FC 04, and FC 03 when it differs). */
 export function describeMap(map: RegisterMap): string {
-  const rows = (entries: RegisterMap['input']) =>
-    [...entries]
-      .sort((a, b) => a.address - b.address)
-      .map((e) => {
-        const addr = `0x${e.address.toString(16).toUpperCase().padStart(4, '0')}`;
-        const src = e.writable ? `write (\`${e.key}\`)` : typeof e.value === 'string' ? `\`${e.value}\`` : '';
-        return `| ${addr} | ${e.address} | ${e.type} | ${e.scale ? `×${e.scale}` : ''} | ${e.name} | ${e.unit ?? ''} | ${src} |`;
-      });
-  const head = '| Address | Dec | Type | Scale | Name | Unit | Value |\n|---|---|---|---|---|---|---|';
   const parts = [`${map.title}. Word order: ${map.wordOrder === 'msw' ? 'most' : 'least'} significant register first.`];
   parts.push(`Source: ${map.source}`);
-  if (map.input === map.holding) {
-    parts.push(`FC 03 and FC 04 read the same registers.\n\n${head}\n${rows(map.input).join('\n')}`);
-  } else {
-    parts.push(`Input registers (FC 04):\n\n${head}\n${rows(map.input).join('\n')}`);
-    parts.push(`Holding registers (FC 03):\n\n${head}\n${rows(map.holding).join('\n')}`);
+  if (map.input === map.holding) parts.push(`FC 03 and FC 04 read the same registers.\n\n${registerTable(map.input)}`);
+  else {
+    parts.push(`Input registers (FC 04):\n\n${registerTable(map.input)}`);
+    parts.push(`Holding registers (FC 03):\n\n${registerTable(map.holding)}`);
   }
   return parts.join('\n\n');
 }

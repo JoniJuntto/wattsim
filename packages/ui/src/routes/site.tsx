@@ -18,7 +18,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { ApiError, api, downloads } from '@/api/http';
+import { ApiError, api, downloads, errorText } from '@/api/http';
 import type {
   Allocation,
   NodeInfo,
@@ -73,22 +73,6 @@ import { layoutSld } from '@/lib/sld-layout';
 import { cn } from '@/lib/utils';
 import { siteRoute } from '@/router';
 import { useLive, useStore } from '@/state/live';
-
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
-function useReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(
-    () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false,
-  );
-  useEffect(() => {
-    const m = window.matchMedia?.('(prefers-reduced-motion: reduce)');
-    if (!m) return;
-    const on = () => setReduced(m.matches);
-    m.addEventListener('change', on);
-    return () => m.removeEventListener('change', on);
-  }, []);
-  return reduced;
-}
 
 /** Loads the site list into the live store (again after every stream snapshot). */
 export function useSites() {
@@ -223,7 +207,6 @@ function SiteView({
   const topo = detail.topology;
   const desc = useMemo(() => descriptionIndex(topo.description), [topo.description]);
   const info = useMemo(() => new Map<string, NodeInfo>(topo.nodes.map((n) => [n.id, n])), [topo.nodes]);
-  const reduced = useReducedMotion();
   const filter = search.phase ?? 'all';
   const current = liveState?.live ?? null;
 
@@ -417,7 +400,7 @@ function SiteView({
       <div className="grid min-h-0 flex-1 grid-cols-1 xl:grid-cols-[minmax(0,1fr)_23rem]">
         <section aria-label="Single-line diagram" className="flex min-w-0 flex-col border-b xl:border-r xl:border-b-0">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 pt-2 text-[11px] text-muted-foreground sm:px-4">
-            <SldLegend reduced={reduced} />
+            <SldLegend />
           </div>
           <div ref={sldBox} className="min-w-0 overflow-x-auto px-1 pb-2">
             <Sld
@@ -430,7 +413,6 @@ function SiteView({
               selected={selected}
               onSelect={(id) => setSearch({ node: id === selected ? undefined : id })}
               onToggleGroup={toggleGroup}
-              reducedMotion={reduced}
               limits={limits}
               scale={scale}
             />
@@ -545,7 +527,7 @@ function ModeBadge({ live, following, onLive }: { live: boolean; following: bool
   );
 }
 
-function SldLegend({ reduced }: { reduced: boolean }) {
+function SldLegend() {
   const swatch = (color: string, w = 3) => (
     <span className="inline-block h-[3px] w-4 rounded-full" style={{ background: color, height: w }} />
   );
@@ -558,7 +540,8 @@ function SldLegend({ reduced }: { reduced: boolean }) {
         <span className="inline-block w-4 border-[var(--load-dead)] border-t border-dashed" /> no power
       </span>
       <span>
-        Line weight: current. {reduced ? 'Arrows: direction of flow.' : 'Moving dashes: power, upwards for export.'}
+        Line weight: current. <span className="motion-reduce:hidden">Moving dashes: power, upwards for export.</span>
+        <span className="motion-safe:hidden">Arrows: direction of flow.</span>
       </span>
       <span className="flex items-center gap-1">
         {(['L1', 'L2', 'L3'] as Phase[]).map((p, k) => (

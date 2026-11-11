@@ -8,7 +8,7 @@ import { MEMORY_CSMS, runInMemory, spawnInMemory } from './in-memory';
 const repoRoot = new URL('../../..', import.meta.url).pathname;
 const basicFixture = join(repoRoot, 'packages/scenario/test/fixtures/basic.ws');
 
-/** `wattsim` in a child process whose stations reach its in-memory CSMS at `MEMORY_CSMS` (see in-memory.ts). */
+/** `wattsim` in a child process whose stations reach its own `FakeCsms` at `MEMORY_CSMS` (see in-memory.ts). */
 const cli = (...args: string[]) => runInMemory('packages/cli/src/index.ts', args);
 
 const scratch = await mkdtemp(join(tmpdir(), 'wattsim-cli-'));

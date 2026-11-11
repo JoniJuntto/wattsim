@@ -2,12 +2,7 @@ import type { OcppVersion } from '@wattsim/protocol';
 import type { ReplayMismatch, TraceEntry } from '@wattsim/trace';
 import { normalizeVersion, readTrace, replay as replayTrace, TraceFormatError, toScenario } from '@wattsim/trace';
 import { defineCommand } from 'citty';
-import { err, out } from '../load';
-
-async function badInput(message: string): Promise<never> {
-  await err(`${message}\n`);
-  process.exit(2);
-}
+import { fail, out } from '../load';
 
 /** `NEW` (a trace with one identity) or `OLD=NEW[,OLD=NEW...]`. */
 function parseIdentityMap(raw: string, identities: string[]): Record<string, string> | string {
@@ -66,24 +61,24 @@ export const replay = defineCommand({
     let version: OcppVersion | undefined;
     if (args.version !== undefined) {
       version = normalizeVersion(args.version);
-      if (!version) await badInput(`invalid --version: ${args.version} (1.6, 2.0.1 or 2.1)`);
+      if (!version) await fail(2, `invalid --version: ${args.version} (1.6, 2.0.1 or 2.1)`);
     }
     let trace: TraceEntry[];
     try {
       trace = await readTrace(args.trace, { version });
     } catch (e) {
-      if (e instanceof TraceFormatError) await badInput(String(e));
-      await badInput(`cannot read ${args.trace}: ${e instanceof Error ? e.message : String(e)}`);
+      if (e instanceof TraceFormatError) await fail(2, String(e));
+      await fail(2, `cannot read ${args.trace}: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
-    if (trace.length === 0) await badInput(`${args.trace}: the trace is empty`);
+    if (trace.length === 0) await fail(2, `${args.trace}: the trace is empty`);
 
     if (args.export !== undefined) {
       let ws: string;
       try {
         ws = toScenario(trace, { csmsUrl: args.csms, version });
       } catch (e) {
-        await badInput(`${args.trace}: ${e instanceof Error ? e.message : String(e)}`);
+        await fail(2, `${args.trace}: ${e instanceof Error ? e.message : String(e)}`);
         return;
       }
       if (args.export === '-') await out(ws);
@@ -91,28 +86,28 @@ export const replay = defineCommand({
       process.exit(0);
     }
 
-    if (!args.csms) await badInput('no CSMS URL: pass --csms');
+    if (!args.csms) await fail(2, 'no CSMS URL: pass --csms');
     const speed = args.speed === undefined ? undefined : Number(args.speed);
-    if (speed !== undefined && !(Number.isFinite(speed) && speed > 0)) await badInput(`invalid --speed: ${args.speed}`);
+    if (speed !== undefined && !(Number.isFinite(speed) && speed > 0)) await fail(2, `invalid --speed: ${args.speed}`);
     const timeoutS = args.timeout === undefined ? undefined : Number(args.timeout);
     if (timeoutS !== undefined && !(Number.isFinite(timeoutS) && timeoutS > 0)) {
-      await badInput(`invalid --timeout: ${args.timeout}`);
+      await fail(2, `invalid --timeout: ${args.timeout}`);
     }
     const settleS = args.settle === undefined ? undefined : Number(args.settle);
     if (settleS !== undefined && !(Number.isFinite(settleS) && settleS >= 0)) {
-      await badInput(`invalid --settle: ${args.settle}`);
+      await fail(2, `invalid --settle: ${args.settle}`);
     }
     let basicAuth: { user: string; password: string } | undefined;
     if (args.auth !== undefined) {
       const i = args.auth.indexOf(':');
-      if (i < 1) await badInput('invalid --auth (expected user:password)');
+      if (i < 1) await fail(2, 'invalid --auth (expected user:password)');
       basicAuth = { user: args.auth.slice(0, i), password: args.auth.slice(i + 1) };
     }
     let identityMap: Record<string, string> | undefined;
     if (args.identity !== undefined) {
       const identities = [...new Set(trace.map((e) => e.identity))];
       const parsed = parseIdentityMap(args.identity, identities);
-      if (typeof parsed === 'string') await badInput(parsed);
+      if (typeof parsed === 'string') await fail(2, parsed);
       identityMap = parsed as Record<string, string>;
     }
 

@@ -13,7 +13,6 @@ import {
   TariffStore,
   TransactionCost,
   tariffProblem,
-  wallToUtc,
 } from '../src/index';
 
 const HKI = 'Europe/Helsinki';
@@ -44,16 +43,6 @@ function schemaProblems(details: CostDetails): string[] {
 }
 
 describe('local time', () => {
-  test('wall time to UTC around the Helsinki spring DST change (last Sunday of March)', () => {
-    // 2026-03-29 03:00 EET -> 04:00 EEST, at 01:00 UTC.
-    expect(wallToUtc(at('2026-03-29T02:30:00Z'), HKI)).toBe(at('2026-03-29T00:30:00Z'));
-    expect(wallToUtc(at('2026-03-29T04:00:00Z'), HKI)).toBe(at('2026-03-29T01:00:00Z'));
-    // 03:30 does not exist that night: the first instant past it is the jump.
-    expect(wallToUtc(at('2026-03-29T03:30:00Z'), HKI)).toBe(at('2026-03-29T01:00:00Z'));
-    // Autumn: 03:30 happens twice on 2026-10-25; the first is in summer time.
-    expect(wallToUtc(at('2026-10-25T03:30:00Z'), HKI)).toBe(at('2026-10-25T00:30:00Z'));
-  });
-
   test('localTime gives date, minutes and weekday in the zone', () => {
     const l = localTime(at('2026-03-28T22:30:00Z'), HKI); // 00:30 EET on Sunday the 29th
     expect(l.date).toBe('2026-03-29');

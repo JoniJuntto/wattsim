@@ -108,22 +108,6 @@ export function pairFrames(frames: readonly FrameEvent[], opts: PairOptions = {}
   return { partner, latencyMs, callNotKept };
 }
 
-export type FrameFilter = { action?: string; dir?: 'in' | 'out'; text?: string };
-
-/** Indices of `frames` that pass the filter. Text matches action, message id and the raw frame, case-insensitively. */
-export function filterFrames(frames: readonly FrameEvent[], filter: FrameFilter): number[] {
-  const text = filter.text?.trim().toLowerCase();
-  const out: number[] = [];
-  for (let i = 0; i < frames.length; i++) {
-    const f = frames[i] as FrameEvent;
-    if (filter.dir && f.dir !== filter.dir) continue;
-    if (filter.action && f.action !== filter.action) continue;
-    if (text && !f.raw.toLowerCase().includes(text) && !(f.action ?? '').toLowerCase().includes(text)) continue;
-    out.push(i);
-  }
-  return out;
-}
-
 /** Distinct actions seen in the log, sorted, for the action filter. */
 export function actionsIn(frames: readonly FrameEvent[]): string[] {
   const set = new Set<string>();

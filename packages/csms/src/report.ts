@@ -40,26 +40,10 @@ export function addToReport(r: ConformanceReport, v: ConformanceViolation): void
   station.byRule[v.rule] = (station.byRule[v.rule] ?? 0) + 1;
 }
 
-/** Summarise `violations`. `identities` adds stations with no violations, so they show up as clean. */
-export function buildReport(
-  violations: readonly ConformanceViolation[],
-  identities: readonly string[] = [],
-): ConformanceReport {
-  const r = emptyReport();
-  r.violations = [...violations];
-  for (const id of identities) r.byIdentity[id] = { ...tally(), byRule: {} };
-  for (const v of violations) addToReport(r, v);
-  return r;
-}
+const XML_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
 
-function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
+/** Also runs under Node (the VS Code language server bundles this package), so no `Bun.escapeHTML`. */
+const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => XML_ESCAPES[c] as string);
 
 function line(v: ConformanceViolation): string {
   return `[${v.rule}] ${v.message} (${v.specRef}${v.frameId ? `, frame ${v.frameId}` : ''})`;

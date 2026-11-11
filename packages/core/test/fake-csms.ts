@@ -1,28 +1,16 @@
 /**
- * In-repo CSMS test double. Negotiates the OCPP subprotocol from `Sec-WebSocket-Protocol`, takes the identity from
- * the last URL path segment, records every frame it receives and auto-replies to the common station-initiated
- * actions.
- *
- * By default it is reachable only in memory: pass `socket: csms.connect` to the station or connection (its `url`
- * is a `ws://memory-N.invalid` that no real socket reaches). `listen: true` also serves it on `Bun.serve`, for tests
- * whose subject is the network. Delivery is asynchronous either way, so tests pair this with `until()` and drive
- * every timer through a `VirtualClock`.
+ * In-repo CSMS test double on `Bun.serve` (127.0.0.1, a free port). Negotiates the OCPP subprotocol from
+ * `Sec-WebSocket-Protocol`, takes the identity from the last URL path segment, records every frame it receives and
+ * auto-replies to the common station-initiated actions. Socket delivery is real I/O, so tests pair this with
+ * `until()` and drive every timer through a `VirtualClock`.
  */
 import type { CallErrorFrame, CallFrame, Frame, OcppVersion } from '@wattsim/protocol';
-import { decodeFrame, encodeFrame, isOcppVersion, MessageType, newMessageId } from '@wattsim/protocol';
-import type { MemoryEndpoint, MemorySocket } from '../../csms/src/index';
-import { connectMemory, listenInMemory } from '../../csms/src/index';
+import { decodeFrame, encodeFrame, isOcppVersion, MessageType } from '@wattsim/protocol';
 import type { Clock } from '../src/index';
 import { isoTimestamp, WallClock } from '../src/index';
 
 type SocketData = { identity: string; protocol: OcppVersion; authorization: string | undefined };
-/** A `Bun.ServerWebSocket` or the in-memory transport's server end. */
-type Socket = {
-  readonly data: SocketData;
-  readonly readyState: number;
-  send(raw: string): unknown;
-  close(code?: number, reason?: string): void;
-};
+type Socket = Bun.ServerWebSocket<SocketData>;
 
 /** Return this from a responder to make the CSMS answer with a CALLERROR instead of a CALLRESULT. */
 export class CsmsCallError {
@@ -40,11 +28,7 @@ export class CsmsCallError {
 export type Responder = (payload: unknown, identity: string) => unknown | Promise<unknown>;
 
 export type FakeCsmsOptions = {
-  /** Also listen on TCP (127.0.0.1); default false: in memory only, through `connect`. */
-  listen?: boolean;
-  /** Without `listen`: the in-memory URL (only its origin counts); default a fresh `ws://memory-N.invalid`. */
-  url?: string;
-  /** With `listen`: 0 (default) picks a free port. */
+  /** 0 (default) picks a free port. */
   port?: number;
   /** Only accept this subprotocol; default accepts any supported OCPP version the client offers. */
   version?: OcppVersion;
@@ -58,13 +42,7 @@ type PendingCall = { resolve: (v: unknown) => void; reject: (e: Error) => void }
 
 export class FakeCsms {
   readonly url: string;
-  /** 0 unless `listen`. */
   readonly port: number;
-  /**
-   * Socket factory for `StationConfig.socket` / `ConnectionOptions.socket`: an in-memory connection to this CSMS
-   * with the same handshake as over TCP. Ignores the URL's host.
-   */
-  readonly connect: (url: string, protocols?: string[], headers?: Record<string, string>) => MemorySocket;
   /** Every decodable frame received, from all clients, in arrival order. */
   readonly received: Frame[] = [];
   /** Raw messages that failed to decode as OCPP-J frames. */
@@ -72,8 +50,7 @@ export class FakeCsms {
   /** Every frame this CSMS sent, in send order. */
   readonly sent: Frame[] = [];
 
-  private readonly server: Bun.Server<SocketData> | undefined;
-  private readonly unlisten: () => void;
+  private readonly server: Bun.Server<SocketData>;
   private readonly clock: Clock;
   private readonly autoReply: boolean;
   private readonly byIdentity = new Map<string, Frame[]>();
@@ -81,7 +58,6 @@ export class FakeCsms {
   private readonly responders = new Map<string, Responder>();
   private readonly pendingCalls = new Map<string, PendingCall>();
   private nextTransactionId = 1;
-  private stopped = false;
 
   private constructor(opts: FakeCsmsOptions) {
     this.clock = opts.clock ?? new WallClock();
@@ -111,25 +87,9 @@ export class FakeCsms {
         this.onMessage(ws, raw);
       },
     };
-    const memory: MemoryEndpoint<SocketData> = {
-      upgrade: (req) => {
-        if (this.stopped) return null;
-        const r = upgrade(req.url, req.headers);
-        return r instanceof Response ? { status: r.status } : { data: r, protocol: r.protocol };
-      },
-      ...handlers,
-    };
-    this.connect = (url, protocols = [], headers = {}) => connectMemory(memory, url, protocols, headers);
-    if (!opts.listen) {
-      this.server = undefined;
-      this.port = 0;
-      const listening = listenInMemory(memory, opts.url);
-      this.url = listening.url;
-      this.unlisten = listening.close;
-      return;
-    }
     this.server = Bun.serve<SocketData>({
       port: opts.port ?? 0,
+      hostname: '127.0.0.1',
       fetch: (req, server) => {
         const data = upgrade(new URL(req.url), req.headers);
         if (data instanceof Response) return data;
@@ -140,7 +100,6 @@ export class FakeCsms {
     });
     this.port = this.server.port ?? 0;
     this.url = `ws://127.0.0.1:${this.port}`;
-    this.unlisten = listenInMemory(memory, this.url).close;
   }
 
   static async start(opts: FakeCsmsOptions = {}): Promise<FakeCsms> {
@@ -195,7 +154,7 @@ export class FakeCsms {
 
   /** Send a CALL to a client; resolves with its CALLRESULT payload, rejects on CALLERROR or when the client drops. */
   call(identity: string, action: string, payload: unknown): Promise<unknown> {
-    const id = newMessageId();
+    const id = crypto.randomUUID();
     return new Promise((resolve, reject) => {
       this.pendingCalls.set(id, { resolve, reject });
       try {
@@ -222,11 +181,7 @@ export class FakeCsms {
   async stop(): Promise<void> {
     for (const p of this.pendingCalls.values()) p.reject(new Error('FakeCsms stopped'));
     this.pendingCalls.clear();
-    this.stopped = true;
-    this.unlisten();
-    // As `Bun.Server.stop(true)` does to the TCP clients.
-    for (const ws of this.sockets.values()) ws.close(1001, 'Server closed');
-    await this.server?.stop(true);
+    await this.server.stop(true);
   }
 
   private onMessage(ws: Socket, raw: string): void {
@@ -302,8 +257,8 @@ export class FakeCsms {
 }
 
 /**
- * Poll `cond` with real sleeps until it holds. The only real-time wait tests may use: socket I/O (in memory or real)
- * is asynchronous even though every timer runs on the virtual clock.
+ * Poll `cond` with real sleeps until it holds. The only real-time wait tests may use: socket I/O is asynchronous
+ * even though every timer runs on the virtual clock.
  */
 export async function until(cond: () => boolean, timeoutMs = 1000, what = 'condition'): Promise<void> {
   const step = 5;
@@ -313,9 +268,3 @@ export async function until(cond: () => boolean, timeoutMs = 1000, what = 'condi
   }
   throw new Error(`until: timed out after ${timeoutMs} ms waiting for ${what}`);
 }
-
-/**
- * Socket factory for `StationConfig.socket` / `ConnectionOptions.socket` that reaches, in memory, whichever CSMS
- * double (a `FakeCsms` or a `Csms`) is at the URL's origin; nothing there fails like a refused TCP connect.
- */
-export { connectInMemory } from '../../csms/src/index';

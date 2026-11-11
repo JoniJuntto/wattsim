@@ -19,7 +19,7 @@ import { Conflict, NotFound } from './registry';
 import { BadRequest } from './schemas';
 import { type InferEvse, inferAllocation, profileLimit } from './site-infer';
 import type { SandboxPlan } from './site-sandbox';
-import type { StreamHub } from './stream';
+import type { RateWindow, StreamHub } from './stream';
 import type {
   AllocationView,
   OcppVersion,
@@ -37,9 +37,7 @@ import type {
 
 /** EVSE leaves a site may have to be shown, built in the sandbox or uploaded. */
 export const MAX_SITE_LEAVES = 500;
-/** Nodes (leaves included) an uploaded report may have. */
-export const MAX_SITE_NODES = 5000;
-export const SITE_INTERVAL_MS = 250;
+const SITE_INTERVAL_MS = 250;
 const SUMMARY_INTERVAL_MS = 1000;
 const ALLOCATIONS_PER_S = 10;
 const EVENTS_PER_S = 50;
@@ -54,7 +52,7 @@ const tri = (t: readonly number[], f: (x: number) => number) =>
   [f(t[0] ?? 0), f(t[1] ?? 0), f(t[2] ?? 0)] as [number, number, number];
 
 /** A node state rounded for the wire (0.01 A, 1 W, 0.1 V, 0.001 of the trip threshold). */
-export function compactNode(n: NodeState): NodeState {
+function compactNode(n: NodeState): NodeState {
   const out: NodeState = {
     ...n,
     currentA: tri(n.currentA, r2),
@@ -94,7 +92,7 @@ function peakOf(score: SiteScoreView): SiteSummary['peak'] {
 }
 
 /** The interface to the UI stations a sandbox binds (the registry). */
-export type StationHost = {
+type StationHost = {
   station(id: string): Station | undefined;
   create(
     specs: Array<{ id: string; version: OcppVersion; csmsUrl: string; evses: number; autoBoot: boolean }>,
@@ -106,9 +104,9 @@ export type StationHost = {
 };
 
 /** The built-in test CSMS (the reference controller sends its profiles through it). */
-export type CsmsHost = { start(): Promise<string>; readonly running: Csms | undefined };
+type CsmsHost = { start(): Promise<string>; readonly running: Csms | undefined };
 
-export type SandboxOptions = {
+type SandboxOptions = {
   plan: SandboxPlan;
   name?: string;
   controller: 'reference' | 'none';
@@ -124,8 +122,6 @@ export type SiteActionBody =
   | { type: 'reclose'; node: string }
   | { type: 'load'; node: string; watts?: number; on?: boolean }
   | { type: 'controller'; mode: 'reference' | 'none' };
-
-type Window = { start: number; sent: number };
 
 type LiveSite = {
   id: string;
@@ -145,8 +141,8 @@ type LiveSite = {
   nodeSig: Map<string, string>;
   leafSig: Map<string, string>;
   offs: Array<() => void>;
-  allocWindow: Window;
-  eventWindow: Window;
+  allocWindow: RateWindow;
+  eventWindow: RateWindow;
   /** The reference controller ran at some point. */
   everReference: boolean;
   /** Sandbox: release the stations. */
@@ -163,8 +159,7 @@ export class Sites {
   constructor(
     private readonly store: Store,
     private readonly hub: StreamHub,
-    private readonly host: { stations?: StationHost; csms?: CsmsHost } = {},
-    private readonly maxLeaves = MAX_SITE_LEAVES,
+    private readonly host: { stations: StationHost; csms: CsmsHost },
   ) {}
 
   // ---- reading ---------------------------------------------------------------------------------------------------
@@ -286,8 +281,8 @@ export class Sites {
    */
   attachRun(runId: string, runName: string, run: SiteRun): { id: string } | { refused: string } {
     const leaves = run.runtime.leaves().length;
-    if (leaves > this.maxLeaves) {
-      return { refused: `the site has ${leaves} EVSE leaves; the Site page shows at most ${this.maxLeaves}` };
+    if (leaves > MAX_SITE_LEAVES) {
+      return { refused: `the site has ${leaves} EVSE leaves; the Site page shows at most ${MAX_SITE_LEAVES}` };
     }
     const s = this.add('run', run.runtime.site.description.name ?? runName, run.runtime, { runId });
     return { id: s.id };
@@ -312,10 +307,8 @@ export class Sites {
   // ---- sandbox ---------------------------------------------------------------------------------------------------
 
   async createSandbox(o: SandboxOptions): Promise<SiteDetail> {
-    const stationsHost = this.host.stations;
-    if (!stationsHost) throw new Conflict('this server has no UI stations to bind');
+    const { stations: stationsHost, csms: csmsHost } = this.host;
     const { plan } = o;
-    const csmsHost = this.host.csms;
     // Which UI station each leaf is bound to.
     const bindings: Record<string, string> = {};
     const toCreate = new Map<string, { evses: number; version?: OcppVersion }>();
@@ -348,15 +341,11 @@ export class Sites {
         }
       }
     }
-    let csms: Csms | undefined;
-    let csmsUrl: string | undefined;
-    if ((o.controller === 'reference' || toCreate.size > 0) && csmsHost) {
-      csmsUrl = await csmsHost.start();
-      csms = csmsHost.running;
-    }
+    const needCsms = o.controller === 'reference' || toCreate.size > 0;
+    const csmsUrl = needCsms ? await csmsHost.start() : undefined;
+    const csms: Csms | undefined = needCsms ? csmsHost.running : undefined;
     if (o.controller === 'reference' && !csms) throw new Conflict('the reference controller needs the test CSMS');
     if (toCreate.size > 0) {
-      if (!csmsUrl) throw new Conflict('creating stations needs the test CSMS');
       stationsHost.create(
         [...toCreate].map(([id, c]) => ({
           id,
@@ -443,7 +432,8 @@ export class Sites {
 
   upload(report: SiteReportView, name?: string): SiteSummary {
     const leaves = report.leaves.length;
-    if (leaves > this.maxLeaves) throw new BadRequest(`leaves: a site may have at most ${this.maxLeaves} EVSE leaves`);
+    if (leaves > MAX_SITE_LEAVES)
+      throw new BadRequest(`leaves: a site may have at most ${MAX_SITE_LEAVES} EVSE leaves`);
     return this.save('upload', name ?? report.name ?? 'uploaded site report', report);
   }
 
@@ -509,7 +499,7 @@ export class Sites {
       if (err instanceof NotFound) throw err;
       throw new BadRequest(err instanceof Error ? err.message : String(err));
     }
-    if (s.sessionStation) this.host.stations?.session.record(s.sessionStation, line);
+    if (s.sessionStation) this.host.stations.session.record(s.sessionStation, line);
     this.changed(s);
     return this.liveView(s);
   }
@@ -692,26 +682,14 @@ export class Sites {
   }
 
   private allocation(s: LiveSite, a: AllocationView): void {
-    if (!this.allow(s.allocWindow, ALLOCATIONS_PER_S)) return;
+    if (!this.hub.allow(s.allocWindow, ALLOCATIONS_PER_S)) return;
     this.hub.broadcast({ type: 'site.allocation', siteId: s.id, allocation: rounded(a) });
   }
 
   private event(s: LiveSite, e: SiteEventView): void {
     s.dirty = true;
-    if (!this.allow(s.eventWindow, EVENTS_PER_S)) return;
+    if (!this.hub.allow(s.eventWindow, EVENTS_PER_S)) return;
     this.hub.broadcast({ type: 'site.event', siteId: s.id, event: e });
-  }
-
-  private allow(w: Window, perS: number): boolean {
-    if (this.hub.size === 0) return false;
-    const now = Date.now();
-    if (now - w.start >= 1000) {
-      w.start = now;
-      w.sent = 0;
-    }
-    if (w.sent >= perS) return false;
-    w.sent++;
-    return true;
   }
 
   private watchFrames(s: LiveSite, station: Station): void {

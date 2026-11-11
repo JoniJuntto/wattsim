@@ -70,16 +70,6 @@ export function formatTrace(entries: readonly TraceEntry[], format: TraceFileFor
   return { text: lines.length > 0 ? `${lines.join('\n')}\n` : '', skipped };
 }
 
-export async function writeTrace(
-  path: string,
-  entries: readonly TraceEntry[],
-  format: TraceFileFormat = 'oot',
-): Promise<TraceEntry[]> {
-  const { text, skipped } = formatTrace(entries, format);
-  await Bun.write(path, text);
-  return skipped;
-}
-
 /** Appends entries to a JSONL file as they happen. */
 export class TraceWriter {
   private readonly sink: FileSink;

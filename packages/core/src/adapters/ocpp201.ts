@@ -9,10 +9,10 @@ import { parseTime, profileProblem } from '../charging';
 import type { Clock } from '../clock';
 import { isoTimestamp } from '../clock';
 import type { MeterSample } from '../meter';
-import { OCMF_ENCODING, OCMF_SIGNING_METHOD } from '../ocmf';
 import type { ConnectorStatus, EvseState, ResolvedStationConfig, TransactionState } from '../station';
 import { isTimeZone } from '../tariff';
 import { handleSecurity2x, sendSignCertificate, signTrigger2x } from './security';
+import { HEARTBEAT_INTERVAL, METER_INTERVAL, pickEvse, triggered, txOf } from './shared';
 import type { BootReason, CallOutcome, SampleContext, StationContext, TxUpdateTrigger, VersionAdapter } from './types';
 
 type TxEvent = v201.TransactionEventRequest;
@@ -85,7 +85,7 @@ function endTrigger(reason: string, stopped: StopReason201): TriggerReason201 {
   }
 }
 
-export function wireStatus201(status: ConnectorStatus): WireStatus201 {
+function wireStatus201(status: ConnectorStatus): WireStatus201 {
   switch (status) {
     case 'Available':
     case 'Reserved':
@@ -98,7 +98,7 @@ export function wireStatus201(status: ConnectorStatus): WireStatus201 {
 }
 
 /** `Idle` whenever no EV is plugged in, including a remotely started transaction still waiting for the cable. */
-export function chargingState201(evse: EvseState): ChargingState201 {
+function chargingState201(evse: EvseState): ChargingState201 {
   switch (evse.status) {
     case 'Charging':
     case 'SuspendedEV':
@@ -110,28 +110,18 @@ export function chargingState201(evse: EvseState): ChargingState201 {
 }
 
 /**
- * One 2.x `MeterValue`: energy, power, voltage, current and (when known) SoC. An OCMF-signed sample carries its
- * record on the energy register as `signedMeterValue`. While a V2X EV discharges, Power.Active.Import and
- * Current.Import are negative and Power.Active.Export carries the magnitude; Energy.Active.Export.Register appears
- * once the meter has exported anything.
+ * One 2.x `MeterValue`: energy, power, voltage, current and (when known) SoC. While a V2X EV discharges,
+ * Power.Active.Import and Current.Import are negative and Power.Active.Export carries the magnitude;
+ * Energy.Active.Export.Register appears once the meter has exported anything.
  */
-export function meterValue201(sample: MeterSample, context: SampleContext): MeterValue201 {
-  const register: SampledValue201 = {
-    value: Math.round(sample.energyWh),
-    context,
-    measurand: 'Energy.Active.Import.Register',
-    unitOfMeasure: { unit: 'Wh' },
-  };
-  if (sample.signed) {
-    register.signedMeterValue = {
-      signedMeterData: Buffer.from(sample.signed.ocmf, 'utf8').toString('base64'),
-      signingMethod: OCMF_SIGNING_METHOD,
-      encodingMethod: OCMF_ENCODING,
-      publicKey: sample.signed.publicKey,
-    };
-  }
+function meterValue201(sample: MeterSample, context: SampleContext): MeterValue201 {
   const sampledValue: SampledValue201[] = [
-    register,
+    {
+      value: Math.round(sample.energyWh),
+      context,
+      measurand: 'Energy.Active.Import.Register',
+      unitOfMeasure: { unit: 'Wh' },
+    },
     {
       value: Math.round(sample.powerKw * 1000),
       context,
@@ -235,11 +225,6 @@ function reports201(requestId: number, found: readonly ChargingProfile[]): v201.
   return out;
 }
 
-function txOf(evse: EvseState): TransactionState {
-  if (!evse.tx) throw new Error(`EVSE ${evse.id}: no transaction state`);
-  return evse.tx;
-}
-
 function txEvent(
   st: StationContext,
   evse: EvseState,
@@ -280,42 +265,13 @@ function meterValuesPayload(evse: EvseState, sample: MeterSample, context: Sampl
   return { evseId: evse.id, meterValue: [meterValue201(sample, context)] };
 }
 
-function pickEvse(st: StationContext, evseId: number | undefined): EvseState | undefined {
-  if (evseId !== undefined) {
-    const evse = st.evse(evseId);
-    return evse && !evse.tx ? evse : undefined;
-  }
-  return st.evses.find((e) => e.ev && !e.tx) ?? st.evses.find((e) => !e.tx);
-}
-
-function parseSeconds(value: string): number | undefined {
-  const n = Number(value);
-  return Number.isInteger(n) && n >= 0 && value.trim() !== '' ? n : undefined;
-}
-
 /** A variable without `set` is read-only: SetVariables answers Rejected. */
 type VariableEntry = { get: (st: StationContext) => string; set?: (st: StationContext, v: string) => boolean };
 
 /** Device-model variables this station understands, keyed `Component.Variable`. */
 const VARIABLES: Record<string, VariableEntry> = {
-  'OCPPCommCtrlr.HeartbeatInterval': {
-    get: (st) => String(Math.round((st.heartbeatMs ?? 0) / 1000)),
-    set: (st, v) => {
-      const s = parseSeconds(v);
-      if (s === undefined) return false;
-      st.setHeartbeatMs(s * 1000);
-      return true;
-    },
-  },
-  'SampledDataCtrlr.TxUpdatedInterval': {
-    get: (st) => String(Math.round(st.meterIntervalMs / 1000)),
-    set: (st, v) => {
-      const s = parseSeconds(v);
-      if (s === undefined) return false;
-      st.setMeterIntervalMs(s * 1000);
-      return true;
-    },
-  },
+  'OCPPCommCtrlr.HeartbeatInterval': HEARTBEAT_INTERVAL,
+  'SampledDataCtrlr.TxUpdatedInterval': METER_INTERVAL,
   'ClockCtrlr.TimeZone': {
     get: (st) => st.timeZone,
     set: (st, v) => {
@@ -395,35 +351,19 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       if (evseId !== undefined && !st.evse(evseId)) {
         return { result: { status: 'Rejected' } satisfies v201.TriggerMessageResponse };
       }
-      let after: (() => Promise<void>) | undefined;
-      switch (p.requestedMessage) {
-        case 'BootNotification':
-          after = () => st.boot('Triggered');
-          break;
-        case 'Heartbeat':
-          after = () => st.sendHeartbeat();
-          break;
-        case 'StatusNotification':
-          after = () => st.sendStatus(evseId);
-          break;
-        case 'MeterValues':
-          after = () => st.sendMeterValues(evseId);
-          break;
-        case 'TransactionEvent': {
-          const targets = evseId === undefined ? st.evses : [st.evse(evseId) as EvseState];
-          if (!targets.some((e) => e.tx)) {
-            return { result: { status: 'Rejected' } satisfies v201.TriggerMessageResponse };
-          }
-          after = () => st.sendTransactionUpdate(evseId, 'Trigger');
-          break;
+      let after = triggered(st, p.requestedMessage, evseId);
+      if (!after && p.requestedMessage === 'TransactionEvent') {
+        const targets = evseId === undefined ? st.evses : [st.evse(evseId) as EvseState];
+        if (!targets.some((e) => e.tx)) {
+          return { result: { status: 'Rejected' } satisfies v201.TriggerMessageResponse };
         }
-        default: {
-          const use = signTrigger2x(p.requestedMessage);
-          if (!use) return { result: { status: 'NotImplemented' } satisfies v201.TriggerMessageResponse };
-          after = async () => {
-            await sendSignCertificate(st, use);
-          };
-        }
+        after = () => st.sendTransactionUpdate(evseId, 'Trigger');
+      } else if (!after) {
+        const use = signTrigger2x(p.requestedMessage);
+        if (!use) return { result: { status: 'NotImplemented' } satisfies v201.TriggerMessageResponse };
+        after = async () => {
+          await sendSignCertificate(st, use);
+        };
       }
       return { result: { status: 'Accepted' } satisfies v201.TriggerMessageResponse, after };
     }

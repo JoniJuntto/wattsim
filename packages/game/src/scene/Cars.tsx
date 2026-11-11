@@ -2,7 +2,7 @@ import { useFrame } from '@react-three/fiber';
 import { useRef } from 'react';
 import type { Group, Mesh, MeshBasicMaterial } from 'three';
 import { useTick } from '../hooks';
-import { bayById, QUEUE } from '../sim/layout';
+import { QUEUE } from '../sim/layout';
 import { type Car, type Lot, MIN, pathAt } from '../sim/world';
 
 /** A driver who is losing patience: queuing, stuck, or parked without charge for a while. */
@@ -38,7 +38,8 @@ function pose(lot: Lot, car: Car): [x: number, z: number, heading: number] {
     const i = lot.cars.filter((c) => c.state === 'waiting').indexOf(car);
     return [QUEUE[0] - i * 5.5, QUEUE[1] + 1.5, Math.PI / 2];
   }
-  const bay = bayById(car.bay ?? '');
+  // `car.bay` is the charger's id (lot code + bay), not the bay's.
+  const bay = lot.chargers.get(car.bay ?? '')?.bay;
   if (!bay) return [0, 0, 0];
   return [bay.pos[0], bay.pos[1], bay.facing === 1 ? 0 : Math.PI];
 }

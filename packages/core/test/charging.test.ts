@@ -8,7 +8,7 @@ import type { CallFrame, OcppVersion, v16, v201 } from '@wattsim/protocol';
 import { validatePayload } from '@wattsim/protocol';
 import type { ChargingEnv, ChargingProfile, StationConfig } from '../src/index';
 import { ProfileStore, Station, VirtualClock } from '../src/index';
-import { connectInMemory, FakeCsms, until } from './fake-csms';
+import { FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const MINUTE = 60_000;
@@ -109,7 +109,7 @@ describe('ProfileStore: composite limit', () => {
       prof({ id: 1, purpose: 'TxDefaultProfile', stackLevel: 0, periods: [{ startPeriod: 0, limit: 11_000 }] }),
     );
     store.set(prof({ id: 2, purpose: 'TxDefaultProfile', stackLevel: 1, periods: [{ startPeriod: 0, limit: 5_000 }] }));
-    expect(store.limitAt(1, T0)).toBeCloseTo(5, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(5, 9);
     // A higher stack level that is not valid yet does not count.
     store.set(
       prof({
@@ -120,9 +120,9 @@ describe('ProfileStore: composite limit', () => {
         periods: [{ startPeriod: 0, limit: 2_000 }],
       }),
     );
-    expect(store.limitAt(1, T0)).toBeCloseTo(5, 9);
-    expect(store.limitAt(1, T0 + HOUR)).toBeCloseTo(2, 9);
-    expect(store.limitAt(2, T0)).toBeUndefined(); // installed on EVSE 1 only
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(5, 9);
+    expect(store.limitDetail(1, T0 + HOUR)?.kw).toBeCloseTo(2, 9);
+    expect(store.limitDetail(2, T0)?.kw).toBeUndefined(); // installed on EVSE 1 only
   });
 
   test('a TxProfile overrides any TxDefaultProfile while the transaction runs', () => {
@@ -131,10 +131,10 @@ describe('ProfileStore: composite limit', () => {
     store.set(prof({ id: 1, purpose: 'TxDefaultProfile', stackLevel: 5, periods: [{ startPeriod: 0, limit: 3_000 }] }));
     e.tx.set(1, T0);
     store.set(prof({ id: 2, purpose: 'TxProfile', stackLevel: 0, periods: [{ startPeriod: 0, limit: 7_000 }] }));
-    expect(store.limitAt(1, T0)).toBeCloseTo(7, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(7, 9);
     expect(store.endTransaction(1)).toBe(1);
     e.tx.delete(1);
-    expect(store.limitAt(1, T0)).toBeCloseTo(3, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(3, 9);
   });
 
   test('an EVSE-specific TxDefaultProfile beats one installed on the station (evseId 0)', () => {
@@ -149,8 +149,8 @@ describe('ProfileStore: composite limit', () => {
       }),
     );
     store.set(prof({ id: 2, purpose: 'TxDefaultProfile', evseId: 2, periods: [{ startPeriod: 0, limit: 9_000 }] }));
-    expect(store.limitAt(1, T0)).toBeCloseTo(4, 9);
-    expect(store.limitAt(2, T0)).toBeCloseTo(9, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(4, 9);
+    expect(store.limitDetail(2, T0)?.kw).toBeCloseTo(9, 9);
   });
 
   test('the Max profile caps Tx and TxDefault', () => {
@@ -161,9 +161,9 @@ describe('ProfileStore: composite limit', () => {
     store.set(
       prof({ id: 2, purpose: 'ChargingStationMaxProfile', evseId: 0, periods: [{ startPeriod: 0, limit: 10_000 }] }),
     );
-    expect(store.limitAt(1, T0)).toBeCloseTo(10, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(10, 9);
     store.set(prof({ id: 1, purpose: 'TxProfile', periods: [{ startPeriod: 0, limit: 5_000 }] }));
-    expect(store.limitAt(1, T0)).toBeCloseTo(5, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(5, 9);
     store.set(
       prof({
         id: 3,
@@ -172,7 +172,7 @@ describe('ProfileStore: composite limit', () => {
         periods: [{ startPeriod: 0, limit: 4_000 }],
       }),
     );
-    expect(store.limitAt(1, T0)).toBeCloseTo(4, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(4, 9);
   });
 
   test('a station-wide Max profile is one cap shared equally by the EVSEs with an active transaction', () => {
@@ -182,11 +182,11 @@ describe('ProfileStore: composite limit', () => {
       prof({ id: 1, purpose: 'ChargePointMaxProfile', evseId: 0, periods: [{ startPeriod: 0, limit: 12_000 }] }),
     );
     e.tx.set(1, T0);
-    expect(store.limitAt(1, T0)).toBeCloseTo(12, 9);
-    expect(store.limitAt(2, T0)).toBeCloseTo(6, 9); // what EVSE 2 would get if it started now
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(12, 9);
+    expect(store.limitDetail(2, T0)?.kw).toBeCloseTo(6, 9); // what EVSE 2 would get if it started now
     e.tx.set(2, T0);
-    expect(store.limitAt(1, T0)).toBeCloseTo(6, 9);
-    expect(store.limitAt(2, T0)).toBeCloseTo(6, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(6, 9);
+    expect(store.limitDetail(2, T0)?.kw).toBeCloseTo(6, 9);
   });
 
   test('every schedule period is a step; the schedule ends after its duration', () => {
@@ -204,12 +204,12 @@ describe('ProfileStore: composite limit', () => {
         ],
       }),
     );
-    expect(store.limitAt(1, T0 - 1)).toBeUndefined();
-    expect(store.limitAt(1, T0)).toBeCloseTo(11, 9);
-    expect(store.limitAt(1, T0 + 600_000 - 1)).toBeCloseTo(11, 9);
-    expect(store.limitAt(1, T0 + 600_000)).toBeCloseTo(4, 9);
-    expect(store.limitAt(1, T0 + 1_200_000)).toBeCloseTo(7, 9);
-    expect(store.limitAt(1, T0 + 1_800_000)).toBeUndefined();
+    expect(store.limitDetail(1, T0 - 1)?.kw).toBeUndefined();
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(11, 9);
+    expect(store.limitDetail(1, T0 + 600_000 - 1)?.kw).toBeCloseTo(11, 9);
+    expect(store.limitDetail(1, T0 + 600_000)?.kw).toBeCloseTo(4, 9);
+    expect(store.limitDetail(1, T0 + 1_200_000)?.kw).toBeCloseTo(7, 9);
+    expect(store.limitDetail(1, T0 + 1_800_000)?.kw).toBeUndefined();
     expect(store.nextChange(T0)).toBe(T0 + 600_000);
     expect(store.nextChange(T0 + 600_000)).toBe(T0 + 1_200_000);
     expect(store.nextChange(T0 + 1_200_000)).toBe(T0 + 1_800_000);
@@ -230,8 +230,8 @@ describe('ProfileStore: composite limit', () => {
         ],
       }),
     );
-    expect(store.limitAt(1, T0)).toBeCloseTo(6.9, 9);
-    expect(store.limitAt(1, T0 + MINUTE)).toBeCloseTo(3.68, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(6.9, 9);
+    expect(store.limitDetail(1, T0 + MINUTE)?.kw).toBeCloseTo(3.68, 9);
   });
 
   test('Recurring Daily repeats across midnight', () => {
@@ -251,11 +251,11 @@ describe('ProfileStore: composite limit', () => {
         ],
       }),
     );
-    expect(store.limitAt(1, Date.parse('2026-01-02T23:30:00Z'))).toBeCloseTo(3, 9);
-    expect(store.limitAt(1, Date.parse('2026-01-03T00:00:00Z'))).toBeCloseTo(11, 9);
-    expect(store.limitAt(1, Date.parse('2026-01-03T03:59:59Z'))).toBeCloseTo(11, 9);
-    expect(store.limitAt(1, Date.parse('2026-01-03T04:00:00Z'))).toBeUndefined();
-    expect(store.limitAt(1, Date.parse('2026-01-03T21:59:59Z'))).toBeUndefined();
+    expect(store.limitDetail(1, Date.parse('2026-01-02T23:30:00Z'))?.kw).toBeCloseTo(3, 9);
+    expect(store.limitDetail(1, Date.parse('2026-01-03T00:00:00Z'))?.kw).toBeCloseTo(11, 9);
+    expect(store.limitDetail(1, Date.parse('2026-01-03T03:59:59Z'))?.kw).toBeCloseTo(11, 9);
+    expect(store.limitDetail(1, Date.parse('2026-01-03T04:00:00Z'))?.kw).toBeUndefined();
+    expect(store.limitDetail(1, Date.parse('2026-01-03T21:59:59Z'))?.kw).toBeUndefined();
     expect(store.nextChange(Date.parse('2026-01-03T05:00:00Z'))).toBe(Date.parse('2026-01-03T22:00:00Z'));
     expect(store.nextChange(Date.parse('2026-01-03T23:00:00Z'))).toBe(Date.parse('2026-01-04T00:00:00Z'));
   });
@@ -273,8 +273,8 @@ describe('ProfileStore: composite limit', () => {
         periods: [{ startPeriod: 0, limit: 2_000 }],
       }),
     );
-    expect(store.limitAt(1, T0 + 7 * 24 * HOUR + MINUTE)).toBeCloseTo(2, 9);
-    expect(store.limitAt(1, T0 + 24 * HOUR + MINUTE)).toBeUndefined();
+    expect(store.limitDetail(1, T0 + 7 * 24 * HOUR + MINUTE)?.kw).toBeCloseTo(2, 9);
+    expect(store.limitDetail(1, T0 + 24 * HOUR + MINUTE)?.kw).toBeUndefined();
   });
 
   test('validTo expiry falls back to the next stack level', () => {
@@ -289,9 +289,9 @@ describe('ProfileStore: composite limit', () => {
         periods: [{ startPeriod: 0, limit: 5_000 }],
       }),
     );
-    expect(store.limitAt(1, T0)).toBeCloseTo(5, 9);
+    expect(store.limitDetail(1, T0)?.kw).toBeCloseTo(5, 9);
     expect(store.nextChange(T0)).toBe(T0 + HOUR);
-    expect(store.limitAt(1, T0 + HOUR)).toBeCloseTo(9, 9);
+    expect(store.limitDetail(1, T0 + HOUR)?.kw).toBeCloseTo(9, 9);
   });
 
   test('a Relative schedule starts when the transaction starts', () => {
@@ -308,13 +308,13 @@ describe('ProfileStore: composite limit', () => {
         ],
       }),
     );
-    expect(store.limitAt(1, T0 + 5 * HOUR)).toBeCloseTo(3, 9); // no transaction: the schedule as if it started now
+    expect(store.limitDetail(1, T0 + 5 * HOUR)?.kw).toBeCloseTo(3, 9); // no transaction: the schedule as if it started now
     expect(store.nextChange(T0)).toBeUndefined();
     const start = T0 + 10 * MINUTE;
     e.tx.set(1, start);
-    expect(store.limitAt(1, start + 59 * MINUTE)).toBeCloseTo(3, 9);
+    expect(store.limitDetail(1, start + 59 * MINUTE)?.kw).toBeCloseTo(3, 9);
     expect(store.nextChange(start)).toBe(start + HOUR);
-    expect(store.limitAt(1, start + HOUR)).toBeCloseTo(11, 9);
+    expect(store.limitDetail(1, start + HOUR)?.kw).toBeCloseTo(11, 9);
   });
 });
 
@@ -403,7 +403,7 @@ describe('ProfileStore: install, clear, query', () => {
         ],
       }),
     );
-    expect(store.limitAt(1, from)).toBeCloseTo(6, 9);
+    expect(store.limitDetail(1, from)?.kw).toBeCloseTo(6, 9);
     expect(store.composite(1, from, 60_000, 'W')).toEqual([
       { startPeriod: 0, limit: 6_000 },
       { startPeriod: 1, limit: 20_000 },
@@ -442,7 +442,7 @@ const open: Station[] = [];
 async function booted(version: OcppVersion, opts: Partial<StationConfig> = {}): Promise<Station> {
   for (let attempt = 0; attempt < 5; attempt++) {
     clock = new VirtualClock(T0);
-    const station = new Station({ id: 'CP1', version, csmsUrl: csms.url, socket: connectInMemory, clock, ...opts });
+    const station = new Station({ id: 'CP1', version, csmsUrl: csms.url, clock, ...opts });
     const errors: Error[] = [];
     station.on('error', (err) => errors.push(err));
     open.push(station);

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { classifyHandshake, StationSecurity, schemeProblem, securityEventName } from '../src/index';
+import { schemeProblem } from '../src/adapters/security';
+import { classifyHandshake, StationSecurity, securityEventName } from '../src/index';
 
 describe('classifyHandshake (Bun WebSocket error texts, probed on Bun 1.4.4)', () => {
   const prefix = "WebSocket connection to 'wss://127.0.0.1:1/CS1' failed: ";

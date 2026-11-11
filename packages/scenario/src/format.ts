@@ -1,5 +1,6 @@
+import type { OcppVersion } from '@wattsim/protocol';
 import type {
-  ChaosFaultSpec,
+  ChaosFault,
   ChaosFilters,
   Comments,
   DurationUnit,
@@ -22,7 +23,10 @@ import type {
 } from './ast';
 
 const INDENT = '  ';
-const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** A bare word the DSL reads as an identifier (an unquoted object key, a variable name). */
+export const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** The DSL's `version` word for a station's OCPP version. */
+export const DSL_VERSION: Record<OcppVersion, string> = { 'ocpp1.6': '1.6', 'ocpp2.0.1': '2.0.1', 'ocpp2.1': '2.1' };
 const UNITS: [DurationUnit, number][] = [
   ['h', 3_600_000],
   ['min', 60_000],
@@ -49,8 +53,35 @@ export function formatDuration(d: { ms: number; unit?: DurationUnit }): string {
 }
 
 const str = (s: StringExpr) => `"${s.raw}"`;
+
 /** Plain decimal digits, never exponent form, so the lexer can read the output back. */
-const num = (n: number) => n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 20 });
+export function dslNumber(n: number): string {
+  return n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 20 });
+}
+const num = dslNumber;
+
+/** A DSL string literal from plain text. `{` starts an interpolation in the DSL, so it is escaped with `"` and `\`. */
+export function dslString(s: string): string {
+  return `"${s
+    .replace(/[\\"{]/g, (c) => `\\${c}`)
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')}"`;
+}
+
+/** A JSON value in the DSL's payload syntax: strings always quoted (a bare word is a variable reference). */
+export function dslJson(v: unknown): string {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'string') return dslString(v);
+  if (typeof v === 'number') return Number.isFinite(v) ? dslNumber(v) : 'null';
+  if (typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) return `[${v.map(dslJson).join(', ')}]`;
+  if (typeof v === 'object') {
+    const entries = Object.entries(v as Record<string, unknown>).filter(([, x]) => x !== undefined);
+    return `{${entries.map(([k, x]) => `${IDENT_RE.test(k) ? k : dslString(k)}: ${dslJson(x)}`).join(', ')}}`;
+  }
+  return 'null';
+}
 const numExpr = (e: NumExpr) => (e.kind === 'ref' ? e.name : num(e.value));
 const strExpr = (e: StrExpr) => (e.kind === 'ref' ? e.name : str(e));
 
@@ -106,9 +137,11 @@ function formatEnergy(e: EnergyExpr): string {
   return `${num(e.unit === 'kWh' ? e.wh / 1000 : e.wh)}${e.unit}`;
 }
 
-/** The arguments of a milestone-4 chaos fault, after its name. */
-function formatFaultArgs(f: ChaosFaultSpec): string[] {
+/** The arguments of a chaos fault, after its name. */
+function formatFaultArgs(f: ChaosFault): string[] {
   switch (f.kind) {
+    case 'delay':
+      return [formatDurExpr(f.delay)];
     case 'jitter':
       return [`${formatDurExpr(f.min)}..${formatDurExpr(f.max)}`];
     case 'reorder':
@@ -126,6 +159,8 @@ function formatFaultArgs(f: ChaosFaultSpec): string[] {
       return [formatDurExpr(f.shift)];
     case 'oversized':
       return [f.kb.kind === 'ref' ? f.kb.name : `${num(f.kb.value)}kB`];
+    default:
+      return [];
   }
 }
 
@@ -250,12 +285,7 @@ function formatStmtLines(s: Stmt, depth: number, pad: string): string[] {
           : `error ${r.code}${r.description ? ` ${str(r.description)}` : ''}`;
       return [`${pad}${head.join(' ')} {`, `${pad}${INDENT}${body}`, `${pad}}`];
     }
-    case 'chaos': {
-      const parts = ['chaos', s.fault];
-      if (s.delay) parts.push(formatDurExpr(s.delay));
-      return line([...parts, ...formatChaosFilters(s)].join(' '));
-    }
-    case 'chaosFault':
+    case 'chaos':
       return line(['chaos', s.fault.kind, ...formatFaultArgs(s.fault), ...formatChaosFilters(s)].join(' '));
     case 'bootLoop':
       return line(`bootLoop ${numExpr(s.count)}`);

@@ -37,7 +37,7 @@ const SOURCE = 'wattsim';
 const ALL_ACTIONS = new Set(OCPP_VERSIONS.flatMap((v) => ACTIONS[v]));
 const DURATION_WORDS = new Set(['ms', 's', 'm', 'min', 'h']);
 
-export const fileUri = (path: string) => pathToFileURL(path).href;
+const fileUri = (path: string) => pathToFileURL(path).href;
 const label = (v: OcppVersion) => `OCPP ${v.slice(4)}`;
 
 // ---- diagnostics ------------------------------------------------------------------------------------------------
@@ -149,14 +149,10 @@ function nameRange(text: string, start: number): Range {
   return { start: { line: start, character: t?.start ?? 0 }, end: { line: start, character: t?.end ?? 0 } };
 }
 
-export type QuirkSite = { path?: string; range: Range };
+type QuirkSite = { path?: string; range: Range };
 
 /** Every quirk in reach of a file: its own, then those of its imports, transitively. First declaration wins. */
-export async function collectQuirks(
-  text: string,
-  path: string | undefined,
-  ws: Workspace,
-): Promise<Map<string, QuirkSite>> {
+async function collectQuirks(text: string, path: string | undefined, ws: Workspace): Promise<Map<string, QuirkSite>> {
   const out = new Map<string, QuirkSite>();
   const seen = new Set<string>();
   const visit = async (src: string, file: string | undefined) => {

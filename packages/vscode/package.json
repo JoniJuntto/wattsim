@@ -83,20 +83,19 @@
     "build": "bun run scripts/grammar.ts && bun build src/extension.ts --target node --format cjs --external vscode --outfile dist/extension.cjs && bun build ../lsp/src/main.ts --target node --format cjs --outfile dist/server.cjs",
     "package": "bun run build && vsce package --no-dependencies --skip-license --out wattsim.vsix",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:e2e": "bun run build && bun test/e2e/run.ts"
   },
   "devDependencies": {
     "@types/bun": "catalog:",
     "@types/vscode": "1.91.0",
+    "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "4.1.0",
     "@wattsim/lsp": "workspace:*",
     "@wattsim/protocol": "workspace:*",
     "@wattsim/scenario": "workspace:*",
     "typescript": "catalog:",
-    "vscode-jsonrpc": "10.0.0",
     "vscode-languageclient": "11.0.0",
-    "vscode-languageserver": "11.0.0",
-    "vscode-oniguruma": "2.0.1",
-    "vscode-textmate": "9.3.2"
+    "vscode-languageserver": "11.0.0"
   }
 }

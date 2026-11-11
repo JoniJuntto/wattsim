@@ -9,7 +9,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type MeterSample, Station, type StationConfig, VirtualClock, WallClock } from '@wattsim/core';
 import { createLoadModel } from '@wattsim/grid';
-import { connectInMemory } from '../../csms/src/index';
 import { DEFAULT_SITE_TIME, driveVirtual, isIdle, parse, run, SiteRun, siteSetup } from '../src/index';
 
 const REL_CSV = 'seconds,W\n0,10000\n3600,30000\n7200,5000\n';
@@ -48,7 +47,7 @@ async function runVirtual(src: string, files: Record<string, string>, startMs: n
     clock,
     file,
     stationFactory: (cfg: StationConfig) => {
-      const s = new Station({ ...cfg, socket: connectInMemory });
+      const s = new Station(cfg);
       stations.push(s);
       return s;
     },
@@ -195,7 +194,7 @@ station "A" {
     clock,
     file,
     stationFactory: (cfg: StationConfig) => {
-      const s = new Station({ ...cfg, socket: connectInMemory });
+      const s = new Station(cfg);
       s.on('meter', (_id, m) => samples.push(m));
       stations.push(s);
       return s;

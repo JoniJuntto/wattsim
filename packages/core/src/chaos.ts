@@ -9,11 +9,6 @@
  * effects. A frame can match one delay rule (the first `delay`, `jitter` or `slowRead` that matches) and one other
  * rule (the first other rule that matches), whatever their order; it is held for the delay and then gets the other
  * effect.
- *
- * `ChaosEffect` holds the faults that existed before milestone 4 and `ChaosFaultEffect` the later ones (jitter,
- * reorder, halfOpen, slowRead, reconnectStorm and the protocol mutations). They are separate unions so that code
- * which switches over `ChaosEffect` exhaustively keeps compiling: `decide` resolves `jitter` and `slowRead` to a plain
- * delay and reports the other new faults in `ChaosDecision.fault`.
  */
 import type { Frame } from '@wattsim/protocol';
 
@@ -36,30 +31,21 @@ export type ChaosMatch = {
   messageType?: 'call' | 'result' | 'error';
 };
 
-export type ChaosEffect =
-  | { kind: 'drop' }
-  | { kind: 'delay'; ms: number }
-  | { kind: 'duplicate'; count?: number }
-  /** Flips the raw string into invalid JSON. */
-  | { kind: 'corrupt' }
-  | { kind: 'wrongId' }
-  | { kind: 'callError'; code?: string }
-  /** Swallow the matching inbound CALL so no CALLRESULT is sent. */
-  | { kind: 'noResponse' }
-  | { kind: 'mutate'; fn: (payload: unknown) => unknown };
-
 /**
- * Faults added in milestone 4 (see the module comment for why they are not in `ChaosEffect`).
+ * What a rule does to a frame.
  *
  * Transport:
- * - `jitter`: hold the frame for a delay drawn uniformly from `minMs..maxMs` with the engine's RNG. A delay.
+ * - `delay`: hold the frame `ms`. `jitter`: hold it for a delay drawn uniformly from `minMs..maxMs` with the engine's
+ *   RNG. `slowRead`: inbound only; the n-th frame this rule delays is held `n * stepMs`. `decide` resolves all three to
+ *   `{ kind: 'delay', ms }` with the delay drawn.
  * - `reorder`: hold the frame until `after` (default 1) later frames in the same direction have passed it. Never an
  *   outbound CALL: only a later outbound frame releases it, and the station's next CALL waits for this one's answer.
  * - `halfOpen`: from this frame on (the frame included) nothing is written to or read from the socket, which stays
  *   open. With `ms`, the station notices after that long and drops the socket (then reconnects as usual).
- * - `slowRead`: inbound only. The n-th frame this rule delays is held `n * stepMs`. A delay.
  * - `reconnectStorm`: after this frame, drop the socket `count` times in `windowMs` (every `windowMs / count`, the
  *   first one interval after the frame), reconnecting at once each time. A storm in progress ignores new triggers.
+ * - `corrupt` flips the raw string into invalid JSON; `noResponse` swallows the matching inbound CALL so no
+ *   CALLRESULT is sent.
  *
  * Protocol (outbound only; deliberate schema breaks, see `faults.ts`):
  * - `invalidEnum`: replace the enum value at `path` (default: the first enum field of the payload).
@@ -67,7 +53,15 @@ export type ChaosEffect =
  * - `timestamp`: shift every date-time field of the payload by `shiftMs`.
  * - `oversized`: pad the payload with an extra `wattsimPadding` field until its JSON is `bytes` long.
  */
-export type ChaosFaultEffect =
+export type ChaosEffect =
+  | { kind: 'drop' }
+  | { kind: 'delay'; ms: number }
+  | { kind: 'duplicate'; count?: number }
+  | { kind: 'corrupt' }
+  | { kind: 'wrongId' }
+  | { kind: 'callError'; code?: string }
+  | { kind: 'noResponse' }
+  | { kind: 'mutate'; fn: (payload: unknown) => unknown }
   | { kind: 'jitter'; minMs: number; maxMs: number }
   | { kind: 'reorder'; after?: number }
   | { kind: 'halfOpen'; ms?: number }
@@ -78,17 +72,15 @@ export type ChaosFaultEffect =
   | { kind: 'timestamp'; shiftMs: number }
   | { kind: 'oversized'; bytes: number };
 
-export type ChaosRule = { id?: string; match: ChaosMatch; effect: ChaosEffect | ChaosFaultEffect; once?: boolean };
+export type ChaosRule = { id?: string; match: ChaosMatch; effect: ChaosEffect; once?: boolean };
 
 /**
- * `effect` is what happens to the frame (null: nothing). `delayed` is set when a delay rule matched as well as the
- * rule behind `effect`: the frame is held `delayed.ms` first. A delay alone comes back as `effect` itself (a `jitter`
- * or `slowRead` as `{ kind: 'delay', ms }` with the drawn delay). `fault` is set, with `effect` null, when the other
- * rule is a `ChaosFaultEffect` that is not a delay; `rule` is then that rule.
+ * `effect` is what happens to the frame (null: nothing) and `rule` the rule behind it. `delayed` is set when a delay
+ * rule matched as well as that rule: the frame is held `delayed.ms` first. A delay alone comes back as `effect` itself
+ * (a `jitter` or `slowRead` as `{ kind: 'delay', ms }` with the drawn delay).
  */
 export type ChaosDecision = {
   effect: ChaosEffect | null;
-  fault?: ChaosFaultEffect;
   rule?: ChaosRule;
   delayed?: { ms: number; rule: ChaosRule };
 };
@@ -97,11 +89,6 @@ export type ChaosDecision = {
 const OUT_ONLY: ReadonlySet<string> = new Set(['invalidEnum', 'missingField', 'timestamp', 'oversized']);
 const IN_ONLY: ReadonlySet<string> = new Set(['slowRead']);
 const DELAYS: ReadonlySet<string> = new Set(['delay', 'jitter', 'slowRead']);
-
-/** True for the effects `ChaosEngine.decide` resolves to a delay: `delay`, `jitter` and `slowRead`. */
-export function isDelayEffect(effect: ChaosEffect | ChaosFaultEffect): boolean {
-  return DELAYS.has(effect.kind);
-}
 
 const MESSAGE_TYPES: Record<NonNullable<ChaosMatch['messageType']>, readonly number[]> = {
   call: [2, 6],
@@ -200,9 +187,7 @@ export class ChaosEngine {
       const effect = delay.effect.kind === 'delay' ? delay.effect : { kind: 'delay' as const, ms: delayMs };
       return { effect, rule: delay };
     }
-    const decision: ChaosDecision = isFault(other.effect)
-      ? { effect: null, fault: other.effect, rule: other }
-      : { effect: other.effect, rule: other };
+    const decision: ChaosDecision = { effect: other.effect, rule: other };
     if (delay) decision.delayed = { ms: delayMs, rule: delay };
     return decision;
   }
@@ -234,20 +219,4 @@ export class ChaosEngine {
     this.counters.set(key, n);
     return n;
   }
-}
-
-const OLD_KINDS: ReadonlySet<string> = new Set([
-  'drop',
-  'delay',
-  'duplicate',
-  'corrupt',
-  'wrongId',
-  'callError',
-  'noResponse',
-  'mutate',
-]);
-
-/** A milestone-4 fault (`ChaosFaultEffect`) rather than one of the original `ChaosEffect`s. */
-export function isFault(effect: ChaosEffect | ChaosFaultEffect): effect is ChaosFaultEffect {
-  return !OLD_KINDS.has(effect.kind);
 }

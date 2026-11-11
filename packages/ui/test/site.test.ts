@@ -18,8 +18,24 @@ import {
   thermalLevel,
   trippedAt,
 } from '../src/lib/site-model';
-import { layoutSld, overlaps, type SldLayout } from '../src/lib/sld-layout';
+import { layoutSld, type SldItem, type SldLayout } from '../src/lib/sld-layout';
 import { initialState, reduce, reduceAll } from '../src/state/store';
+
+/** Pairs of items whose boxes overlap; empty for a good layout. */
+function overlaps(layout: SldLayout): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  const it = layout.items;
+  for (let a = 0; a < it.length; a++) {
+    for (let b = a + 1; b < it.length; b++) {
+      const p = it[a] as SldItem;
+      const q = it[b] as SldItem;
+      const x = Math.min(p.x1, q.x1) - Math.max(p.x0, q.x0);
+      const y = Math.min(p.y + p.h, q.y + q.h) - Math.max(p.y, q.y);
+      if (x > 0.5 && y > 0.5) out.push([p.id, q.id]);
+    }
+  }
+  return out;
+}
 
 function allIds(desc: SiteDescription): string[] {
   const out: string[] = [];

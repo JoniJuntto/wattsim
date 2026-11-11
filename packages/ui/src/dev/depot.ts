@@ -10,7 +10,7 @@ const ROTATIONS = ['L1L2L3', 'L2L3L1', 'L3L1L2'] as const;
 
 export const isVan = (i: number) => i % 10 === 0;
 
-export function chargerNodes(from: number, to: number): NodeDescription[] {
+function chargerNodes(from: number, to: number): NodeDescription[] {
   const out: NodeDescription[] = [];
   for (let i = from, k = 0; i <= to; i++, k++) {
     const id = `CP-${i}`;
@@ -112,17 +112,18 @@ export function depotDescription(chargers = 20): SiteDescription {
                         id: 'HVAC',
                         pf: 0.9,
                         model: {
-                          type: 'daily',
+                          type: 'profile',
                           interpolation: 'linear',
-                          points: [
-                            [0, 8000],
-                            [6, 12_000],
-                            [9, 30_000],
-                            [14, 38_000],
-                            [18, 20_000],
-                            [22, 10_000],
-                            [24, 8000],
-                          ],
+                          loop: 'daily',
+                          csv: [
+                            '00:00,8000',
+                            '06:00,12000',
+                            '09:00,30000',
+                            '14:00,38000',
+                            '18:00,20000',
+                            '22:00,10000',
+                            '24:00,8000',
+                          ].join('\n'),
                         },
                       } as unknown as NodeDescription,
                       {

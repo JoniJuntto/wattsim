@@ -1,7 +1,6 @@
 /**
  * Certificate status for the test CA without a network: the CA's own revocation table answers OCPP
- * `GetCertificateStatus` with a real, signed RFC 6960 OCSPResponse. Also the canned ISO 15118 answer for
- * `Get15118EVCertificate` (no EXI codec, no contract certificates).
+ * `GetCertificateStatus` with a real, signed RFC 6960 OCSPResponse.
  */
 import {
   BasicOCSPResponse,
@@ -21,8 +20,6 @@ import { AlgorithmIdentifier } from '@peculiar/asn1-x509';
 import * as x509 from '@peculiar/x509';
 import type { CertificateHashData, HashAlgorithm, KeyedCertificate, TestCa } from './pki';
 import { issuedByHashes, publicKeyBits, sameHashData } from './pki';
-
-export type CertificateStatus = 'good' | 'revoked' | 'unknown';
 
 /** OCPP `OCSPRequestDataType`: hash data plus the responder URL. */
 export type OcspRequestData = CertificateHashData & { responderURL: string };
@@ -46,7 +43,7 @@ function issuerFor(ca: TestCa, hash: CertificateHashData): KeyedCertificate | un
 }
 
 /** Status of a certificate from the CA's revocation table; `unknown` when this CA did not issue it. */
-export function certificateStatus(ca: TestCa, hash: CertificateHashData): CertificateStatus {
+export function certificateStatus(ca: TestCa, hash: CertificateHashData): 'good' | 'revoked' | 'unknown' {
   if (!issuerFor(ca, hash)) return 'unknown';
   return ca.revoked.has(hash.serialNumber.replace(/^0+/, '').toUpperCase()) ? 'revoked' : 'good';
 }
@@ -113,40 +110,3 @@ export async function ocspResponse(ca: TestCa, req: CertificateHashData, now = n
   });
   return Buffer.from(AsnConvert.serialize(response)).toString('base64');
 }
-
-/** Decode a base64 OCSPResponse into the status of its first single response (for tests and CSMS-side checks). */
-export function readOcspResponse(base64: string): { responseStatus: number; certStatus?: CertificateStatus } {
-  const res = AsnConvert.parse(Buffer.from(base64, 'base64'), OCSPResponse);
-  if (!res.responseBytes) return { responseStatus: res.responseStatus };
-  const basic = AsnConvert.parse(res.responseBytes.response, BasicOCSPResponse);
-  const first = basic.tbsResponseData.responses[0];
-  const s = first?.certStatus;
-  const certStatus: CertificateStatus | undefined = !s
-    ? undefined
-    : s.revoked
-      ? 'revoked'
-      : s.good !== undefined
-        ? 'good'
-        : 'unknown';
-  return { responseStatus: res.responseStatus, certStatus };
-}
-
-/**
- * Canned `Get15118EVCertificateResponse` content: `Accepted` with a fixed base64 placeholder in place of an EXI
- * CertificateInstallationRes, or `Failed` with a reason. wattsim implements no ISO 15118 stack.
- */
-export function cannedEv15118Response(accepted = true): {
-  status: 'Accepted' | 'Failed';
-  exiResponse: string;
-  statusInfo?: { reasonCode: string; additionalInfo: string };
-} {
-  if (accepted) return { status: 'Accepted', exiResponse: CANNED_EXI };
-  return {
-    status: 'Failed',
-    exiResponse: '',
-    statusInfo: { reasonCode: 'NotSupported', additionalInfo: 'wattsim has no ISO 15118 contract certificate pool' },
-  };
-}
-
-/** Base64 of the ASCII text `wattsim-canned-15118-exi`: recognisable, and not a real EXI stream. */
-export const CANNED_EXI = Buffer.from('wattsim-canned-15118-exi').toString('base64');

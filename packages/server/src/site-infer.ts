@@ -33,7 +33,7 @@ export type InferEvse = {
   limit?: { amps?: number; kw?: number };
 };
 
-export type InferInput = {
+type InferInput = {
   t: number;
   /** Site nodes in tree order (`Site.nodes`). */
   nodes: readonly NodeInfo[];

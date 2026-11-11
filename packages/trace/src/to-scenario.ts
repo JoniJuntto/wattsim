@@ -30,7 +30,7 @@
  */
 import type { OcppVersion } from '@wattsim/protocol';
 import { CALL_ERROR_CODES, MessageType } from '@wattsim/protocol';
-import { format, formatDuration, parse } from '@wattsim/scenario';
+import { DSL_VERSION, dslJson, dslString, format, formatDuration, IDENT_RE, parse } from '@wattsim/scenario';
 import type { TraceEntry } from './entry';
 import { correlate, isCallLike } from './entry';
 import type { IgnoreMatcher } from './replay';
@@ -43,40 +43,9 @@ export type ToScenarioOptions = {
   version?: OcppVersion;
   /** Emit `wait` statements for the recorded gaps; default true. */
   timing?: boolean;
-  /** Keys left out of expected payloads; default the replay defaults. */
-  ignoreKeys?: readonly string[];
 };
 
-const DSL_VERSION: Record<OcppVersion, string> = { 'ocpp1.6': '1.6', 'ocpp2.0.1': '2.0.1', 'ocpp2.1': '2.1' };
-const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const TIMESTAMP = '<timestamp>';
-
-/** A DSL string literal. `{` would start an interpolation, so it is escaped with `"` and `\`. */
-function dslString(s: string): string {
-  return `"${s
-    .replace(/[\\"{]/g, (c) => `\\${c}`)
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t')}"`;
-}
-
-function dslNumber(n: number): string {
-  return n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 20 });
-}
-
-/** A JSON value in payload syntax; the timestamp placeholder of `loosen` is dropped by `dropPlaceholders` first. */
-function dslJson(v: unknown): string {
-  if (v === null || v === undefined) return 'null';
-  if (typeof v === 'string') return dslString(v);
-  if (typeof v === 'number') return Number.isFinite(v) ? dslNumber(v) : 'null';
-  if (typeof v === 'boolean') return String(v);
-  if (Array.isArray(v)) return `[${v.map(dslJson).join(', ')}]`;
-  if (typeof v === 'object') {
-    const entries = Object.entries(v as Record<string, unknown>).filter(([, x]) => x !== undefined);
-    return `{${entries.map(([k, x]) => `${IDENT_RE.test(k) ? k : dslString(k)}: ${dslJson(x)}`).join(', ')}}`;
-  }
-  return 'null';
-}
 
 /**
  * An `expect` pattern: `loosen` removes the ignored keys and turns timestamps into a placeholder; object keys
@@ -204,7 +173,7 @@ function planBoots(
 
 /** Convert a trace to canonical `.ws` text. Throws when an identity has no OCPP version and none is given. */
 export function toScenario(trace: readonly TraceEntry[], opts: ToScenarioOptions = {}): string {
-  const ignore = ignoreMatcher(opts.ignoreKeys ?? DEFAULT_IGNORE_KEYS);
+  const ignore = ignoreMatcher(DEFAULT_IGNORE_KEYS);
   const links = correlate(trace);
   const t0 = trace.reduce((m, e) => Math.min(m, e.ts), Number.POSITIVE_INFINITY);
   const identities: string[] = [];

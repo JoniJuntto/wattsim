@@ -11,17 +11,15 @@
  * caller, so fire-and-forget sends (heartbeats, meter values) never become unhandled rejections.
  */
 import type { CallFrame, OcppVersion, v201 } from '@wattsim/protocol';
-import { authorizePncPayload, chargingNeedsPayload } from './adapters/iso15118';
+import { chargingNeedsPayload } from './adapters/iso15118';
 import { ocpp16 } from './adapters/ocpp16';
-import { ocpp21 } from './adapters/ocpp21';
-import { ocpp201 } from './adapters/ocpp201';
+import { createOcpp2xAdapter, ocpp201 } from './adapters/ocpp201';
 import { schemeProblem, sendSignCertificate } from './adapters/security';
 import type {
   BootReason,
   CallOutcome,
   ResetRequest,
   SampleContext,
-  StationContext,
   TxUpdateTrigger,
   VersionAdapter,
 } from './adapters/types';
@@ -49,10 +47,8 @@ import {
 import type { EvConfig } from './ev';
 import { EvModel } from './ev';
 import { TypedEmitter } from './events';
-import type { MeterOptions, MeterSample } from './meter';
+import type { MeterSample } from './meter';
 import { MeterModel } from './meter';
-import type { OcmfReason } from './ocmf';
-import { OcmfSigner } from './ocmf';
 import type { PhaseCount } from './phases';
 import { resolvePower } from './phases';
 import type { CertificateSigningUse, SecurityConfig, SecurityEventKind, SecurityProfile } from './security';
@@ -106,20 +102,6 @@ export type StationConfig = {
   reconnect?: ConnectionOptions['reconnect'];
   /** Offline queue cap, see `ConnectionOptions.maxQueue`. */
   maxQueue?: number;
-  /**
-   * `physics` (default): the EV's soc curve, temperature derating and limits shape the power. `constant`: the EV
-   * draws a constant power (its limit at the initial soc, capped by the offer) and its soc and temperature stay put,
-   * for load runs that only need traffic.
-   */
-  meterModel?: 'physics' | 'constant';
-  /** Builds each EVSE's meter (default `new MeterModel(opts)`); return a subclass for another meter model. */
-  meterFactory?: (opts: MeterOptions) => MeterModel;
-  /** Builds the EV for `plugIn(evseId, config)` (default `new EvModel(config)`); return a subclass for another model. */
-  evFactory?: (cfg: Partial<EvConfig>) => EvModel;
-  /** Sign every energy register reading as OCMF with a per-station ECDSA P-256 key. Default false. */
-  signedMeterValues?: boolean;
-  /** PKCS#8 PEM P-256 private key for the OCMF signatures; default: generated on first use. */
-  meterSigningKey?: string;
   /** IANA time zone of the station (2.x `ClockCtrlr.TimeZone`); tariff times of day are local to it. Default UTC. */
   timeZone?: string;
   /** Socket factory, see `ConnectionOptions.socket`. */
@@ -284,20 +266,10 @@ export type CallInterceptor = (call: CallFrame) => CallAnswer;
 /** Base64 placeholder for an EV's EXI CertificateInstallationReq (no ISO 15118 stack). */
 const CANNED_EXI_REQUEST = btoa('wattsim-canned-15118-exi-request');
 
-const ADAPTERS: Record<OcppVersion, VersionAdapter> = { 'ocpp1.6': ocpp16, 'ocpp2.0.1': ocpp201, 'ocpp2.1': ocpp21 };
-
-/** Station state beyond the defaults (see `Station.rx`). */
-type Realism = {
-  constantPower: boolean;
-  evFactory: ((cfg: Partial<EvConfig>) => EvModel) | undefined;
-  /** `signedMeterValues`: false, true (key generated on first use) or the PKCS#8 PEM key. */
-  signing: boolean | string;
-  signer?: OcmfSigner;
-  tariffs?: TariffStore;
-  /** Smart-charging inputs per EVSE id at the last evaluation, while a profile applies. */
-  limits?: Map<number, { limit?: Limit; v2x?: V2xLimits }>;
-  /** IANA time zone (2.x `ClockCtrlr.TimeZone`); tariff conditions are local to it. */
-  tz: string;
+const ADAPTERS: Record<OcppVersion, VersionAdapter> = {
+  'ocpp1.6': ocpp16,
+  'ocpp2.0.1': ocpp201,
+  'ocpp2.1': createOcpp2xAdapter('ocpp2.1'),
 };
 
 function sameLimit(a: Limit | undefined, b: Limit | undefined): boolean {
@@ -340,7 +312,7 @@ function meanVoltage(v: readonly number[]): number | undefined {
   return sum / v.length;
 }
 
-export class Station extends TypedEmitter<StationEvents> implements StationContext {
+export class Station extends TypedEmitter<StationEvents> {
   readonly id: string;
   readonly version: OcppVersion;
   readonly clock: Clock;
@@ -385,8 +357,12 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   /** Handshake failures already reported since the last successful connection (one event per failure streak). */
   private handshakeReported: Set<HandshakeFailure> | undefined;
   private startupReported = false;
-  /** EV / meter / tariff state beyond the defaults; one field, created on first need, so plain stations stay small. */
-  private rx: Realism | undefined;
+  /** 2.1 default tariffs; created on first use. */
+  private tariffStore: TariffStore | undefined;
+  /** Smart-charging inputs per EVSE id at the last evaluation, while a profile applies. */
+  private limits: Map<number, { limit?: Limit; v2x?: V2xLimits }> | undefined;
+  /** IANA time zone (2.x `ClockCtrlr.TimeZone`); tariff conditions are local to it. */
+  private tz = 'UTC';
   /** Power supply state; undefined without `StationConfig.supply`, so plain stations pay one check. */
   private sup: SupplyState | undefined;
 
@@ -415,23 +391,15 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     this.hbMs = cfg.heartbeatMs;
     this.mvMs = this.cfg.meterIntervalMs;
     this.ratedKw = (this.cfg.maxCurrentA * this.cfg.phases * this.cfg.voltageV) / 1000;
-    if (cfg.meterModel === 'constant' || cfg.evFactory || cfg.signedMeterValues || cfg.timeZone !== undefined) {
-      // The time zone is checked only when given: an Intl formatter costs memory default stations need not pay.
-      if (cfg.timeZone !== undefined && !isTimeZone(cfg.timeZone)) {
-        throw new RangeError(`${cfg.id}: unknown time zone ${cfg.timeZone}`);
-      }
-      this.rx = {
-        constantPower: cfg.meterModel === 'constant',
-        evFactory: cfg.evFactory,
-        signing: cfg.signedMeterValues ? (cfg.meterSigningKey ?? true) : false,
-        tz: cfg.timeZone ?? 'UTC',
-      };
+    if (cfg.timeZone !== undefined) {
+      // Checked only when given: an Intl formatter costs memory default stations need not pay.
+      if (!isTimeZone(cfg.timeZone)) throw new RangeError(`${cfg.id}: unknown time zone ${cfg.timeZone}`);
+      this.tz = cfg.timeZone;
     }
-    const meterOf = cfg.meterFactory ?? ((o: MeterOptions) => new MeterModel(o));
     this.evses = Array.from({ length: evseCount }, (_, i) => ({
       id: i + 1,
       status: 'Available' as const,
-      meter: meterOf({ voltageV: this.cfg.voltageV, phases: this.cfg.phases }),
+      meter: new MeterModel({ voltageV: this.cfg.voltageV, phases: this.cfg.phases }),
       offeredKw: this.ratedKw,
     }));
     this.charging = new ProfileStore({
@@ -708,39 +676,18 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
 
   /** IANA time zone of the station; tariff times of day are local to it. */
   get timeZone(): string {
-    return this.rx?.tz ?? 'UTC';
+    return this.tz;
   }
 
   set timeZone(tz: string) {
     if (!isTimeZone(tz)) throw new RangeError(`${this.id}: unknown time zone ${tz}`);
-    this.realism.tz = tz;
+    this.tz = tz;
   }
 
   /** 2.1 default tariffs (SetDefaultTariff); created on first use. */
   get tariffs(): TariffStore {
-    const rx = this.realism;
-    rx.tariffs ??= new TariffStore(this.evses.length);
-    return rx.tariffs;
-  }
-
-  /** The OCMF signer (and its public key) when `signedMeterValues` is on; the key is generated on first use. */
-  get meterSigner(): OcmfSigner | undefined {
-    const rx = this.rx;
-    if (!rx || rx.signing === false) return undefined;
-    rx.signer ??= new OcmfSigner({
-      gateway: `${this.cfg.vendor} ${this.cfg.model}`,
-      gatewaySerial: this.cfg.serial ?? this.id,
-      gatewayVersion: this.cfg.firmware,
-      meterVendor: this.cfg.vendor,
-      meterModel: `${this.cfg.model} meter`,
-      privateKeyPem: typeof rx.signing === 'string' ? rx.signing : undefined,
-    });
-    return rx.signer;
-  }
-
-  private get realism(): Realism {
-    this.rx ??= { constantPower: false, evFactory: undefined, signing: false, tz: 'UTC' };
-    return this.rx;
+    this.tariffStore ??= new TariffStore(this.evses.length);
+    return this.tariffStore;
   }
 
   // ---- connection lifecycle --------------------------------------------------------------------------------
@@ -828,7 +775,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   async plugIn(evseId: number, ev?: EvModel | Partial<EvConfig>): Promise<void> {
     const evse = this.evseOrThrow(evseId);
     if (evse.ev) throw new Error(`EVSE ${evseId}: an EV is already plugged in`);
-    const model = ev instanceof EvModel ? ev : this.rx?.evFactory ? this.rx.evFactory(ev ?? {}) : new EvModel(ev);
+    const model = ev instanceof EvModel ? ev : new EvModel(ev);
     if (model.state === 'Unplugged') model.plug();
     this.integrate(evse);
     evse.ev = model;
@@ -884,26 +831,6 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     this.integrate(evse);
     ev.resume();
     this.refresh(evse);
-  }
-
-  /**
-   * ISO 15118 Plug & Charge (2.x): Authorize with the EV's contract id (`emaid`, idToken type eMAID) and the hash
-   * data of the installed V2G certificate chain, then start the transaction under that idToken. Resolves false when
-   * the CSMS does not accept the contract (or the certificate); no transaction starts then.
-   */
-  async plugAndCharge(evseId: number): Promise<boolean> {
-    if (this.version === 'ocpp1.6') throw new Error('Plug & Charge needs OCPP 2.0.1 or 2.1');
-    const evse = this.evseOrThrow(evseId);
-    const emaid = this.evOrThrow(evse).config.emaid;
-    if (emaid === undefined) throw new Error(`EVSE ${evseId}: the EV has no contract id (emaid)`);
-    const payload = await authorizePncPayload(this.version, emaid, this.sec);
-    const res = (await this.request('Authorize', payload)) as v201.AuthorizeResponse;
-    const ok =
-      res.idTokenInfo.status === 'Accepted' &&
-      (res.certificateStatus === undefined || res.certificateStatus === 'Accepted');
-    if (!ok) return false;
-    await this.beginTransaction(evseId, { idTag: emaid, idTokenType: 'eMAID' });
-    return true;
   }
 
   /** ISO 15118 (2.x): NotifyEVChargingNeeds for the EV on `evseId`: energy request, departure time, limits. */
@@ -1000,10 +927,6 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     }
     this.emitState();
     await this.request('StatusNotification', this.adapter.statusPayload(evse, this.clock, errorCode));
-  }
-
-  sendRaw(action: string, payload: unknown): Promise<unknown> {
-    return this.request(action, payload);
   }
 
   // ---- security ----------------------------------------------------------------------------------------------
@@ -1138,7 +1061,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     if (active) this.emitState();
   }
 
-  // ---- StationContext (used by adapters and the public methods above) ---------------------------------------
+  // ---- used by the adapters and the public methods above -----------------------------------------------------
 
   request(action: string, payload: unknown): Promise<unknown> {
     // A dark station sends nothing; what it would have sent is lost (its transactions end after the power is back).
@@ -1185,7 +1108,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     await Promise.all(
       targets.map((evse) => {
         this.integrate(evse);
-        const sample = evse.tx ? this.takeSample(evse, evse.tx, 'Trigger') : this.sampleOf(evse, undefined, 'Trigger');
+        const sample = evse.tx ? this.takeSample(evse, evse.tx, 'Trigger') : this.sampleOf(evse);
         if (!evse.tx) this.emit('meter', evse.id, sample);
         return this.request('MeterValues', this.adapter.meterValuesPayload(evse, sample, 'Trigger'));
       }),
@@ -1225,7 +1148,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     if (evse.meter.exported > 0) tx.meterStartExportWh = evse.meter.exported;
     evse.tx = tx;
     evse.idTag = tx.idTag;
-    const tariffs = this.rx?.tariffs;
+    const tariffs = this.tariffStore;
     if (tariffs && this.version === 'ocpp2.1') {
       const tariff = tariffs.defaultFor(evse.id, now);
       if (tariff) tx.cost = new TransactionCost(tariff, now, this.timeZone);
@@ -1429,8 +1352,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     tx.lastTickAt = now;
     let kw = this.drawKw(evse);
     if (now <= t) return;
-    // The constant model keeps the EV where it started: same soc, same temperature, same power.
-    const ev = this.rx?.constantPower ? undefined : evse.ev;
+    const ev = evse.ev;
     const voltageV = evse.meter.voltageV;
     const phases = evse.phases ?? this.cfg.phases;
     // Idle time before a driver tariff arrives counts towards its conditions (2.1 only).
@@ -1463,18 +1385,17 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
   /** Set or clear the smart-charging inputs of one EVSE, then recompute its offer. */
   private applyLimit(evse: EvseState, limit: Limit | undefined, v2x: V2xLimits | undefined): void {
     evse.limitKw = limit?.kw;
-    if (limit === undefined && v2x === undefined) this.rx?.limits?.delete(evse.id);
+    if (limit === undefined && v2x === undefined) this.limits?.delete(evse.id);
     else {
-      const rx = this.realism;
-      rx.limits ??= new Map();
-      rx.limits.set(evse.id, { limit, v2x });
+      this.limits ??= new Map();
+      this.limits.set(evse.id, { limit, v2x });
     }
     this.reoffer(evse);
   }
 
   /** Phases, offer and V2X target of one EVSE from every limit in force (see `resolvePower`). */
   private reoffer(evse: EvseState): void {
-    const inputs = this.rx?.limits?.get(evse.id);
+    const inputs = this.limits?.get(evse.id);
     const ev = evse.ev;
     // The supply's live phases cap the phases in use the way the EV's own phase count does.
     const live = this.sup ? this.livePhases(evse, ev?.config.phases ?? 3) : undefined;
@@ -1501,7 +1422,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
 
   /** True when the smart-charging inputs differ from those last applied to `evse`. */
   private limitChanged(evse: EvseState, limit: Limit | undefined, v2x: V2xLimits | undefined): boolean {
-    const prev = this.rx?.limits?.get(evse.id);
+    const prev = this.limits?.get(evse.id);
     if (!prev) return limit !== undefined || v2x !== undefined;
     return (
       !sameLimit(prev.limit, limit) ||
@@ -1523,7 +1444,7 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     const v2x = !empty && this.charging.hasV2x;
     let changedAny = false;
     for (const evse of this.evses) {
-      if (empty && !this.rx?.limits?.has(evse.id)) continue;
+      if (empty && !this.limits?.has(evse.id)) continue;
       const limit = empty ? undefined : this.charging.limitDetail(evse.id, now);
       const v2xLimits = v2x ? this.charging.v2xAt(evse.id, now) : undefined;
       const values = v2xLimits && (v2xLimits.setpoint || v2xLimits.dischargeLimit) ? v2xLimits : undefined;
@@ -1599,43 +1520,18 @@ export class Station extends TypedEmitter<StationEvents> implements StationConte
     return true;
   }
 
-  /** A meter sample; OCMF-signed when `signedMeterValues` is on. */
-  private sampleOf(
-    evse: EvseState,
-    tx: TransactionState | undefined,
-    context: SampleContext,
-    atMs?: number,
-  ): MeterSample {
+  /** A meter sample. */
+  private sampleOf(evse: EvseState, atMs?: number): MeterSample {
     // The voltage the site delivers right now (it moves with the load), not the nominal one; the current follows.
     const s = this.sup?.source(evse.id);
     const sample = evse.meter.sample(this.clock, evse.ev?.soc, s ? meanVoltage(s.voltageV) : undefined);
     if (atMs !== undefined) sample.timestamp = new Date(atMs).toISOString();
-    const signer = this.meterSigner;
-    if (signer) {
-      const reason: OcmfReason | undefined =
-        tx === undefined
-          ? undefined
-          : context === 'Transaction.Begin'
-            ? 'B'
-            : context === 'Transaction.End'
-              ? 'E'
-              : 'C';
-      const ocmf = signer.sign({
-        timeMs: atMs ?? this.clock.now(),
-        wh: sample.energyWh,
-        meterSerial: `${this.cfg.serial ?? this.id}-${evse.id}`,
-        tx: reason,
-        idTag: tx?.idTag,
-        idType: tx?.idTokenType,
-      });
-      sample.signed = { ocmf, publicKey: signer.publicKeyBase64 };
-    }
     return sample;
   }
 
   /** `atMs`: when the sample was taken, if not now (the end of a transaction lost in a power loss). */
   private takeSample(evse: EvseState, tx: TransactionState, context: SampleContext, atMs?: number): MeterSample {
-    const sample = this.sampleOf(evse, tx, context, atMs);
+    const sample = this.sampleOf(evse, atMs);
     tx.samples.push({ sample, context });
     if (tx.samples.length > MAX_TX_SAMPLES) tx.samples.shift();
     this.emit('meter', evse.id, sample);

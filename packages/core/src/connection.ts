@@ -15,12 +15,11 @@ import {
   FrameDecodeError,
   isKnownAction,
   MessageType,
-  newMessageId,
   SEND_ACTIONS,
   validatePayload,
   violationErrorCode,
 } from '@wattsim/protocol';
-import type { ChaosDirection, ChaosEffect, ChaosEngine, ChaosFaultEffect, ChaosRule } from './chaos';
+import type { ChaosDirection, ChaosEffect, ChaosEngine, ChaosRule } from './chaos';
 import type { Clock, Timer } from './clock';
 import { TypedEmitter } from './events';
 import { mutatePayload } from './faults';
@@ -36,7 +35,7 @@ export type ReconnectPolicy = { initialMs: number; maxMs: number; factor: number
  * TLS client settings for `wss://` (OCPP security profiles 2 and 3), passed to Bun's WebSocket. `ca` replaces the
  * system trust store; `cert` (PEM chain, leaf first) and `key` (PKCS#8 PEM) present a client certificate.
  */
-export type ConnectionTls = { ca?: string | string[]; cert?: string; key?: string; rejectUnauthorized?: boolean };
+export type ConnectionTls = { ca?: string | string[]; cert?: string; key?: string };
 
 /** The parts of a connection that `reconfigure` can change; they apply from the next socket opened. */
 export type ConnectionEndpoint = {
@@ -348,7 +347,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   }
 
   /** Close the socket and stop reconnecting. Queued requests stay queued for the next `connect()`. */
-  disconnect(code = 1000): Promise<void> {
+  disconnect(): Promise<void> {
     this.wantConnected = false;
     this.cancelReconnectTimer();
     this.stopStorm();
@@ -361,7 +360,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
     }
     return new Promise<void>((resolve) => {
       this.closeWaiters.push(resolve);
-      ws.close(code);
+      ws.close(1000);
     });
   }
 
@@ -409,7 +408,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   request(action: string, payload: unknown): Promise<unknown> {
     if (this.strict) this.check(action, 'request', payload);
     return new Promise<unknown>((resolve, reject) => {
-      this.queue.push({ id: newMessageId(), action, payload, resolve, reject });
+      this.queue.push({ id: crypto.randomUUID(), action, payload, resolve, reject });
       this.enforceQueueCap();
       this.pump();
     });
@@ -572,14 +571,14 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
   /** Apply outbound chaos, then transmit. `action` is the hint for frames that carry none. */
   private send(frame: Frame, action: string): void {
     const decision = this.chaos?.decide('out', frame, action);
-    if (!decision?.rule || (!decision.effect && !decision.fault)) {
+    if (!decision?.rule || !decision.effect) {
       this.transmit(frame, encodeFrame(frame));
       return;
     }
-    const { effect, fault, delayed } = decision;
+    const { effect, delayed } = decision;
     if (delayed) this.emit('chaos', delayed.rule, frame);
     this.emit('chaos', decision.rule, frame);
-    const apply = fault ? () => this.faultOut(frame, action, fault) : () => this.applyOut(frame, effect as ChaosEffect);
+    const apply = () => this.applyOut(frame, action, effect);
     if (delayed) this.later(apply, delayed.ms);
     else apply();
   }
@@ -595,33 +594,8 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
     timers.add(timer);
   }
 
-  /** Apply one outbound milestone-4 fault (a delay-class one never gets here: `decide` resolves it). */
-  private faultOut(frame: Frame, action: string, fault: ChaosFaultEffect): void {
-    switch (fault.kind) {
-      case 'reorder':
-        this.hold('out', fault.after, () => this.transmit(frame, encodeFrame(frame)));
-        return;
-      case 'halfOpen':
-        this.goHalfOpen(fault.ms);
-        return;
-      case 'reconnectStorm':
-        this.transmit(frame, encodeFrame(frame));
-        this.startStorm(fault.count, fault.windowMs);
-        return;
-      default: {
-        if (!('payload' in frame)) {
-          this.transmit(frame, encodeFrame(frame));
-          return;
-        }
-        const kind = frame.type === MessageType.CallResult ? 'response' : 'request';
-        const f = { ...frame, payload: mutatePayload(this.version, action, kind, frame.payload, fault) };
-        this.transmit(f, encodeFrame(f));
-      }
-    }
-  }
-
-  /** Apply one outbound chaos effect. */
-  private applyOut(frame: Frame, effect: ChaosEffect): void {
+  /** Apply one outbound chaos effect (`jitter` and `slowRead` never get here: `decide` resolves them to a delay). */
+  private applyOut(frame: Frame, action: string, effect: ChaosEffect): void {
     switch (effect.kind) {
       case 'drop':
       case 'noResponse':
@@ -638,7 +612,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
         this.transmit(frame, corruptRaw(encodeFrame(frame)));
         return;
       case 'wrongId': {
-        const f = { ...frame, id: newMessageId() };
+        const f = { ...frame, id: crypto.randomUUID() };
         this.transmit(f, encodeFrame(f));
         return;
       }
@@ -652,6 +626,33 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
         this.transmit(f, encodeFrame(f));
         return;
       }
+      case 'reorder':
+        this.hold('out', effect.after, () => this.transmit(frame, encodeFrame(frame)));
+        return;
+      case 'halfOpen':
+        this.goHalfOpen(effect.ms);
+        return;
+      case 'reconnectStorm':
+        this.transmit(frame, encodeFrame(frame));
+        this.startStorm(effect.count, effect.windowMs);
+        return;
+      case 'invalidEnum':
+      case 'missingField':
+      case 'timestamp':
+      case 'oversized': {
+        if (!('payload' in frame)) {
+          this.transmit(frame, encodeFrame(frame));
+          return;
+        }
+        const kind = frame.type === MessageType.CallResult ? 'response' : 'request';
+        const f = { ...frame, payload: mutatePayload(this.version, action, kind, frame.payload, effect) };
+        this.transmit(f, encodeFrame(f));
+        return;
+      }
+      case 'jitter':
+      case 'slowRead':
+        this.transmit(frame, encodeFrame(frame));
+        return;
     }
   }
 
@@ -761,37 +762,22 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
           ? this.inflight.action
           : undefined;
     const decision = this.chaos?.decide('in', frame, hint);
-    if (!decision?.rule || (!decision.effect && !decision.fault)) {
+    if (!decision?.rule || !decision.effect) {
       this.dispatch(frame);
       return;
     }
-    const { effect, fault, delayed } = decision;
+    const { effect, delayed } = decision;
     if (delayed) this.emit('chaos', delayed.rule, frame);
     this.emit('chaos', decision.rule, frame);
-    const apply = fault ? () => this.faultIn(frame, fault) : () => this.applyIn(frame, raw, effect as ChaosEffect);
+    const apply = () => this.applyIn(frame, raw, effect);
     if (delayed) this.later(apply, delayed.ms);
     else apply();
   }
 
-  /** Apply one inbound milestone-4 fault. Protocol mutations never get here: `decide` skips them inbound. */
-  private faultIn(frame: Frame, fault: ChaosFaultEffect): void {
-    switch (fault.kind) {
-      case 'reorder':
-        this.hold('in', fault.after, () => this.dispatch(frame));
-        return;
-      case 'halfOpen':
-        this.goHalfOpen(fault.ms);
-        return;
-      case 'reconnectStorm':
-        this.dispatch(frame);
-        this.startStorm(fault.count, fault.windowMs);
-        return;
-      default:
-        this.dispatch(frame);
-    }
-  }
-
-  /** Apply one inbound chaos effect. */
+  /**
+   * Apply one inbound chaos effect. The protocol mutations never get here (`decide` skips them inbound), nor do
+   * `jitter` and `slowRead` (resolved to a delay).
+   */
   private applyIn(frame: Frame, raw: string, effect: ChaosEffect): void {
     switch (effect.kind) {
       case 'drop':
@@ -807,7 +793,7 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
         this.emit('error', new FrameDecodeError('frame corrupted by chaos', corruptRaw(raw)));
         return;
       case 'wrongId':
-        this.dispatch({ ...frame, id: newMessageId() });
+        this.dispatch({ ...frame, id: crypto.randomUUID() });
         return;
       case 'callError':
         if (frame.type === MessageType.Call) {
@@ -821,6 +807,18 @@ export class Connection extends TypedEmitter<ConnectionEvents> {
       case 'mutate':
         this.dispatch('payload' in frame ? { ...frame, payload: effect.fn(frame.payload) } : frame);
         return;
+      case 'reorder':
+        this.hold('in', effect.after, () => this.dispatch(frame));
+        return;
+      case 'halfOpen':
+        this.goHalfOpen(effect.ms);
+        return;
+      case 'reconnectStorm':
+        this.dispatch(frame);
+        this.startStorm(effect.count, effect.windowMs);
+        return;
+      default:
+        this.dispatch(frame);
     }
   }
 

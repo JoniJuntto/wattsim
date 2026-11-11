@@ -32,7 +32,7 @@ type FunctionKeys<T> = {
 /** The `EvConfig` fields a scenario can set: all but the functions (`curve`, `temperatureDerate`). */
 export type EvConfigField = Exclude<keyof EvConfig, FunctionKeys<EvConfig>>;
 
-export const EV_CONFIG_FIELDS = {
+const EV_CONFIG_FIELDS = {
   batteryKwh: 'kWh',
   initialSoc: 'fraction',
   targetSoc: 'fraction',

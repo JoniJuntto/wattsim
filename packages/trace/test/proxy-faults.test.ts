@@ -6,8 +6,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { Station } from '@wattsim/core';
 import { INVALID_ENUM_VALUE, PADDING_FIELD, Station as StationClass, VirtualClock } from '@wattsim/core';
 import { FakeCsms, until } from '../../core/test/fake-csms';
-import type { OcppProxy, TraceEntry } from '../src/index';
-import { chaosPerIdentity, parseChaosRules, Recorder, startProxy } from '../src/index';
+import type { TraceEntry } from '../src/index';
+import { chaosPerIdentity, OcppProxy, parseChaosRules, Recorder } from '../src/index';
 import { newStation, settle, T0 } from './helpers';
 
 let csms: FakeCsms;
@@ -17,7 +17,7 @@ let sclock: VirtualClock;
 let recorder: Recorder;
 
 beforeEach(async () => {
-  csms = await FakeCsms.start({ listen: true });
+  csms = await FakeCsms.start();
   pclock = new VirtualClock(T0);
   sclock = new VirtualClock(T0);
   recorder = new Recorder();
@@ -29,7 +29,7 @@ afterEach(async () => {
 });
 
 async function startWith(rules: string): Promise<OcppProxy> {
-  proxy = await startProxy({
+  proxy = new OcppProxy({
     listen: 0,
     upstream: csms.url,
     record: recorder,
@@ -233,7 +233,7 @@ describe('protocol faults mutate what the charger sends', () => {
     await station.plugIn(1);
     await station.startTransaction(1, 'TAG-1');
     await settle(station, sclock);
-    await station.sendRaw('DataTransfer', { vendorId: 'v' });
+    await station.request('DataTransfer', { vendorId: 'v' });
     await settle(station, sclock);
 
     const got = (action: string) => csms.callsFrom('CP-PROTO', action).map((c) => c.payload as Record<string, unknown>);

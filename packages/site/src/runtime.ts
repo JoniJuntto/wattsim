@@ -42,8 +42,8 @@ import {
   type ViolationKind,
 } from '@wattsim/grid';
 import { AllocationLog, type AllocationStep } from './alloc-log';
-import { type Allocation, type AllocationReason, ReferenceController, type ReferenceOptions } from './controller';
-import { type ModbusOptions, type ServedMeter, SiteMeters } from './meters';
+import { type Allocation, ReferenceController, type ReferenceOptions } from './controller';
+import { findDesc, type ModbusOptions, type ServedMeter, SiteMeters } from './meters';
 import { ScoreAccumulator } from './score';
 import { SeriesRecorder, type SiteSeries } from './series';
 
@@ -64,18 +64,8 @@ export type SiteRuntimeOptions = {
   loadStepMs?: number;
   /** Time series resolution, ms. Default 10000. */
   seriesMs?: number;
-  /** Most time series points (the resolution doubles when full). Default 10000. */
-  maxPoints?: number;
-  /** Most bytes of JSON the time series takes in the report (the resolution doubles when full). Default 6 MB. */
-  maxSeriesBytes?: number;
-  /** Most allocations kept (thinned to half when full, keeping events and extremes). Default 10000. */
-  maxAllocations?: number;
-  /** Most bytes of JSON the allocations take in the report (thinned the same way). Default 6 MB. */
-  maxAllocationBytes?: number;
   /** Load models read `t + timeOffsetMs` (a site `time`); the site and the stations keep the run clock. */
   timeOffsetMs?: number;
-  /** Keep every score sample (`samples()`), e.g. to check the score against `dlmScore`. Default false. */
-  keepSamples?: boolean;
 };
 
 export type LeafInfo = { leafId: string; station: string; evseId: number; maxA: number };
@@ -129,8 +119,8 @@ export type SiteSnapshot = {
 };
 
 /**
- * The `--site-report` file: everything the Site page and its replay load. Version 2 stores the controller's steps as
- * `allocationSteps` against the keyframes in `allocations`; version 1 (older files) has every step in `allocations`.
+ * The `--site-report` file: everything the Site page and its replay load. Version 1 has every controller step in
+ * `allocations`; version 2 (older files) stored keyframes there and every step in `allocationSteps`.
  * `decodeAllocations`, `allocationAt` and `allocationCount` read both.
  */
 export type SiteReport = {
@@ -147,11 +137,11 @@ export type SiteReport = {
   events: Array<TripEvent | RecloseEvent>;
   violations: Violation[];
   /**
-   * The controller's steps. With `allocationSteps` (wattsim writes it), these are the keyframes the steps are encoded
-   * against, a coarser trail on their own: read the steps with `allocationAt` / `decodeAllocations`.
+   * The controller's steps. In a version-2 file these are the keyframes the steps are encoded against, a coarser
+   * trail on their own: read the steps with `allocationAt` / `decodeAllocations`.
    */
   allocations: Allocation[];
-  /** Every step kept: the index of its keyframe in `allocations`, or what changed since the step before. */
+  /** Version 2 only: every step kept, the index of its keyframe in `allocations` or what changed since the step before. */
   allocationSteps?: AllocationStep[];
   modbus: ServedMeter[];
   /** The state at the end of the run. */
@@ -184,7 +174,6 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
   private readonly loadStepMs: number;
   private readonly score = new ScoreAccumulator();
   private readonly series: SeriesRecorder;
-  private readonly kept: ScoreSample[] | undefined;
   private readonly history: Array<TripEvent | RecloseEvent> = [];
   private readonly allocations: AllocationLog;
   private readonly peaks = new Map<string, Triple>();
@@ -211,12 +200,8 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
     this.site = buildSite(opts.site, { startTime: this.startedAt });
     this.loadStepMs = opts.loadStepMs ?? 10_000;
     if (!(this.loadStepMs > 0)) throw new RangeError(`loadStepMs must be > 0, got ${this.loadStepMs}`);
-    this.series = new SeriesRecorder(opts.seriesMs ?? 10_000, opts.maxPoints ?? 10_000, opts.maxSeriesBytes);
-    this.allocations = new AllocationLog({
-      maxSteps: opts.maxAllocations ?? 10_000,
-      ...(opts.maxAllocationBytes !== undefined ? { maxBytes: opts.maxAllocationBytes } : {}),
-    });
-    this.kept = opts.keepSamples ? [] : undefined;
+    this.series = new SeriesRecorder(opts.seriesMs ?? 10_000);
+    this.allocations = new AllocationLog();
     for (const [id, m] of this.site.models) this.models.set(id, m);
     this.leafList = evseLeaves(opts.site.nodes);
     for (const l of this.leafList) {
@@ -409,11 +394,6 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
     return this.controller?.active ? 'reference' : 'none';
   }
 
-  /** Run a reference controller step now (for tests and the UI). */
-  controlNow(reason: AllocationReason = 'manual'): Allocation | undefined {
-    return this.controller?.step(reason);
-  }
-
   /** Requests in flight that a virtual-clock driver should wait for (controller profiles). */
   get pending(): number {
     return this.controller?.pending ?? 0;
@@ -451,11 +431,6 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
     return acc.result(Object.fromEntries(this.requests));
   }
 
-  /** Every score sample (with `keepSamples`), the pending one included. */
-  samples(): ScoreSample[] {
-    return [...(this.kept ?? []), ...(this.pendingSample ? [this.pendingSample] : [])];
-  }
-
   /** Trips so far, at one node or anywhere. */
   trips(nodeId?: string): TripEvent[] {
     return this.history.filter(
@@ -491,21 +466,6 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
     return this.meters.served;
   }
 
-  /** The Modbus reading of a meter node right now. */
-  meterReading(meterId: string) {
-    return this.meters.reading(meterId);
-  }
-
-  /** Controller steps kept so far. */
-  allocationCount(): number {
-    return this.allocations.length;
-  }
-
-  /** Controller step `i` kept so far (0 = oldest; numbers to 0.01). */
-  allocationAt(i: number): Allocation | undefined {
-    return this.allocations.at(i);
-  }
-
   /** Controller steps at or after `t` (the newest `limit`), numbers to 0.01: a live view's increment, no full copy. */
   allocationsSince(t: number, limit?: number): Allocation[] {
     return this.allocations.since(t, limit);
@@ -516,18 +476,13 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
     return this.series.since(t, limit);
   }
 
-  /** Every controller step kept so far, oldest first (numbers to 0.01). */
-  allocationList(): Allocation[] {
-    return this.allocations.all();
-  }
-
   /** Everything recorded, for `--site-report` and the Site page. */
   report(): SiteReport {
     const end = this.endedAt ?? this.siteTime();
     const state = this.site.state();
     return {
       format: 'wattsim-site-report',
-      version: 2,
+      version: 1,
       ...(this.site.description.name !== undefined ? { name: this.site.description.name } : {}),
       description: this.site.description,
       nodes: this.site.nodes,
@@ -643,7 +598,6 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
     }
     if (prev) {
       this.score.add(prev);
-      this.kept?.push(prev);
       this.peak(prev.state);
     }
     this.pendingSample = { t: st.t, state: st, ...(evse ? { evse } : {}) };
@@ -748,15 +702,7 @@ export class SiteRuntime extends TypedEmitter<SiteRuntimeEvents> {
   }
 
   private descOf(id: string): NodeDescription | undefined {
-    const walk = (nodes: readonly NodeDescription[]): NodeDescription | undefined => {
-      for (const n of nodes) {
-        if (n.id === id) return n;
-        const hit = n.children ? walk(n.children) : undefined;
-        if (hit) return hit;
-      }
-      return undefined;
-    };
-    return walk(this.site.description.nodes);
+    return findDesc(this.site.description.nodes, id);
   }
 }
 
@@ -769,7 +715,7 @@ function isLeafKind(kind: string): boolean {
 }
 
 /** Every EVSE leaf of a description, in tree order. */
-export function evseLeaves(nodes: readonly NodeDescription[]): LeafInfo[] {
+function evseLeaves(nodes: readonly NodeDescription[]): LeafInfo[] {
   const out: LeafInfo[] = [];
   const walk = (list: readonly NodeDescription[]) => {
     for (const n of list) {

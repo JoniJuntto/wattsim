@@ -29,6 +29,8 @@ export type StationView = {
   id: string;
   version: OcppVersion;
   csmsUrl: string;
+  /** The folder the fleet page lists it under; absent: ungrouped. */
+  folder?: string;
   connection: 'idle' | 'connecting' | 'open' | 'closed' | 'reconnecting' /* core ConnectionState */;
   booted: boolean;
   evses: EvseView[];
@@ -70,14 +72,13 @@ export type Violation = {
 
 // HTTP
 
-/** `persistent`: server mode with a data directory (history survives a restart). */
-export type Health = { ok: true; version: string; persistent?: boolean };
 export type Meta = {
   versions: OcppVersion[];
   actions: Record<OcppVersion, { stationSends: string[]; csmsSends: string[] }>;
 };
 
 export type CreateStationOptions = {
+  folder?: string;
   version: OcppVersion;
   csmsUrl: string;
   evses?: number;

@@ -140,7 +140,6 @@ export class GameCsms {
       now: new Date(this.clock.now()).toISOString(),
       nowMs: this.clock.now(),
       heartbeatInterval: 300,
-      blocked: new Set(),
       nextTransactionId: () => this.txIds++,
     };
   }

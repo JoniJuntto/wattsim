@@ -32,14 +32,13 @@ function request(v: OcppVersion, action: string): Record<string, unknown> {
   return REQUESTS[`${v}:${action}`] ?? (v === 'ocpp1.6' ? undefined : REQUESTS[`2x:${action}`]) ?? {};
 }
 
-function ctx(v: OcppVersion, blocked: string[] = []): DefaultContext {
+function ctx(v: OcppVersion): DefaultContext {
   let id = 1;
   return {
     version: v,
     now: new Date(T0).toISOString(),
     nowMs: T0,
     heartbeatInterval: 300,
-    blocked: new Set(blocked),
     nextTransactionId: () => id++,
   };
 }
@@ -82,22 +81,6 @@ describe('default replies', () => {
     const a = defaultReply('StartTransaction', req, c) as { transactionId: number };
     const b = defaultReply('StartTransaction', req, c) as { transactionId: number };
     expect(b.transactionId).toBe(a.transactionId + 1);
-  });
-
-  test('a blocked idTag / idToken is answered Blocked', () => {
-    expect(defaultReply('Authorize', { idTag: 'BAD' }, ctx('ocpp1.6', ['BAD']))).toEqual({
-      idTagInfo: { status: 'Blocked' },
-    });
-    expect(
-      defaultReply('Authorize', { idToken: { idToken: 'BAD', type: 'ISO14443' } }, ctx('ocpp2.1', ['BAD'])),
-    ).toEqual({ idTokenInfo: { status: 'Blocked' } });
-    const started = { ...request('ocpp2.0.1', 'TransactionEvent'), idToken: { idToken: 'BAD', type: 'ISO14443' } };
-    expect(defaultReply('TransactionEvent', started, ctx('ocpp2.0.1', ['BAD']))).toEqual({
-      idTokenInfo: { status: 'Blocked' },
-    });
-    expect(defaultReply('Authorize', { idTag: 'GOOD' }, ctx('ocpp1.6', ['BAD']))).toEqual({
-      idTagInfo: { status: 'Accepted' },
-    });
   });
 
   test('DataTransfer is UnknownVendorId, SignCertificate Accepted', () => {

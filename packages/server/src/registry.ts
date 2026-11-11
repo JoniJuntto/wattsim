@@ -16,13 +16,14 @@ import {
 } from '@wattsim/core';
 import type { Frame, Violation } from '@wattsim/protocol';
 import { isKnownAction, MessageType, validatePayload } from '@wattsim/protocol';
+import { dslJson, dslNumber, dslString } from '@wattsim/scenario';
 import { buildChaos } from './chaos';
 import { TrackedClock } from './clock';
 import type { FleetStationState } from './fleet';
 import type { ActionBody, ChaosBody, CreateStation } from './schemas';
 import { BadRequest } from './schemas';
 import { effectiveStep, STATUS_ORDER, StationSeries } from './series';
-import { dslJson, dslNumber, dslString, SessionRecorder } from './session';
+import { SessionRecorder } from './session';
 import type {
   ChaosRuleView,
   ConnectionView,
@@ -39,7 +40,7 @@ import type {
 
 export const FRAMES_PER_STATION = 2000;
 /** How long an action request waits for the station before answering 202 and letting the stream report the rest. */
-export const ACTION_WAIT_MS = 5000;
+const ACTION_WAIT_MS = 5000;
 /** CALL ids remembered per station to resolve the action of a CALLRESULT/CALLERROR. */
 const PENDING_IDS = 1000;
 const MS_PER_HOUR = 3_600_000;
@@ -64,6 +65,7 @@ type Entry = {
   id: string;
   version: OcppVersion;
   csmsUrl: string;
+  folder?: string;
   station: Station;
   clock: TrackedClock;
   chaos: ChaosEngine;
@@ -79,7 +81,7 @@ type Entry = {
 };
 
 /** What an action answers: `pending` when the station had not finished within `ACTION_WAIT_MS`. */
-export type ActionOutcome = { pending: false; result?: unknown } | { pending: true };
+type ActionOutcome = { pending: false; result?: unknown } | { pending: true };
 
 const noop = () => {};
 
@@ -127,6 +129,16 @@ export class Registry {
     return specs.map((s) => this.toView(this.createOne(s)));
   }
 
+  /** Move stations to `folder` (undefined: out of theirs) atomically: every id is checked before any is moved. */
+  setFolder(ids: string[], folder: string | undefined): StationView[] {
+    const entries = ids.map((id) => this.get(id));
+    for (const e of entries) {
+      e.folder = folder;
+      this.sink.stationChanged(e.id);
+    }
+    return entries.map((e) => this.toView(e));
+  }
+
   private createOne(s: CreateStation): Entry {
     const clock = new TrackedClock();
     const chaos = new ChaosEngine();
@@ -150,6 +162,7 @@ export class Registry {
       id: s.id,
       version: s.version as OcppVersion,
       csmsUrl: s.csmsUrl,
+      folder: s.folder,
       station,
       clock,
       chaos,
@@ -374,7 +387,7 @@ export class Registry {
           throw new BadRequest(`payload: ${body.action} request failed validation: ${detail}`);
         }
         return {
-          run: () => s.sendRaw(body.action, body.payload),
+          run: () => s.request(body.action, body.payload),
           line: `send ${body.action} ${dslJson(body.payload)}`,
         };
       }
@@ -510,11 +523,6 @@ export class Registry {
     };
   }
 
-  /** Bytes the time series of a station hold. */
-  seriesBytes(id: string): number {
-    return this.get(id).series.bytes();
-  }
-
   /**
    * The composite charging schedule of an EVSE (0: the grid connection) from now over `durationMs`, in kW: what the
    * station would answer GetCompositeSchedule with.
@@ -617,6 +625,7 @@ export class Registry {
       id: e.id,
       version: e.version,
       csmsUrl: e.csmsUrl,
+      folder: e.folder,
       connection: this.connectionView(e),
       booted: s.state.booted,
       evses: s.evses.map((evse) => evseView(evse, now, s.cfg.voltageV)),
@@ -661,7 +670,7 @@ function evseView(evse: EvseState, now: number, voltageV: number): EvseView {
 }
 
 /** One time-series sample of an EVSE as the model holds it now (energy and SoC extrapolated like `evseView`). */
-export function seriesSample(evse: EvseState, now: number, voltageV: number): SeriesSample {
+function seriesSample(evse: EvseState, now: number, voltageV: number): SeriesSample {
   const view = evseView(evse, now, voltageV);
   const meter = evse.meter;
   const current = meter.currentA;

@@ -25,7 +25,7 @@ export const NEAR_PCT = 80;
 export const OVER_PCT = 100;
 /** Thermal memory above this share of the trip threshold is "close to tripping". */
 export const THERMAL_NEAR = 0.8;
-export const THERMAL_WARM = 0.5;
+const THERMAL_WARM = 0.5;
 
 export type LoadLevel = 'ok' | 'near' | 'over' | 'dead';
 
@@ -52,7 +52,7 @@ export const LEVEL_LABEL: Record<LoadLevel, string> = {
   dead: 'de-energised',
 };
 
-export type ThermalLevel = 'cold' | 'warm' | 'near';
+type ThermalLevel = 'cold' | 'warm' | 'near';
 export function thermalLevel(x: number | undefined): ThermalLevel {
   if (x === undefined || x < THERMAL_WARM) return 'cold';
   return x < THERMAL_NEAR ? 'warm' : 'near';
@@ -84,7 +84,7 @@ export type NodeFrame = {
 
 export type Frame = { t: number; nodes: Record<string, NodeFrame> };
 
-export function nodeFrame(n: NodeState): NodeFrame {
+function nodeFrame(n: NodeState): NodeFrame {
   return {
     currentA: n.currentA,
     neutralA: n.neutralA,

@@ -1,16 +1,25 @@
 import { CheckCircle2Icon, SendIcon, WandSparklesIcon } from 'lucide-react';
-import { useId, useMemo, useState } from 'react';
+import { useDeferredValue, useId, useMemo, useState } from 'react';
 import { useMeta, useStationAction, useValidation } from '@/api/queries';
 import type { StationView } from '@/api/types';
-import { ActionPicker } from '@/components/app/action-picker';
 import { Button } from '@/components/ui/button';
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
-import { Kbd } from '@/components/ui/kbd';
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
-import { useDebounced } from '@/hooks/use-debounced';
 import { prettyJson } from '@/lib/format';
 import { cn } from '@/lib/utils';
+
+const KBD =
+  'pointer-events-none inline-flex h-5 min-w-5 items-center justify-center rounded-sm bg-muted px-1 font-sans text-xs font-medium text-muted-foreground select-none';
 
 type Parsed = { ok: true; value: unknown } | { ok: false; error: string };
 
@@ -35,7 +44,7 @@ export function SendMessagePanel({ station }: { station: StationView }) {
   const [result, setResult] = useState<{ action: string; result: unknown } | null>(null);
 
   const actions = meta.data?.actions[station.version]?.stationSends ?? [];
-  const debouncedText = useDebounced(text, 350);
+  const debouncedText = useDeferredValue(text);
   const parsed = useMemo(() => parseJson(debouncedText), [debouncedText]);
   const validation = useValidation(
     action && parsed.ok ? { version: station.version, action, payload: parsed.value } : null,
@@ -57,13 +66,21 @@ export function SendMessagePanel({ station }: { station: StationView }) {
     <div className="flex flex-col gap-3">
       <Field>
         <FieldLabel htmlFor={`${uid}-action`}>Action</FieldLabel>
-        <ActionPicker
-          id={`${uid}-action`}
-          value={action}
-          onChange={setAction}
-          groups={[{ heading: `Station to CSMS, OCPP ${station.version.replace('ocpp', '')}`, actions }]}
-          className="w-full sm:w-72"
-        />
+        <Select value={action} onValueChange={setAction}>
+          <SelectTrigger id={`${uid}-action`} className="w-full sm:w-72">
+            <SelectValue placeholder="Choose an action" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              <SelectLabel>Station to CSMS, OCPP {station.version.replace('ocpp', '')}</SelectLabel>
+              {actions.map((a) => (
+                <SelectItem key={a} value={a}>
+                  {a}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
         {meta.isError && <FieldDescription>Could not load the action list from the server.</FieldDescription>}
       </Field>
       <Field data-invalid={!!invalid && !settling}>
@@ -131,7 +148,8 @@ export function SendMessagePanel({ station }: { station: StationView }) {
           Send {action || 'message'}
         </Button>
         <span className="text-muted-foreground text-xs">
-          <Kbd>Ctrl</Kbd> + <Kbd>Enter</Kbd> sends. Strict validation still applies on the server.
+          <kbd className={KBD}>Ctrl</kbd> + <kbd className={KBD}>Enter</kbd> sends. Strict validation still applies on
+          the server.
         </span>
       </div>
       {result && (

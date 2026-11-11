@@ -3,15 +3,15 @@ import type { Station } from '@wattsim/core';
 import { ChaosEngine, VirtualClock } from '@wattsim/core';
 import { FrameDecodeError } from '@wattsim/protocol';
 import { FakeCsms, until } from '../../core/test/fake-csms';
-import type { OcppProxy, TraceEntry } from '../src/index';
-import { parseChaosRules, Recorder, readTrace, startProxy } from '../src/index';
+import type { TraceEntry } from '../src/index';
+import { OcppProxy, parseChaosRules, Recorder, readTrace } from '../src/index';
 import { actionsOf, newStation, recordSession16, settle, T0, tmpPath } from './helpers';
 
 let csms: FakeCsms;
 let proxy: OcppProxy | undefined;
 
 beforeEach(async () => {
-  csms = await FakeCsms.start({ listen: true });
+  csms = await FakeCsms.start();
 });
 afterEach(async () => {
   await proxy?.stop();
@@ -38,7 +38,7 @@ async function connected(clock: VirtualClock, opts: { id?: string } = {}): Promi
 describe('pass-through', () => {
   test('a Station session through the proxy: identical frames on both sides, complete recording', async () => {
     const path = await tmpPath('proxy.jsonl');
-    proxy = await startProxy({ listen: 0, upstream: csms.url, record: path });
+    proxy = new OcppProxy({ listen: 0, upstream: csms.url, record: path });
     const seen: { protocol?: string; auth?: string; clients?: string[] } = {};
     const stationSide = new Recorder();
     const { entries: atStation } = await recordSession16(
@@ -73,9 +73,9 @@ describe('pass-through', () => {
   });
 
   test('passes the Authorization header and mirrors the subprotocol upstream picks', async () => {
-    const strict = await FakeCsms.start({ listen: true, version: 'ocpp2.0.1' });
+    const strict = await FakeCsms.start({ version: 'ocpp2.0.1' });
     try {
-      proxy = await startProxy({ listen: 0, upstream: strict.url });
+      proxy = new OcppProxy({ listen: 0, upstream: strict.url });
       const ws = new WebSocket(`${proxy.url}/any/path/CP-AUTH`, {
         protocols: ['ocpp1.6', 'ocpp2.0.1'],
         headers: { Authorization: 'Basic Q1AtQVVUSDpzZWNyZXQ=' },
@@ -93,9 +93,9 @@ describe('pass-through', () => {
   });
 
   test('an upstream refusal reaches the charger with the same HTTP status', async () => {
-    const strict = await FakeCsms.start({ listen: true, version: 'ocpp2.0.1' });
+    const strict = await FakeCsms.start({ version: 'ocpp2.0.1' });
     try {
-      proxy = await startProxy({ listen: 0, upstream: strict.url });
+      proxy = new OcppProxy({ listen: 0, upstream: strict.url });
       const refused: Array<[string, number]> = [];
       proxy.on('refused', (id, status) => refused.push([id, status]));
       const ws = new WebSocket(`${proxy.url}/CP-OLD`, { protocols: ['ocpp1.6'] });
@@ -115,7 +115,7 @@ describe('pass-through', () => {
   });
 
   test('a close on either side closes the other with the same code', async () => {
-    proxy = await startProxy({ listen: 0, upstream: csms.url });
+    proxy = new OcppProxy({ listen: 0, upstream: csms.url });
     const open = () => {
       const ws = new WebSocket(`${(proxy as OcppProxy).url}/CP-CLOSE`, { protocols: ['ocpp1.6'] });
       return new Promise<WebSocket>((resolve) => {
@@ -139,7 +139,7 @@ describe('pass-through', () => {
   test('an undecodable frame is forwarded and recorded with its decode error', async () => {
     const clock = new VirtualClock(T0);
     const recorder = new Recorder();
-    proxy = await startProxy({ listen: 0, upstream: csms.url, record: recorder });
+    proxy = new OcppProxy({ listen: 0, upstream: csms.url, record: recorder });
     const station = await connected(clock, { id: 'CP-BAD' });
     const errors: Error[] = [];
     station.on('error', (e) => errors.push(e));
@@ -157,7 +157,7 @@ describe('chaos', () => {
   test('drop out Heartbeat nth 2: the CSMS never gets it, the recording has it, marked', async () => {
     const clock = new VirtualClock(T0);
     const recorder = new Recorder();
-    proxy = await startProxy({
+    proxy = new OcppProxy({
       listen: 0,
       upstream: csms.url,
       record: recorder,
@@ -191,7 +191,7 @@ describe('chaos', () => {
 
   test('delay in 5s holds the CSMS reply on the proxy clock', async () => {
     const clock = new VirtualClock(T0);
-    proxy = await startProxy({ listen: 0, upstream: csms.url, clock, chaos: engineFor('delay 5s in Heartbeat') });
+    proxy = new OcppProxy({ listen: 0, upstream: csms.url, clock, chaos: engineFor('delay 5s in Heartbeat') });
     const station = await connected(clock, { id: 'CP-SLOW' });
     let answered = false;
     void station.sendHeartbeat().then(() => {
@@ -208,7 +208,7 @@ describe('chaos', () => {
   test('callError in GetConfiguration: the proxy answers the CSMS itself and records the injected frame', async () => {
     const clock = new VirtualClock(T0);
     const recorder = new Recorder();
-    proxy = await startProxy({
+    proxy = new OcppProxy({
       listen: 0,
       upstream: csms.url,
       record: recorder,
@@ -230,7 +230,7 @@ describe('chaos', () => {
   test('the chaos note says what reached the other side: delivered text and copies', async () => {
     const clock = new VirtualClock(T0);
     const recorder = new Recorder();
-    proxy = await startProxy({
+    proxy = new OcppProxy({
       listen: 0,
       upstream: csms.url,
       record: recorder,
@@ -238,7 +238,7 @@ describe('chaos', () => {
       chaos: engineFor('corrupt out Heartbeat nth 1; callError out GetConfiguration; duplicate out DataTransfer'),
     });
     const station = await connected(clock, { id: 'CP-NOTE' });
-    void station.sendRaw('DataTransfer', { vendorId: 'v' }).catch(() => {});
+    void station.request('DataTransfer', { vendorId: 'v' }).catch(() => {});
     await until(() => csms.callsFrom('CP-NOTE', 'DataTransfer').length === 2, 1000, 'duplicated DataTransfer');
     await settle(station, clock);
     await expect(csms.call('CP-NOTE', 'GetConfiguration', {})).rejects.toThrow('CALLERROR InternalError');

@@ -93,7 +93,7 @@ describe('parse chaos.ws', () => {
     const body = s.stations[0]?.body ?? [];
     expect(body[2]).toEqual({
       kind: 'chaos',
-      fault: 'drop',
+      fault: { kind: 'drop' },
       direction: 'out',
       action: 'MeterValues',
       trigger: { kind: 'nth', n: { kind: 'number', value: 3, loc: { line: 17, col: 34 } } },
@@ -102,8 +102,7 @@ describe('parse chaos.ws', () => {
     } satisfies ChaosStmt);
     expect(body[3]).toMatchObject({
       kind: 'chaos',
-      fault: 'delay',
-      delay: { ms: 2000 },
+      fault: { kind: 'delay', delay: { ms: 2000 } },
       direction: 'in',
       trigger: { kind: 'every', n: { kind: 'number', value: 2 } },
     });
@@ -204,7 +203,7 @@ describe('parse kitchen-sink.ws', () => {
       if (!n) return undefined;
       return `${c.trigger?.kind ?? 'probability'} ${n.kind === 'number' ? n.value : n.name}`;
     };
-    expect(byKind('chaos').map((c) => [c.fault, c.direction, c.action, trigger(c), c.once])).toEqual([
+    expect(byKind('chaos').map((c) => [c.fault.kind, c.direction, c.action, trigger(c), c.once])).toEqual([
       ['drop', undefined, undefined, undefined, false],
       ['drop', 'out', 'MeterValues', 'nth 3', false],
       ['delay', 'in', undefined, 'every 2', false],
@@ -471,7 +470,7 @@ describe('parse m2.ws (milestone 2 syntax)', () => {
     expect(find('wait')?.duration).toMatchObject({ kind: 'ref', name: 'jitter' });
     expect(find('choose')?.branches.map((x) => x.percent)).toEqual([33.3, 66.7]);
     expect(find('chaos', 0)?.trigger).toMatchObject({ kind: 'nth', n: { kind: 'ref', name: 'n' } });
-    expect(find('chaos', 1)?.delay).toMatchObject({ kind: 'ref', name: 'pause' });
+    expect(find('chaos', 1)?.fault).toMatchObject({ kind: 'delay', delay: { kind: 'ref', name: 'pause' } });
     expect(find('chaos', 2)?.probability).toMatchObject({ kind: 'number', value: 0.5 });
   });
 

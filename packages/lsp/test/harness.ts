@@ -2,14 +2,14 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { pathToFileURL } from 'node:url';
+import type { PublishDiagnosticsParams } from 'vscode-languageserver';
 import {
+  createConnection,
   createMessageConnection,
   type MessageConnection,
   StreamMessageReader,
   StreamMessageWriter,
-} from 'vscode-jsonrpc/node';
-import type { PublishDiagnosticsParams } from 'vscode-languageserver';
-import { createConnection } from 'vscode-languageserver/node';
+} from 'vscode-languageserver/node';
 import { type ServerOptions, startServer } from '../src/server';
 
 export const FIXTURES = join(import.meta.dir, 'fixtures');

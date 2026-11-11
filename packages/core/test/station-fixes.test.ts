@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { CallFrame, OcppVersion, v16, v201 } from '@wattsim/protocol';
 import type { Clock, StationConfig, Timer } from '../src/index';
 import { RequestTimeoutError, Station, VirtualClock, WallClock } from '../src/index';
-import { connectInMemory, FakeCsms, until } from './fake-csms';
+import { FakeCsms, until } from './fake-csms';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
 const RATED_KW = 22.08;
@@ -16,7 +16,7 @@ let clock: VirtualClock;
 const open: Station[] = [];
 
 function make(version: OcppVersion, opts: Partial<StationConfig> = {}): Station {
-  const station = new Station({ id: 'CP1', version, csmsUrl: csms.url, socket: connectInMemory, clock, ...opts });
+  const station = new Station({ id: 'CP1', version, csmsUrl: csms.url, clock, ...opts });
   station.on('error', () => {});
   open.push(station);
   return station;
@@ -429,13 +429,11 @@ describe('Fix 12: a schedule boundary beyond the timer range', () => {
     let arms = 0;
     const counting: Clock = {
       now: () => wall.now(),
-      date: () => wall.date(),
       setTimeout(fn: () => void, ms: number): Timer {
         arms++;
         return wall.setTimeout(fn, ms);
       },
       setInterval: (fn, ms) => wall.setInterval(fn, ms),
-      sleep: (ms) => wall.sleep(ms),
     };
     const station = new Station({ id: 'CP1', version: 'ocpp2.0.1', csmsUrl: 'ws://127.0.0.1:1', clock: counting });
     station.charging.set({

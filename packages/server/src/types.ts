@@ -11,6 +11,7 @@ import type {
   TripEventCause,
 } from '@wattsim/grid';
 import type { Violation } from '@wattsim/protocol';
+import type { RunResult } from '@wattsim/scenario';
 import type { Allocation, LeafInfo, LeafSnapshot, SiteReport } from '@wattsim/site';
 
 export type OcppVersion = 'ocpp1.6' | 'ocpp2.0.1' | 'ocpp2.1';
@@ -46,6 +47,8 @@ export type StationView = {
   id: string;
   version: OcppVersion;
   csmsUrl: string;
+  /** The folder the fleet page lists it under; absent: ungrouped. */
+  folder?: string;
   connection: ConnectionView;
   booted: boolean;
   evses: EvseView[];
@@ -154,15 +157,8 @@ export type RunEventView =
   | { type: 'violation'; at: string; station: string; violation: Violation }
   | { type: 'station'; at: string; station: string; status: 'started' | 'finished' | 'failed'; error?: string };
 
-export type RunStationResult = {
-  name: string;
-  ok: boolean;
-  asserts: { ok: boolean; expect: string; message?: string }[];
-  error?: string;
-  durationMs: number;
-};
-
-export type RunResultView = { ok: boolean; stations: RunStationResult[]; violations: Violation[]; durationMs: number };
+/** A scenario `RunResult` without its site (that is in `site_reports`). */
+export type RunResultView = Omit<RunResult, 'site'>;
 
 export type RunDetail = RunSummary & {
   source: string;
@@ -287,7 +283,7 @@ export type StationSeriesView = {
   to: number;
   /** Bucket width the samples were downsampled to (ms); 0: every sample. */
   step: number;
-  /** Before this time some EVSE's samples were downsampled (min/max per 5 min); null: every sample is kept. */
+  /** Before this time some EVSE's older samples were dropped (each keeps its last 1024); null: every sample is kept. */
   fullResolutionFrom: number | null;
   evses: EvseSeriesView[];
 };

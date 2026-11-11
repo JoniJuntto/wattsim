@@ -12,7 +12,11 @@ const stationId = z
   .max(64)
   .regex(/^[^\s/]+$/, 'must not contain whitespace or "/"');
 
+/** A folder groups stations on the fleet page; it has no effect on how a station behaves. */
+const folder = z.string().trim().min(1).max(64);
+
 const stationOptions = {
+  folder: folder.optional(),
   version,
   csmsUrl: z.string().regex(/^wss?:\/\/\S+$/, 'must be a ws:// or wss:// URL'),
   evses: z.number().int().min(1).max(64).optional(),
@@ -39,7 +43,9 @@ export const createBulk = z
   .refine((b) => b.to - b.from < 1000, { message: 'at most 1000 stations per request', path: ['to'] });
 
 export type CreateStation = z.infer<typeof createStation>;
-export type StationOptions = Omit<CreateStation, 'id'>;
+
+/** Move stations into a folder; `null` takes them out of theirs. */
+export const moveStations = z.object({ ids: z.array(stationId).min(1).max(10_000), folder: folder.nullable() });
 
 export const CONNECTOR_STATUSES = [
   'Available',
@@ -54,7 +60,7 @@ export const CONNECTOR_STATUSES = [
 ] as const;
 
 /** Most reboots one `bootLoop` action takes. */
-export const MAX_BOOT_LOOPS = 20;
+const MAX_BOOT_LOOPS = 20;
 
 const withEvse = { evse };
 export const ACTION_SCHEMAS = {
@@ -109,20 +115,20 @@ export const ACTION_SCHEMAS = {
   reset: z.object({ mode: z.enum(['hard', 'soft']) }),
 } as const;
 
-export type ActionType = keyof typeof ACTION_SCHEMAS;
+type ActionType = keyof typeof ACTION_SCHEMAS;
 export type ActionBody = { [K in ActionType]: { type: K } & z.infer<(typeof ACTION_SCHEMAS)[K]> }[ActionType];
 
-/** The original transport faults: core `ChaosEffect`. */
+/** The transport faults that take no arguments but `delay`. */
 export const CHAOS_FAULTS = ['drop', 'delay', 'duplicate', 'corrupt', 'wrongId', 'callError', 'noResponse'] as const;
-/** Milestone-4 transport faults: core `ChaosFaultEffect`. */
-export const TRANSPORT_FAULTS = ['jitter', 'reorder', 'halfOpen', 'slowRead', 'reconnectStorm'] as const;
-/** Milestone-4 protocol faults: deliberate schema breaks in what the station sends. */
+/** Transport faults with their own arguments. */
+const TRANSPORT_FAULTS = ['jitter', 'reorder', 'halfOpen', 'slowRead', 'reconnectStorm'] as const;
+/** Protocol faults: deliberate schema breaks in what the station sends. */
 export const PROTOCOL_FAULTS = ['invalidEnum', 'missingField', 'timestamp', 'oversized'] as const;
 export const ALL_CHAOS_FAULTS = [...CHAOS_FAULTS, ...TRANSPORT_FAULTS, ...PROTOCOL_FAULTS] as const;
-export type ChaosFaultName = (typeof ALL_CHAOS_FAULTS)[number];
+type ChaosFaultName = (typeof ALL_CHAOS_FAULTS)[number];
 
 /** Largest `oversized` payload the API takes, in kB (1 kB = 1024 bytes). */
-export const MAX_OVERSIZED_KB = 1024;
+const MAX_OVERSIZED_KB = 1024;
 /** Longest delay-like parameter: a day. */
 const MAX_MS = 86_400_000;
 
@@ -321,7 +327,7 @@ export const createSite = z.object({
   version: version.optional(),
 });
 
-export const SITE_ACTION_SCHEMAS = {
+const SITE_ACTION_SCHEMAS = {
   trip: z.object({ node: nodeId, phases: z.array(phase).min(1).max(3).optional() }),
   reclose: z.object({ node: nodeId }),
   load: z

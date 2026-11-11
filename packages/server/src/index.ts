@@ -1,7 +1,7 @@
 /**
- * wattsim UI server: one Bun process, one port. Elysia for the JSON API, one WebSocket (`/api/stream`) pushing
- * station state and frames to the browser, the built UI served statically. Never touches OCPP sockets itself:
- * stations own those through `@wattsim/core`. Local-first, no auth (DESIGN.md §3).
+ * wattsim UI server: one Bun process, one port. `Bun.serve` with a small route table for the JSON API, one WebSocket
+ * (`/api/stream`) pushing station state and frames to the browser, the built UI served statically. Never touches
+ * OCPP sockets itself: stations own those through `@wattsim/core`. Local-first, no auth (DESIGN.md §3).
  *
  * No auth does not mean any web page may drive it: a state-changing request (POST, PUT, PATCH, DELETE) or a stream
  * upgrade whose `Origin` is not the server's own (nor one of `allowOrigins`) is a 403, and a request body must be
@@ -14,10 +14,9 @@ import { toJUnit as csmsJUnit } from '@wattsim/csms';
 import { type SiteDescription, validateSite } from '@wattsim/grid';
 import { validatePayload } from '@wattsim/protocol';
 import { toJUnit as runJUnit } from '@wattsim/scenario';
-import { Elysia } from 'elysia';
 import pkg from '../package.json' with { type: 'json' };
 import { Store } from './db/store';
-import { FLEET_BIN_MS, FleetAggregate } from './fleet';
+import { FleetAggregate } from './fleet';
 import { buildMeta } from './meta';
 import { fileName, sessionTrace } from './recording';
 import { Conflict, FRAMES_PER_STATION, NotFound, Registry } from './registry';
@@ -30,6 +29,7 @@ import {
   createBulk,
   createSite,
   createStation,
+  moveStations,
   parseAction,
   parseBody,
   parseSiteAction,
@@ -49,6 +49,7 @@ import { startTestCsmsOn, TestCsms } from './test-csms';
 import type { OcppVersion, ScenarioDiagnostic, SiteLive, SiteReportView, SiteSummary, StationView } from './types';
 
 export { DB_FILE } from './db/store';
+export { ACTION_SCHEMAS, ALL_CHAOS_FAULTS, CONNECTOR_STATUSES } from './schemas';
 export type {
   ChaosRuleView,
   CsmsReportSummary,
@@ -104,10 +105,6 @@ export type ServerOptions = {
    * one. The server's own origin is the request's `Host`, so every name it is reached under works.
    */
   allowOrigins?: string[];
-  /** Width of a fleet aggregate bin; default `FLEET_BIN_MS` (10 s). For tests. */
-  fleetBinMs?: number;
-  /** EVSE leaves a site may have to be shown, built or uploaded; default `MAX_SITE_LEAVES` (500). */
-  maxSiteLeaves?: number;
 };
 
 export type RunningServer = { url: string; stop(): Promise<void> };
@@ -116,15 +113,15 @@ export const DEFAULT_PORT = 7700;
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_MAX_STATIONS = 10_000;
 export const DEFAULT_MAX_RUNS = DEFAULT_RUN_LIMITS.maxRuns;
-export const DEFAULT_MAX_RUN_MS = DEFAULT_RUN_LIMITS.maxRunMs;
 /** The folder under the data directory that browser scenarios import from; nothing outside it is read. */
 export const SCENARIO_DIR = 'scenarios';
 const DEFAULT_UI_DIR = resolve(import.meta.dir, '../../ui/dist');
 const DEFAULT_FRAME_LIMIT = 500;
 /** Largest request body; an uploaded site report may be larger (`MAX_REPORT_BYTES`). */
-export const MAX_BODY_BYTES = 8 * 1024 * 1024;
-export const MAX_REPORT_BYTES = 64 * 1024 * 1024;
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_REPORT_BYTES = 64 * 1024 * 1024;
 const REPORT_UPLOAD = '/api/sites/reports';
+const STREAM_PATH = '/api/stream';
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -135,6 +132,7 @@ const download = (text: string, name: string, type: string) =>
   });
 const OOT_TYPE = 'application/x-ndjson';
 const XML_TYPE = 'application/xml';
+const NOT_FOUND = { error: 'not found' };
 
 /** A scenario that does not parse or link: 400 with editor diagnostics. */
 class InvalidScenario extends BadRequest {
@@ -156,7 +154,7 @@ function timeOf(raw: string | undefined, name: string, fallback: number): number
 }
 
 /** `from`, `to` (default: the last hour up to now) and `step` (ms, default 0) of a series query. */
-function windowOf(query: Record<string, string | undefined>, defaultSpanMs = HOUR_MS) {
+function windowOf(query: Query, defaultSpanMs = HOUR_MS) {
   const to = timeOf(query.to, 'to', Date.now());
   const from = timeOf(query.from, 'from', to - defaultSpanMs);
   if (from >= to) throw new BadRequest('from: must be before to');
@@ -211,9 +209,13 @@ function isLoopback(hostname: string): boolean {
   return LOOPBACK_HOSTS.has(hostname.toLowerCase()) || /^127\.\d+\.\d+\.\d+$/.test(hostname);
 }
 
-/** The host name of a `Host` header value, without its port; `[::1]:7700` gives `[::1]`. */
+/** The host name of a `Host` header value, without its port; `[::1]:7700` gives `[::1]`, garbage gives ''. */
 function hostName(host: string): string {
-  return host.startsWith('[') ? host.slice(0, host.indexOf(']') + 1) : (host.split(':')[0] ?? host);
+  try {
+    return new URL(`http://${host}`).hostname;
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -242,7 +244,7 @@ function guard(request: Request, allowed: ReadonlySet<string>, loopbackOnly: boo
   return undefined;
 }
 
-/** Request bodies arrive as text (see `onParse`) and are parsed here, so a bad one is a 400 like any other. */
+/** Request bodies arrive as text (`guard` has checked the content type) and are parsed here, so a bad one is a 400. */
 function body(raw: unknown): unknown {
   if (typeof raw !== 'string') return raw;
   if (raw.trim() === '') return {};
@@ -251,6 +253,76 @@ function body(raw: unknown): unknown {
   } catch {
     throw new BadRequest('body is not valid JSON');
   }
+}
+
+// ---- routing ------------------------------------------------------------------------------------------------------
+
+type Query = Record<string, string | undefined>;
+type Ctx = { params: Record<string, string>; query: Query; raw: string | undefined };
+type Handler = (c: Ctx) => unknown;
+type Route = { method: string; pattern: RegExp; keys: string[]; handler: Handler };
+
+/** `/api/stations/:id/frames`: one method and path pattern per route; a param takes one non-empty segment. */
+class Router {
+  private readonly routes: Route[] = [];
+
+  on(method: string, path: string, handler: Handler): this {
+    const keys: string[] = [];
+    const source = path.replace(/:(\w+)/g, (_, key: string) => {
+      keys.push(key);
+      return '([^/]+)';
+    });
+    this.routes.push({ method, pattern: new RegExp(`^${source}$`), keys, handler });
+    return this;
+  }
+
+  get = (path: string, handler: Handler) => this.on('GET', path, handler);
+  post = (path: string, handler: Handler) => this.on('POST', path, handler);
+  put = (path: string, handler: Handler) => this.on('PUT', path, handler);
+  delete = (path: string, handler: Handler) => this.on('DELETE', path, handler);
+
+  /** The route for a request; a trailing slash is ignored, and params are percent-decoded. */
+  match(method: string, pathname: string): { handler: Handler; params: Record<string, string> } | undefined {
+    const path = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+    for (const r of this.routes) {
+      if (r.method !== method) continue;
+      const m = r.pattern.exec(path);
+      if (!m) continue;
+      const params: Record<string, string> = {};
+      try {
+        r.keys.forEach((key, i) => {
+          params[key] = decodeURIComponent(m[i + 1] as string);
+        });
+      } catch {
+        return undefined;
+      }
+      return { handler: r.handler, params };
+    }
+    return undefined;
+  }
+}
+
+/** The first value of each query parameter. */
+function queryOf(url: URL): Query {
+  const q: Query = {};
+  for (const [k, v] of url.searchParams) q[k] ??= v;
+  return q;
+}
+
+/** What a handler returned, as a response: a Response as is, anything else as JSON. */
+function respond(out: unknown): Response {
+  return out instanceof Response
+    ? out
+    : new Response(JSON.stringify(out), { headers: { 'content-type': 'application/json;charset=utf-8' } });
+}
+
+function errorResponse(error: unknown): Response {
+  if (error instanceof InvalidScenario) return json(400, { error: error.message, diagnostics: error.diagnostics });
+  if (error instanceof BadRequest) return json(400, { error: error.message });
+  if (error instanceof NotFound) return json(404, { error: error.message });
+  if (error instanceof Conflict) return json(409, { error: error.message });
+  if (error instanceof TooManyRuns) return json(429, { error: error.message });
+  return json(500, { error: error instanceof Error ? error.message : String(error) });
 }
 
 function expandBulk(b: ReturnType<typeof createBulk.parse>): CreateStation[] {
@@ -281,7 +353,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
   const meta = buildMeta();
   const hub: StreamHub = new StreamHub((id): StationView | undefined => reg.view(id));
   const reg: Registry = new Registry(hub);
-  const fleet = new FleetAggregate(opts.fleetBinMs ?? FLEET_BIN_MS);
+  const fleet = new FleetAggregate();
   const fleetTimer = setInterval(() => hub.fleet(fleet.sample(Date.now(), reg.fleetStates())), fleet.binMs);
   const store = new Store(opts.dataDir);
   const scenarioDir = opts.dataDir ? resolve(opts.dataDir, SCENARIO_DIR) : process.cwd();
@@ -289,6 +361,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
   const maxStations = opts.maxStations ?? DEFAULT_MAX_STATIONS;
   const scenarioOpts = { dir: scenarioDir, maxStations };
   const allowed: ReadonlySet<string> = new Set(opts.allowOrigins ?? []);
+  const loopbackOnly = isLoopback(host.replace(/^\[|\]$/g, ''));
   const testCsms = new TestCsms(
     host,
     opts.csmsPort ?? 0,
@@ -296,37 +369,23 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     (id) => reg.has(id),
     (csms, report) => store.saveReport(`test CSMS stopped ${new Date().toISOString()}`, csms.url, report),
   );
-  const sites = new Sites(store, hub, { stations: reg, csms: testCsms }, opts.maxSiteLeaves ?? MAX_SITE_LEAVES);
+  const sites = new Sites(store, hub, { stations: reg, csms: testCsms });
   const runs = new Runs(
     store,
     hub,
     (clock) => startTestCsmsOn({ host, clock }),
     {
       maxRuns: opts.maxRuns ?? DEFAULT_MAX_RUNS,
-      maxRunMs: opts.maxRunMs ?? DEFAULT_MAX_RUN_MS,
+      maxRunMs: opts.maxRunMs ?? DEFAULT_RUN_LIMITS.maxRunMs,
       maxStations,
     },
     sites,
   );
-  const app = new Elysia()
-    .onRequest(({ request }) => guard(request, allowed, isLoopback(host.replace(/^\[|\]$/g, ''))))
-    // `guard` has checked the content type; `body()` parses the text, so a bad body is a 400 like any other.
-    .onParse(({ request }) => request.text())
-    .onError(({ code, error }) => {
-      if (error instanceof InvalidScenario) return json(400, { error: error.message, diagnostics: error.diagnostics });
-      if (error instanceof BadRequest) return json(400, { error: error.message });
-      if (error instanceof NotFound) return json(404, { error: error.message });
-      if (error instanceof Conflict) return json(409, { error: error.message });
-      if (error instanceof TooManyRuns) return json(429, { error: error.message });
-      if (code === 'PARSE') return json(400, { error: 'body is not valid JSON' });
-      if (code === 'VALIDATION') return json(400, { error: error.message });
-      if (code === 'NOT_FOUND') return json(404, { error: 'not found' });
-      return json(500, { error: error instanceof Error ? error.message : String(error) });
-    })
+  const api = new Router()
     .get('/api/health', () => ({ ok: true, version: pkg.version, persistent: store.path !== undefined }))
     .get('/api/meta', () => meta)
     .get('/api/stations', () => reg.views())
-    .post('/api/stations', ({ body: raw }) => {
+    .post('/api/stations', ({ raw }) => {
       const b = body(raw);
       const bulk = typeof b === 'object' && b !== null && 'template' in b;
       const specs = bulk ? expandBulk(parseBody(createBulk, b)) : [parseBody(createStation, b)];
@@ -334,39 +393,48 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       if (opts.keepStations) store.saveStations(specs);
       return json(201, bulk ? views : views[0]);
     })
+    .post('/api/stations/folder', ({ raw }) => {
+      const b = parseBody(moveStations, body(raw));
+      const folder = b.folder ?? undefined;
+      const views = reg.setFolder(b.ids, folder);
+      if (opts.keepStations) store.setStationFolder(b.ids, folder);
+      return views;
+    })
     .delete('/api/stations/:id', async ({ params }) => {
       // `remove` forgets the station before its first await; drop the row in that same step, so a re-create that
       // lands while the socket is still closing keeps the row it saves.
-      const removing = reg.remove(params.id);
-      if (opts.keepStations) store.deleteStation(params.id);
+      const removing = reg.remove(params.id as string);
+      if (opts.keepStations) store.deleteStation(params.id as string);
       await removing;
       return noContent();
     })
-    .post('/api/stations/:id/actions', async ({ params, body: raw }) => {
-      if (!reg.has(params.id)) throw new NotFound(`no station ${params.id}`);
-      const outcome = await reg.action(params.id, parseAction(body(raw)));
+    .post('/api/stations/:id/actions', async ({ params, raw }) => {
+      const id = params.id as string;
+      if (!reg.has(id)) throw new NotFound(`no station ${id}`);
+      const outcome = await reg.action(id, parseAction(body(raw)));
       if (outcome.pending) return json(202, { ok: true });
       return outcome.result === undefined ? { ok: true } : { ok: true, result: outcome.result };
     })
-    .post('/api/stations/:id/chaos', ({ params, body: raw }) => {
-      if (!reg.has(params.id)) throw new NotFound(`no station ${params.id}`);
-      return json(201, reg.addChaos(params.id, parseBody(chaosRule, body(raw))));
+    .post('/api/stations/:id/chaos', ({ params, raw }) => {
+      const id = params.id as string;
+      if (!reg.has(id)) throw new NotFound(`no station ${id}`);
+      return json(201, reg.addChaos(id, parseBody(chaosRule, body(raw))));
     })
     .delete('/api/stations/:id/chaos/:ruleId', ({ params }) => {
-      reg.removeChaos(params.id, params.ruleId);
+      reg.removeChaos(params.id as string, params.ruleId as string);
       return noContent();
     })
     .get('/api/stations/:id/frames', ({ params, query }) =>
-      reg.frames(params.id, limitOf(query.limit, DEFAULT_FRAME_LIMIT, FRAMES_PER_STATION)),
+      reg.frames(params.id as string, limitOf(query.limit, DEFAULT_FRAME_LIMIT, FRAMES_PER_STATION)),
     )
     .get('/api/stations/:id/series', ({ params, query }) => {
       const { from, to, step } = windowOf(query);
-      return reg.series(params.id, from, to, step);
+      return reg.series(params.id as string, from, to, step);
     })
     .get('/api/stations/:id/schedule', ({ params, query }) => {
       const evse = intOf(query.evse, 'evse', 1, 0, 1000);
       const durationS = intOf(query.duration, 'duration', 86_400, 1, MAX_SCHEDULE_S);
-      return reg.schedule(params.id, evse, durationS * 1000);
+      return reg.schedule(params.id as string, evse, durationS * 1000);
     })
     .get('/api/fleet/series', ({ query }) => {
       const { from, to, step } = windowOf(query);
@@ -380,10 +448,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       return reg.fleetStations(from, to, bins, metric, Date.now());
     })
     .get('/api/stations/:id/trace', ({ params }) => {
-      if (!reg.has(params.id)) throw new NotFound(`no station ${params.id}`);
-      return download(sessionTrace(reg, params.id).text, fileName(params.id, '.oot.jsonl'), OOT_TYPE);
+      const id = params.id as string;
+      if (!reg.has(id)) throw new NotFound(`no station ${id}`);
+      return download(sessionTrace(reg, id).text, fileName(id, '.oot.jsonl'), OOT_TYPE);
     })
-    .post('/api/validate', ({ body: raw }) => {
+    .post('/api/validate', ({ raw }) => {
       const b = parseBody(validateBody, body(raw));
       const r = validatePayload(b.version as never, b.action, b.direction, b.payload);
       return r.ok ? { ok: true, violations: [] } : { ok: false, violations: r.violations };
@@ -396,32 +465,32 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     .get('/api/session', () => new Response(reg.session.toScenario(), { headers: { 'content-type': 'text/plain' } }))
     .get('/api/session/trace', () => download(sessionTrace(reg).text, 'session.oot.jsonl', OOT_TYPE))
     // ---- scenarios: editor support, saved scenarios, runs ----
-    .post('/api/scenario/check', async ({ body: raw }) =>
+    .post('/api/scenario/check', async ({ raw }) =>
       checkScenario(parseBody(scenarioSource, body(raw)).source, scenarioOpts),
     )
-    .post('/api/scenario/format', ({ body: raw }) => {
+    .post('/api/scenario/format', ({ raw }) => {
       const r = formatScenario(parseBody(scenarioSource, body(raw)).source);
       if (!r.ok) throw new InvalidScenario(r.diagnostics);
       return { source: r.source };
     })
     .get('/api/scenarios', () => store.scenarios())
-    .post('/api/scenarios', ({ body: raw }) => json(201, store.saveScenario(parseBody(saveScenario, body(raw)))))
+    .post('/api/scenarios', ({ raw }) => json(201, store.saveScenario(parseBody(saveScenario, body(raw)))))
     .get('/api/scenarios/:id', ({ params }) => {
-      const s = store.scenario(params.id);
+      const s = store.scenario(params.id as string);
       if (!s) throw new NotFound(`no scenario ${params.id}`);
       return s;
     })
-    .put('/api/scenarios/:id', ({ params, body: raw }) => {
+    .put('/api/scenarios/:id', ({ params, raw }) => {
       const b = parseBody(saveScenario, body(raw));
-      if (!store.scenario(params.id)) throw new NotFound(`no scenario ${params.id}`);
-      return store.saveScenario({ ...b, id: params.id });
+      if (!store.scenario(params.id as string)) throw new NotFound(`no scenario ${params.id}`);
+      return store.saveScenario({ ...b, id: params.id as string });
     })
     .delete('/api/scenarios/:id', ({ params }) => {
-      if (!store.deleteScenario(params.id)) throw new NotFound(`no scenario ${params.id}`);
+      if (!store.deleteScenario(params.id as string)) throw new NotFound(`no scenario ${params.id}`);
       return noContent();
     })
     .get('/api/runs', () => runs.list())
-    .post('/api/runs', async ({ body: raw }) => {
+    .post('/api/runs', async ({ raw }) => {
       const b = parseBody(startRun, body(raw));
       const p = await prepare(b.source, scenarioOpts);
       if (!p.ok) throw new InvalidScenario(p.diagnostics);
@@ -457,41 +526,45 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       return json(201, run);
     })
     .get('/api/runs/:id', ({ params }) => {
-      const r = runs.detail(params.id);
+      const r = runs.detail(params.id as string);
       if (!r) throw new NotFound(`no run ${params.id}`);
       return r;
     })
     .post('/api/runs/:id/cancel', async ({ params }) => {
-      if (!runs.detail(params.id)) throw new NotFound(`no run ${params.id}`);
-      if (!(await runs.cancel(params.id))) throw new Conflict(`run ${params.id} is not running`);
-      return runs.detail(params.id);
+      const id = params.id as string;
+      if (!runs.detail(id)) throw new NotFound(`no run ${id}`);
+      if (!(await runs.cancel(id))) throw new Conflict(`run ${id} is not running`);
+      return runs.detail(id);
     })
     .delete('/api/runs/:id', ({ params }) => {
-      if (runs.isRunning(params.id)) throw new Conflict(`run ${params.id} is running; cancel it first`);
-      if (!store.deleteRun(params.id)) throw new NotFound(`no run ${params.id}`);
+      const id = params.id as string;
+      if (runs.isRunning(id)) throw new Conflict(`run ${id} is running; cancel it first`);
+      if (!store.deleteRun(id)) throw new NotFound(`no run ${id}`);
       return noContent();
     })
     .get('/api/runs/:id/timeline', ({ params }) => {
-      const t = runs.timeline(params.id);
+      const t = runs.timeline(params.id as string);
       if (!t) throw new NotFound(`no run ${params.id}`);
       return t;
     })
     .get('/api/runs/:id/trace', ({ params }) => {
-      const r = runs.detail(params.id);
-      if (!r) throw new NotFound(`no run ${params.id}`);
+      const id = params.id as string;
+      const r = runs.detail(id);
+      if (!r) throw new NotFound(`no run ${id}`);
       const rec = r.recordingId === undefined ? undefined : store.recordingTrace(r.recordingId);
-      if (!rec) throw new NotFound(`run ${params.id} has no recording${r.status === 'running' ? ' yet' : ''}`);
+      if (!rec) throw new NotFound(`run ${id} has no recording${r.status === 'running' ? ' yet' : ''}`);
       return download(rec.trace, fileName(`${r.name}-${r.id.slice(0, 8)}`, '.oot.jsonl'), OOT_TYPE);
     })
     .get('/api/runs/:id/junit', ({ params }) => {
-      const r = runs.detail(params.id);
-      if (!r) throw new NotFound(`no run ${params.id}`);
-      if (!r.result) throw new Conflict(`run ${params.id} has no result${r.status === 'running' ? ' yet' : ''}`);
+      const id = params.id as string;
+      const r = runs.detail(id);
+      if (!r) throw new NotFound(`no run ${id}`);
+      if (!r.result) throw new Conflict(`run ${id} has no result${r.status === 'running' ? ' yet' : ''}`);
       return download(runJUnit(r.result, r.name), fileName(`${r.name}-${r.id.slice(0, 8)}`, '.xml'), XML_TYPE);
     })
     // ---- recordings ----
     .get('/api/recordings', () => store.recordings())
-    .post('/api/recordings', ({ body: raw }) => {
+    .post('/api/recordings', ({ raw }) => {
       const b = parseBody(saveRecording, body(raw));
       if (b.stationId !== undefined && !reg.has(b.stationId)) throw new NotFound(`no station ${b.stationId}`);
       const t = sessionTrace(reg, b.stationId);
@@ -503,12 +576,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       );
     })
     .get('/api/recordings/:id', ({ params }) => {
-      const r = store.recordingTrace(params.id);
+      const r = store.recordingTrace(params.id as string);
       if (!r) throw new NotFound(`no recording ${params.id}`);
       return download(r.trace, fileName(r.name, '.oot.jsonl'), OOT_TYPE);
     })
     .delete('/api/recordings/:id', ({ params }) => {
-      if (!store.deleteRecording(params.id)) throw new NotFound(`no recording ${params.id}`);
+      if (!store.deleteRecording(params.id as string)) throw new NotFound(`no recording ${params.id}`);
       return noContent();
     })
     // ---- the built-in test CSMS ----
@@ -519,7 +592,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       return testCsms.findingsBins(from, to, step > 0 ? step : 60_000);
     })
     .get('/api/csms/sessions/:identity/frames', ({ params, query }) => {
-      const frames = testCsms.frames(params.identity, limitOf(query.limit, 500, 500));
+      const frames = testCsms.frames(params.identity as string, limitOf(query.limit, 500, 500));
       if (!frames) throw new NotFound(`the test CSMS has no session ${params.identity}`);
       return frames;
     })
@@ -532,32 +605,32 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
         : download(JSON.stringify(report, null, 2), 'csms-report.json', 'application/json');
     })
     .get('/api/csms/reports', () => store.reports())
-    .post('/api/csms/reports', ({ body: raw }) => {
+    .post('/api/csms/reports', ({ raw }) => {
       const b = parseBody(saveReport, body(raw));
       const csms = testCsms.running;
       if (!csms) throw new Conflict('the test CSMS is not running');
       return json(201, store.saveReport(b.name ?? `test CSMS ${new Date().toISOString()}`, csms.url, csms.report()));
     })
     .get('/api/csms/reports/:id', ({ params, query }) => {
-      const r = store.report(params.id);
+      const r = store.report(params.id as string);
       if (!r) throw new NotFound(`no report ${params.id}`);
       return query.format === 'junit'
         ? download(csmsJUnit(r.report), fileName(r.name, '.xml'), XML_TYPE)
         : download(JSON.stringify(r.report, null, 2), fileName(r.name, '.json'), 'application/json');
     })
     .delete('/api/csms/reports/:id', ({ params }) => {
-      if (!store.deleteReport(params.id)) throw new NotFound(`no report ${params.id}`);
+      if (!store.deleteReport(params.id as string)) throw new NotFound(`no report ${params.id}`);
       return noContent();
     })
     // ---- electrical sites (the DLM test environment) ----
     .get('/api/sites', () => sites.list())
-    .post('/api/sites', async ({ body: raw }) => {
+    .post('/api/sites', async ({ raw }) => {
       const b = parseBody(createSite, body(raw));
       const p = await prepare(b.source, scenarioOpts);
       if (!p.ok) throw new InvalidScenario(p.diagnostics);
       let plan: SandboxPlan;
       try {
-        plan = planSandbox(p.scenario, p.linked, p.file, opts.maxSiteLeaves ?? MAX_SITE_LEAVES);
+        plan = planSandbox(p.scenario, p.linked, p.file, MAX_SITE_LEAVES);
       } catch (err) {
         throw new InvalidScenario([toDiagnostic(b.source, err, p.file)]);
       }
@@ -571,7 +644,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       });
       return json(201, detail);
     })
-    .post(REPORT_UPLOAD, ({ body: raw }) => {
+    .post(REPORT_UPLOAD, ({ raw }) => {
       if (typeof raw === 'string' && raw.length > MAX_REPORT_BYTES) {
         return json(413, { error: `request body too large: at most ${MAX_REPORT_BYTES} bytes` });
       }
@@ -592,58 +665,74 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       }
       return json(201, sites.upload(r));
     })
-    .get('/api/sites/:id', ({ params }) => sites.detail(params.id))
+    .get('/api/sites/:id', ({ params }) => sites.detail(params.id as string))
     .get('/api/sites/:id/report', ({ params, query }) => {
-      const r = sites.report(params.id);
+      const id = params.id as string;
+      const r = sites.report(id);
       return query.download === undefined
         ? r
-        : download(
-            JSON.stringify(r),
-            fileName(r.name ?? `site-${params.id.slice(0, 8)}`, '.site.json'),
-            'application/json',
-          );
+        : download(JSON.stringify(r), fileName(r.name ?? `site-${id.slice(0, 8)}`, '.site.json'), 'application/json');
     })
     .get('/api/sites/:id/series', ({ params, query }) => {
       const from = query.from === undefined ? undefined : timeOf(query.from, 'from', 0);
       const to = query.to === undefined ? undefined : timeOf(query.to, 'to', 0);
       const nodes = query.nodes ? query.nodes.split(',').filter(Boolean) : undefined;
-      return sites.series(params.id, from, to, nodes);
+      return sites.series(params.id as string, from, to, nodes);
     })
     .get('/api/sites/:id/allocations', ({ params, query }) => {
       const from = query.from === undefined ? undefined : timeOf(query.from, 'from', 0);
       const to = query.to === undefined ? undefined : timeOf(query.to, 'to', 0);
-      return sites.allocations(params.id, from, to, limitOf(query.limit, 1000, 20_000));
+      return sites.allocations(params.id as string, from, to, limitOf(query.limit, 1000, 20_000));
     })
-    .get('/api/sites/:id/events', ({ params }) => sites.events(params.id))
+    .get('/api/sites/:id/events', ({ params }) => sites.events(params.id as string))
     .post(
       '/api/sites/:id/actions',
-      ({ params, body: raw }): SiteLive => sites.action(params.id, parseSiteAction(body(raw))),
+      ({ params, raw }): SiteLive => sites.action(params.id as string, parseSiteAction(body(raw))),
     )
-    .post('/api/sites/:id/stop', async ({ params }): Promise<SiteSummary> => sites.stopSandbox(params.id))
+    .post('/api/sites/:id/stop', async ({ params }): Promise<SiteSummary> => sites.stopSandbox(params.id as string))
     .delete('/api/sites/:id', async ({ params }) => {
-      await sites.remove(params.id);
+      await sites.remove(params.id as string);
       return noContent();
-    })
-    .ws('/api/stream', {
-      open: (ws) => hub.add(ws.raw, reg.views()),
-      close: (ws) => hub.delete(ws.raw),
-      message: () => {}, // server -> browser only
-    })
-    .all('/api/*', () => json(404, { error: 'not found' }))
-    .get('/*', ({ path }) => (path.startsWith('/api/') ? json(404, { error: 'not found' }) : serveUi(uiDir, path)));
+    });
 
   if (opts.keepStations) {
     if (opts.csmsPort) await testCsms.start();
     restoreStations(store, reg);
   }
-  app.listen({ port: opts.port ?? DEFAULT_PORT, hostname: host, maxRequestBodySize: MAX_REPORT_BYTES });
-  const port = app.server?.port;
-  if (port === undefined) throw new Error('server did not start');
+  const server = Bun.serve({
+    port: opts.port ?? DEFAULT_PORT,
+    hostname: host,
+    maxRequestBodySize: MAX_REPORT_BYTES,
+    async fetch(request, server) {
+      try {
+        const refused = guard(request, allowed, loopbackOnly);
+        if (refused) return refused;
+        const url = new URL(request.url);
+        const path = url.pathname;
+        if (path === STREAM_PATH || path === `${STREAM_PATH}/`) {
+          if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return json(404, NOT_FOUND);
+          return server.upgrade(request) ? undefined : json(400, { error: 'websocket upgrade failed' });
+        }
+        const read = request.method === 'GET' || request.method === 'HEAD';
+        const m = api.match(read ? 'GET' : request.method, path);
+        if (m) return respond(await m.handler({ params: m.params, query: queryOf(url), raw: await request.text() }));
+        if (path.startsWith('/api/') || !read) return json(404, NOT_FOUND);
+        return await serveUi(uiDir, path);
+      } catch (error) {
+        return errorResponse(error);
+      }
+    },
+    websocket: {
+      open: (ws) => hub.add(ws, reg.views()),
+      close: (ws) => hub.delete(ws),
+      message: () => {}, // server -> browser only
+    },
+  });
   const urlHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host.includes(':') ? `[${host}]` : host;
 
   let stopping: Promise<void> | undefined;
   return {
-    url: `http://${urlHost}:${port}`,
+    url: `http://${urlHost}:${server.port}`,
     stop: () => {
       stopping ??= (async () => {
         clearInterval(fleetTimer);
@@ -652,7 +741,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
         await reg.closeAll();
         await testCsms.stop();
         hub.close();
-        await app.stop(true);
+        await server.stop(true);
         store.close();
       })();
       return stopping;

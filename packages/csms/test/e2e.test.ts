@@ -7,7 +7,7 @@ import type { StationConfig } from '@wattsim/core';
 import { ChaosEngine, Station, VirtualClock } from '@wattsim/core';
 import type { OcppVersion } from '@wattsim/protocol';
 import type { Csms, RuleId } from '../src/index';
-import { connectInMemory, startCsms } from '../src/index';
+import { startCsms } from '../src/index';
 import { until } from './until';
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
@@ -25,7 +25,7 @@ afterEach(async () => {
 
 function startServer(): Csms {
   clock = new VirtualClock(T0);
-  csms = startCsms({ listen: false, clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
+  csms = startCsms({ clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
   return csms;
 }
 
@@ -35,7 +35,6 @@ async function station(version: OcppVersion, id: string, cfg: Partial<StationCon
     id,
     version,
     csmsUrl: server.url,
-    socket: connectInMemory,
     clock,
     meterIntervalMs: MIN,
     ...cfg,
@@ -197,7 +196,7 @@ describe('faults are flagged with the expected rule', () => {
     const server = startServer();
     const chaos = new ChaosEngine();
     const st = await station('ocpp1.6', 'BAD-16', { chaos });
-    await st.sendRaw('Heartbeat', {});
+    await st.request('Heartbeat', {});
     expect(rulesOf('BAD-16')).toEqual(['boot.not-accepted']);
 
     await st.boot();
@@ -209,9 +208,9 @@ describe('faults are flagged with the expected rule', () => {
     const reg = (value: string) => [
       { timestamp: now(), sampledValue: [{ value, measurand: 'Energy.Active.Import.Register', unit: 'Wh' }] },
     ];
-    await st.sendRaw('MeterValues', { connectorId: 1, transactionId: txId, meterValue: reg('1') });
-    await st.sendRaw('StopTransaction', { transactionId: 9999, meterStop: 0, timestamp: now() });
-    await st.sendRaw('StatusNotification', { connectorId: 0, errorCode: 'NoError', status: 'Charging' });
+    await st.request('MeterValues', { connectorId: 1, transactionId: txId, meterValue: reg('1') });
+    await st.request('StopTransaction', { transactionId: 9999, meterStop: 0, timestamp: now() });
+    await st.request('StatusNotification', { connectorId: 0, errorCode: 'NoError', status: 'Charging' });
 
     // Chaos: a duplicated Heartbeat reuses its message id; a mutated DataTransfer fails its schema.
     chaos.add({ match: { direction: 'out', action: 'Heartbeat' }, effect: { kind: 'duplicate' }, once: true });
@@ -221,7 +220,7 @@ describe('faults are flagged with the expected rule', () => {
       effect: { kind: 'mutate', fn: (p) => ({ ...(p as object), vendorId: 42 }) },
       once: true,
     });
-    await st.sendRaw('DataTransfer', { vendorId: 'acme' }).catch(() => {});
+    await st.request('DataTransfer', { vendorId: 'acme' }).catch(() => {});
     await st.sendHeartbeat();
     await settled(st);
 
@@ -284,10 +283,10 @@ describe('faults are flagged with the expected rule', () => {
       ...(wh === undefined ? {} : { meterValue: [{ timestamp: now(), sampledValue: [{ value: wh }] }] }),
     });
 
-    await st.sendRaw('TransactionEvent', event('Updated', crypto.randomUUID(), 3));
-    await st.sendRaw('TransactionEvent', event('Updated', id, tx.seqNo++, 1));
-    await st.sendRaw('TransactionEvent', event('Started', id, 0));
-    await st.sendRaw('StatusNotification', {
+    await st.request('TransactionEvent', event('Updated', crypto.randomUUID(), 3));
+    await st.request('TransactionEvent', event('Updated', id, tx.seqNo++, 1));
+    await st.request('TransactionEvent', event('Started', id, 0));
+    await st.request('StatusNotification', {
       timestamp: new Date(clock.now() + 60 * MIN).toISOString(),
       connectorStatus: 'Available',
       evseId: 2,
@@ -324,7 +323,7 @@ describe('faults are flagged with the expected rule', () => {
     const id = String(st.evse(1)?.tx?.id);
     await st.stopTransaction(1);
     await settled(st);
-    await st.sendRaw('TransactionEvent', {
+    await st.request('TransactionEvent', {
       eventType: 'Updated',
       timestamp: new Date(clock.now()).toISOString(),
       triggerReason: 'MeterValuePeriodic',

@@ -32,6 +32,7 @@ import type {
   SiteValue,
   StringExpr,
 } from './ast';
+import { rawText } from './ast';
 import { ParseError } from './lexer';
 
 /** Units a site value may carry, and what one of each is worth in the base unit. */
@@ -68,7 +69,7 @@ export type SiteSetup = {
 };
 
 /** Reads a load profile file named in the site block; relative paths are the caller's business. */
-export type ProfileReader = (path: string, loc: Loc) => string;
+type ProfileReader = (path: string, loc: Loc) => string;
 
 const ROTATIONS = ['L1L2L3', 'L2L3L1', 'L3L1L2'] as const;
 /** Grid violation kinds by the word the DSL uses for them. */
@@ -82,10 +83,10 @@ export const VIOLATION_WORDS: Readonly<Record<string, string>> = {
   neutral: 'neutral',
 };
 
-const literal = (s: StringExpr) => s.parts.map((p) => (typeof p === 'string' ? p : `{${p.var}}`)).join('');
+const literal = rawText;
 
 /** A number value in base units (`250A` -> 250, `20kW` -> 20000, `95%` -> 95). */
-export function siteNumber(v: SiteValue, kind: SiteUnitKind): number {
+function siteNumber(v: SiteValue, kind: SiteUnitKind): number {
   if (v.kind !== 'number') throw new Error(`expected a number, got ${v.kind}`);
   const table = SITE_UNITS[kind] as Record<string, number>;
   return v.value * (table[v.unit ?? ''] ?? 1);
@@ -353,11 +354,8 @@ function fieldOf(type: SiteNode['type'], key: string): string {
 }
 
 /**
- * The site block as a description. `read` returns a load profile's text (without it every profile reads as a flat
- * 0 W, which is how the parser validates without touching files). Throws `ParseError`.
- */
-/**
- * The site block as a grid description. `startMs` is the model time the site starts at when the block has no
+ * The site block as a grid description. `read` returns a load profile's text (without it every profile reads as a
+ * flat 0 W, which is how the parser validates without touching files). Throws `ParseError`. `startMs` is the model time the site starts at when the block has no
  * `time` line (the run's start); relative load profiles without `loop` are anchored at the site's start.
  */
 export function siteSetup(

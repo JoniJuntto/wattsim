@@ -1,7 +1,4 @@
-/**
- * The CSMS with raw WebSocket clients so every frame is under the test's control. Clients connect in memory
- * (memory.test.ts checks that transport against TCP), so no test here depends on free local ports.
- */
+/** The CSMS with raw WebSocket clients so every frame is under the test's control. */
 import { afterEach, describe, expect, test } from 'bun:test';
 import { VirtualClock } from '@wattsim/core';
 import type { CsmsOptions } from '../src/index';
@@ -10,8 +7,6 @@ import {
   CallTimeoutError,
   type Csms,
   CsmsCallError,
-  connectInMemory,
-  type MemorySocket,
   PayloadValidationError,
   startCsms,
   toJUnit,
@@ -29,12 +24,12 @@ afterEach(async () => {
 });
 
 function start(opts: CsmsOptions = {}): Csms {
-  csms = startCsms({ listen: false, ...opts });
+  csms = startCsms(opts);
   return csms;
 }
 
 type Client = {
-  ws: MemorySocket;
+  ws: WebSocket;
   inbox: unknown[][];
   send(frame: unknown[]): void;
   /** The next inbound frame not yet taken. */
@@ -48,7 +43,7 @@ async function connect(
   protocols: string[] = ['ocpp1.6'],
   headers: Record<string, string> = {},
 ): Promise<Client> {
-  const ws = connectInMemory(`${url}/${identity}`, protocols, headers);
+  const ws = new WebSocket(`${url}/${identity}`, { protocols, headers });
   const inbox: unknown[][] = [];
   let taken = 0;
   ws.onmessage = (ev) => inbox.push(JSON.parse(String(ev.data)));
@@ -72,7 +67,7 @@ async function connect(
 
 /** The HTTP status a WebSocket upgrade request gets: 101 when it opens, else the status the refusal reports. */
 async function upgradeStatus(url: string, path: string, protocol: string, auth?: string): Promise<number> {
-  const ws = connectInMemory(`${url}${path}`, [protocol], auth ? { Authorization: auth } : {});
+  const ws = new WebSocket(`${url}${path}`, { protocols: [protocol], headers: auth ? { Authorization: auth } : {} });
   return new Promise((resolve) => {
     let status = 0;
     ws.onopen = () => {
@@ -102,13 +97,6 @@ describe('handshake', () => {
     expect(c.ws.protocol).toBe('ocpp2.0.1');
     await until(() => s.session('CP 1')?.connected === true);
     expect(s.session('CP 1')?.version).toBe('ocpp2.0.1');
-  });
-
-  test('`versions` filters the offer', async () => {
-    const s = start({ versions: ['ocpp1.6'] });
-    const c = await connect(s.url, 'CP1', ['ocpp2.1', 'ocpp1.6']);
-    expect(c.ws.protocol).toBe('ocpp1.6');
-    expect(await upgradeStatus(s.url, '/CP2', 'ocpp2.1')).toBe(400);
   });
 
   test('an unknown or missing subprotocol, or no identity, is HTTP 400', async () => {

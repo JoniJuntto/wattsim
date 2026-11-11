@@ -1,6 +1,5 @@
+export type { Clock, Timer } from '@wattsim/core';
 export { isStationInitiated, stationActions } from './actions';
-export type { Clock, Timer } from './clock';
-export { WallClock } from './clock';
 export type {
   AnsweredCall,
   BootStatus,
@@ -29,10 +28,8 @@ export {
 } from './conformance';
 export type { DefaultContext } from './defaults';
 export { defaultReply } from './defaults';
-export type { MemoryEndpoint, MemoryServerSocket, MemoryUpgradeRequest } from './memory';
-export { connectInMemory, connectMemory, listenInMemory, listensInMemory, MemorySocket } from './memory';
 export type { ConformanceReport, Tally } from './report';
-export { addToReport, buildReport, emptyReport, toJUnit } from './report';
+export { addToReport, emptyReport, toJUnit } from './report';
 export type { ConformanceViolation, RuleId, Severity } from './rules';
 export { RULE_IDS, RULES, specRef } from './rules';
 export type {

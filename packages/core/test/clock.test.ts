@@ -1,11 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { isoTimestamp, SkewedClock, VirtualClock, WallClock } from '../src/index';
+import { isoTimestamp, SkewedClock, sleep, VirtualClock, WallClock } from '../src/index';
 
 describe('VirtualClock', () => {
   test('starts at the given epoch and does not move on its own', () => {
     const c = new VirtualClock(1_000_000);
     expect(c.now()).toBe(1_000_000);
-    expect(c.date().getTime()).toBe(1_000_000);
     expect(c.pendingTimers()).toBe(0);
   });
 
@@ -61,7 +60,7 @@ describe('VirtualClock', () => {
   test('sleep resolves after advance of at least its duration', async () => {
     const c = new VirtualClock(0);
     let done = false;
-    const p = c.sleep(100).then(() => {
+    const p = sleep(c, 100).then(() => {
       done = true;
     });
     await c.advance(99);
@@ -228,7 +227,6 @@ describe('SkewedClock', () => {
     expect(skewed.now()).toBe(base.now() + 300_000);
     await base.advance(1_000_000);
     expect(skewed.now()).toBe(base.now() + 300_000 + 1000);
-    expect(skewed.date().getTime()).toBe(skewed.now());
   });
 
   test('timers are scheduled on the base clock with drift-scaled durations', async () => {
@@ -254,7 +252,7 @@ describe('SkewedClock', () => {
     const base = new VirtualClock(0);
     const skewed = new SkewedClock(base, { offsetMs: -5000 });
     let done = false;
-    const p = skewed.sleep(100).then(() => {
+    const p = sleep(skewed, 100).then(() => {
       done = true;
     });
     await base.advance(100);
@@ -271,11 +269,11 @@ describe('WallClock', () => {
     c.setTimeout(() => {
       fired = true;
     }, 1);
-    await c.sleep(10);
+    await sleep(c, 10);
     expect(fired).toBe(true);
     let n = 0;
     const i = c.setInterval(() => n++, 1);
-    await c.sleep(20);
+    await sleep(c, 20);
     i.cancel();
     expect(n).toBeGreaterThan(0);
   });

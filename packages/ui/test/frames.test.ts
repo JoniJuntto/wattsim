@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { FrameEvent } from '../src/api/types';
-import { actionsIn, filterFrames, groupExchanges, pairFrames, parseFrame, previewOf } from '../src/lib/frames';
+import { actionsIn, groupExchanges, pairFrames, parseFrame, previewOf } from '../src/lib/frames';
 import { frame } from './fixtures';
 
 describe('pairFrames', () => {
@@ -89,19 +89,13 @@ describe('parseFrame', () => {
   });
 });
 
-describe('filterFrames', () => {
+describe('actionsIn', () => {
   const frames = [
     frame({ seq: 1, type: 2, id: 'a', dir: 'out', action: 'Authorize', raw: '[2,"a","Authorize",{"idTag":"TAG-1"}]' }),
     frame({ seq: 2, type: 3, id: 'a', dir: 'in', action: 'Authorize' }),
     frame({ seq: 3, type: 2, id: 'b', dir: 'in', action: 'Reset' }),
   ];
-  test('by direction, action and text', () => {
-    expect(filterFrames(frames, { dir: 'in' })).toEqual([1, 2]);
-    expect(filterFrames(frames, { action: 'Authorize' })).toEqual([0, 1]);
-    expect(filterFrames(frames, { text: 'tag-1' })).toEqual([0]);
-    expect(filterFrames(frames, { text: 'reset', dir: 'in' })).toEqual([2]);
-  });
-  test('actionsIn lists distinct actions sorted', () => {
+  test('lists distinct actions sorted', () => {
     expect(actionsIn(frames)).toEqual(['Authorize', 'Reset']);
   });
 });

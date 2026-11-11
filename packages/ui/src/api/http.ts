@@ -16,17 +16,22 @@ import type {
   CreateStationsBulkBody,
   CsmsReportSummary,
   CsmsView,
+  FindingsBinsView,
+  FleetSeriesView,
+  FleetStationsView,
   FrameEvent,
-  Health,
   Meta,
   RecordingView,
   RunDetail,
   RunSummary,
+  RunTimeline,
   SavedScenario,
   SavedScenarioSummary,
   ScenarioCheck,
+  ScheduleView,
   StartRunBody,
   StationAction,
+  StationSeriesView,
   StationView,
   ValidateBody,
   ValidateResult,
@@ -44,6 +49,8 @@ export class ApiError extends Error {
     this.name = 'ApiError';
   }
 }
+
+export const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   return (await requestWithStatus<T>(method, path, body)).data;
@@ -85,11 +92,13 @@ const station = (id: string) => `/api/stations/${encodeURIComponent(id)}`;
 const site = (id: string) => `/api/sites/${encodeURIComponent(id)}`;
 
 export const api = {
-  health: () => request<Health>('GET', '/api/health'),
   meta: () => request<Meta>('GET', '/api/meta'),
   stations: () => request<StationView[]>('GET', '/api/stations'),
   createStation: (body: CreateStationBody) => request<StationView>('POST', '/api/stations', body),
   createStations: (body: CreateStationsBulkBody) => request<StationView[]>('POST', '/api/stations', body),
+  /** `null` takes the stations out of their folder. */
+  moveStations: (ids: string[], folder: string | null) =>
+    request<StationView[]>('POST', '/api/stations/folder', { ids, folder }),
   deleteStation: (id: string) => request<void>('DELETE', station(id)),
   /**
    * `pending` is true when the server answered 202: the station had not finished after 5 s (unreachable CSMS, calls
@@ -104,6 +113,14 @@ export const api = {
     request<void>('DELETE', `${station(id)}/chaos/${encodeURIComponent(ruleId)}`),
   validate: (body: ValidateBody) => request<ValidateResult>('POST', '/api/validate', body),
   frames: (id: string, limit = 2000) => request<FrameEvent[]>('GET', `${station(id)}/frames?limit=${limit}`),
+  series: (id: string, from: number, to: number, step: number) =>
+    request<StationSeriesView>('GET', `${station(id)}/series?from=${from}&to=${to}&step=${step}`),
+  schedule: (id: string, evse: number, durationS: number) =>
+    request<ScheduleView>('GET', `${station(id)}/schedule?evse=${evse}&duration=${durationS}`),
+  fleetSeries: (from: number, to: number, step: number) =>
+    request<FleetSeriesView>('GET', `/api/fleet/series?from=${from}&to=${to}&step=${step}`),
+  fleetStations: (from: number, to: number, bins: number, metric: 'power' | 'status') =>
+    request<FleetStationsView>('GET', `/api/fleet/stations?from=${from}&to=${to}&bins=${bins}&metric=${metric}`),
   startLoopback: () => request<{ url: string }>('POST', '/api/loopback'),
   stopLoopback: () => request<void>('DELETE', '/api/loopback'),
   session: () => request<string>('GET', '/api/session'),
@@ -122,6 +139,7 @@ export const api = {
   startRun: (body: StartRunBody) => request<RunSummary>('POST', '/api/runs', body),
   cancelRun: (id: string) => request<RunDetail>('POST', `/api/runs/${encodeURIComponent(id)}/cancel`),
   deleteRun: (id: string) => request<void>('DELETE', `/api/runs/${encodeURIComponent(id)}`),
+  runTimeline: (id: string) => request<RunTimeline>('GET', `/api/runs/${encodeURIComponent(id)}/timeline`),
 
   recordings: () => request<RecordingView[]>('GET', '/api/recordings'),
   saveRecording: (body: { name?: string; stationId?: string }) =>
@@ -133,6 +151,8 @@ export const api = {
   csmsFrames: (identity: string) =>
     request<FrameEvent[]>('GET', `/api/csms/sessions/${encodeURIComponent(identity)}/frames?limit=500`),
   csmsReports: () => request<CsmsReportSummary[]>('GET', '/api/csms/reports'),
+  findingsBins: (from: number, to: number, step: number) =>
+    request<FindingsBinsView>('GET', `/api/csms/findings/bins?from=${from}&to=${to}&step=${step}`),
   saveCsmsReport: (name?: string) =>
     request<CsmsReportSummary>('POST', '/api/csms/reports', name === undefined ? {} : { name }),
   deleteCsmsReport: (id: string) => request<void>('DELETE', `/api/csms/reports/${encodeURIComponent(id)}`),

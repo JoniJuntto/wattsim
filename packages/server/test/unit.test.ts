@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { Violation } from '@wattsim/protocol';
-import { parse } from '@wattsim/scenario';
+import { dslJson, dslString, parse } from '@wattsim/scenario';
 import { FakeCsms } from '../../core/test/fake-csms';
 import { TrackedClock } from '../src/clock';
 import { Registry, type Sink } from '../src/registry';
-import { dslJson, dslString, SessionRecorder } from '../src/session';
+import { SessionRecorder } from '../src/session';
 import type { FrameEvent } from '../src/types';
 import { until } from './helpers';
 
@@ -57,7 +57,7 @@ describe('session text', () => {
 describe('Registry.remove', () => {
   let csms: FakeCsms;
   beforeAll(async () => {
-    csms = await FakeCsms.start({ listen: true });
+    csms = await FakeCsms.start();
   });
   afterAll(async () => {
     await csms.stop();

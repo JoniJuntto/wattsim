@@ -3,17 +3,72 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import Ajv2020 from 'ajv/dist/2020';
 import addFormats from 'ajv-formats';
-import type { OotRecord, TraceEntry } from '../src/index';
-import {
-  consumerView,
-  formatTrace,
-  makeEntry,
-  OOT_SCHEMA_VERSION,
-  parseDateTime,
-  parseTrace,
-  toOotRecord,
-  validateOotRecord,
-} from '../src/index';
+import type { OotMessageType, OotRecord, TraceEntry } from '../src/index';
+import { formatTrace, makeEntry, OOT_SCHEMA_VERSION, parseTrace, toOotRecord, validateOotRecord } from '../src/index';
+
+/** The consumer view of the format's conformance suite (`expected.json` in each fixture). */
+type ConsumerView = {
+  schemaVersion: string;
+  counts: { records: number; calls: number; callResults: number; callErrors: number };
+  records: Array<{
+    index: number;
+    messageType: OotMessageType;
+    messageId?: string;
+    action?: string;
+    correlatesWith?: number;
+  }>;
+  unansweredCalls: number[];
+  orphanResponses: number[];
+};
+
+/**
+ * Derive the consumer view exactly as conformance/README.md defines it: a response correlates with the most recent
+ * preceding CALL with the same `messageId`, the opposite `direction`, and no earlier response.
+ */
+function consumerView(records: readonly OotRecord[]): ConsumerView {
+  const view: ConsumerView['records'] = records.map((r, index) => {
+    const entry: ConsumerView['records'][number] = { index, messageType: r.messageType };
+    if (r.messageId !== undefined) entry.messageId = r.messageId;
+    if (r.messageType === 'CALL' && r.action !== undefined) entry.action = r.action;
+    return entry;
+  });
+  const answered = new Set<number>();
+  const orphanResponses: number[] = [];
+  records.forEach((r, i) => {
+    if (r.messageType === 'CALL') return;
+    let match = -1;
+    for (let j = i - 1; j >= 0; j--) {
+      const c = records[j] as OotRecord;
+      if (c.messageType === 'CALL' && c.messageId === r.messageId && c.direction !== r.direction && !answered.has(j)) {
+        match = j;
+        break;
+      }
+    }
+    const entry = view[i] as ConsumerView['records'][number];
+    if (match === -1) {
+      orphanResponses.push(i);
+      if (r.action !== undefined) entry.action = r.action;
+      return;
+    }
+    answered.add(match);
+    const action = (records[match] as OotRecord).action;
+    if (action !== undefined) entry.action = action;
+    entry.correlatesWith = match;
+  });
+  const count = (t: OotMessageType) => records.filter((r) => r.messageType === t).length;
+  return {
+    schemaVersion: records[0]?.schemaVersion ?? 'unknown',
+    counts: {
+      records: records.length,
+      calls: count('CALL'),
+      callResults: count('CALLRESULT'),
+      callErrors: count('CALLERROR'),
+    },
+    records: view,
+    unansweredCalls: records.flatMap((r, i) => (r.messageType === 'CALL' && !answered.has(i) ? [i] : [])),
+    orphanResponses,
+  };
+}
 
 const VENDORED = join(import.meta.dir, '../schemas/open-ocpp-trace');
 const schema = await Bun.file(join(VENDORED, 'trace-v1.schema.json')).json();
@@ -43,32 +98,6 @@ const base = {
   direction: 'cp-to-csms',
 };
 
-/** RFC 3339 spellings on both sides of Ajv's `date-time` format, which the vendored schema uses. */
-const TIMESTAMPS = [
-  '2026-01-01t00:00:00z',
-  '2026-01-01 00:00:00Z',
-  '2026-01-01\t00:00:00Z',
-  '2026-01-01T00:00:00+0200',
-  '2026-01-01T00:00:00+02',
-  '2026-01-01T00:00:00-05:30',
-  '2026-01-01T00:00:00.123456789Z',
-  '2026-12-31T23:59:60Z',
-  '2027-01-01T01:59:60+02:00',
-  '2026-12-31T23:59:60.5Z',
-  '2026-06-30T12:59:60Z',
-  '2024-02-29T00:00:00Z',
-  '2026-02-29T00:00:00Z',
-  '2026-02-30T00:00:00Z',
-  '2026-13-01T00:00:00Z',
-  '2026-01-01T24:00:00Z',
-  '2026-01-01T00:00Z',
-  '2026-01-01T00:00:00+24:00',
-  '2026-01-01T00:00:00+02:60',
-  '2026-01-01TT00:00:00Z',
-  '2026-01-01T00:00:00 Z',
-  '0001-01-01T00:00:00Z',
-];
-
 /** Records on both sides of every rule in trace-v1.schema.json. */
 const SAMPLES: Array<[string, unknown]> = [
   ['minimal CALL', { ...base, messageType: 'CALL', action: 'Heartbeat' }],
@@ -82,10 +111,6 @@ const SAMPLES: Array<[string, unknown]> = [
   ['timestamp with offset', { ...base, timestamp: '2026-01-01T02:00:00+02:00', messageType: 'CALL', action: 'X' }],
   ['timestamp without zone', { ...base, timestamp: '2026-01-01T00:00:00', messageType: 'CALL', action: 'X' }],
   ['timestamp as date only', { ...base, timestamp: '2026-01-01', messageType: 'CALL', action: 'X' }],
-  ...TIMESTAMPS.map((ts): [string, unknown] => [
-    `timestamp ${JSON.stringify(ts)}`,
-    { ...base, timestamp: ts, messageType: 'CALL', action: 'X' },
-  ]),
   ['soap transport', { ...base, transport: 'soap', messageType: 'CALL', action: 'X' }],
   ['bad transport', { ...base, transport: 'http', messageType: 'CALL', action: 'X' }],
   ['bad direction', { ...base, direction: 'up', messageType: 'CALL', action: 'X' }],
@@ -142,10 +167,9 @@ describe('timestamps', () => {
     expect(at('0001-01-01T00:00:00Z')).toBe(Date.parse('0001-01-01T00:00:00Z'));
   });
 
-  test('parseDateTime accepts exactly what Ajv accepts', () => {
-    for (const ts of TIMESTAMPS) {
-      const rec = { ...base, timestamp: ts, messageType: 'CALL', action: 'X' };
-      expect([ts, parseDateTime(ts) !== undefined]).toEqual([ts, ajvValidate(rec) as boolean]);
+  test('a timestamp the schema rejects is refused', () => {
+    for (const ts of ['2026-01-01T00:00:00', '2026-01-01', '2026-01-01T00:00Z', '2026-01-01TT00:00:00Z']) {
+      expect(validateOotRecord({ ...base, timestamp: ts, messageType: 'CALL', action: 'X' })).not.toEqual([]);
     }
   });
 });

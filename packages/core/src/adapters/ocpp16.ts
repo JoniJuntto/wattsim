@@ -8,8 +8,9 @@ import type { Clock } from '../clock';
 import { isoTimestamp } from '../clock';
 import type { MeterSample } from '../meter';
 import { MAX_CERTIFICATE_ENTRIES } from '../security';
-import type { ConnectorStatus, EvseState, ResolvedStationConfig, TransactionState } from '../station';
+import type { ConnectorStatus, EvseState, ResolvedStationConfig } from '../station';
 import { changeSecurityProfile16, handleSecurity16 } from './security';
+import { HEARTBEAT_INTERVAL, METER_INTERVAL, pickEvse, triggered, txOf } from './shared';
 import type { BootReason, CallOutcome, SampleContext, StationContext, TxUpdateTrigger, VersionAdapter } from './types';
 
 type MeterValue16 = NonNullable<v16.StopTransactionRequest['transactionData']>[number];
@@ -38,11 +39,8 @@ function stopReason16(reason: string): StopReason16 {
   return (STOP_REASONS as readonly string[]).includes(reason) ? (reason as StopReason16) : 'Other';
 }
 
-/**
- * One 1.6 `MeterValue` from a sample: energy, power, voltage, current and (when known) SoC. An OCMF-signed sample
- * adds the record as a second energy register value with `format: SignedData`.
- */
-export function meterValue16(sample: MeterSample, context: SampleContext): MeterValue16 {
+/** One 1.6 `MeterValue` from a sample: energy, power, voltage, current and (when known) SoC. */
+function meterValue16(sample: MeterSample, context: SampleContext): MeterValue16 {
   const sampledValue: SampledValue16[] = [
     { value: String(Math.round(sample.energyWh)), context, measurand: 'Energy.Active.Import.Register', unit: 'Wh' },
     { value: String(Math.round(sample.powerKw * 1000)), context, measurand: 'Power.Active.Import', unit: 'W' },
@@ -51,15 +49,6 @@ export function meterValue16(sample: MeterSample, context: SampleContext): Meter
   ];
   if (sample.soc !== undefined) {
     sampledValue.push({ value: (sample.soc * 100).toFixed(1), context, measurand: 'SoC', unit: 'Percent' });
-  }
-  if (sample.signed) {
-    sampledValue.push({
-      value: sample.signed.ocmf,
-      context,
-      format: 'SignedData',
-      measurand: 'Energy.Active.Import.Register',
-      unit: 'Wh',
-    });
   }
   return { timestamp: sample.timestamp, sampledValue };
 }
@@ -98,29 +87,10 @@ function rejectSet16(st: StationContext, connectorId: number, cp: ChargingProfil
   return !tx || (cp.transactionId !== undefined && cp.transactionId !== tx.id);
 }
 
-function txOf(evse: EvseState): TransactionState {
-  if (!evse.tx) throw new Error(`EVSE ${evse.id}: no transaction state`);
-  return evse.tx;
-}
-
 function meterValuesPayload(evse: EvseState, sample: MeterSample, context: SampleContext): v16.MeterValuesRequest {
   const payload: v16.MeterValuesRequest = { connectorId: evse.id, meterValue: [meterValue16(sample, context)] };
   if (typeof evse.transactionId === 'number') payload.transactionId = evse.transactionId;
   return payload;
-}
-
-/** RemoteStartTransaction target: the requested connector, else one with an EV waiting, else any free one. */
-function pickEvse(st: StationContext, connectorId: number | undefined): EvseState | undefined {
-  if (connectorId !== undefined) {
-    const evse = st.evse(connectorId);
-    return evse && !evse.tx ? evse : undefined;
-  }
-  return st.evses.find((e) => e.ev && !e.tx) ?? st.evses.find((e) => !e.tx);
-}
-
-function parseSeconds(value: string): number | undefined {
-  const n = Number(value);
-  return Number.isInteger(n) && n >= 0 && value.trim() !== '' ? n : undefined;
 }
 
 /**
@@ -143,26 +113,8 @@ type ConfigEntry = {
 };
 
 const CONFIG: Record<string, ConfigEntry> = {
-  HeartbeatInterval: {
-    readonly: false,
-    get: (st) => String(Math.round((st.heartbeatMs ?? 0) / 1000)),
-    set: (st, v) => {
-      const s = parseSeconds(v);
-      if (s === undefined) return false;
-      st.setHeartbeatMs(s * 1000);
-      return true;
-    },
-  },
-  MeterValueSampleInterval: {
-    readonly: false,
-    get: (st) => String(Math.round(st.meterIntervalMs / 1000)),
-    set: (st, v) => {
-      const s = parseSeconds(v);
-      if (s === undefined) return false;
-      st.setMeterIntervalMs(s * 1000);
-      return true;
-    },
-  },
+  HeartbeatInterval: { readonly: false, ...HEARTBEAT_INTERVAL },
+  MeterValueSampleInterval: { readonly: false, ...METER_INTERVAL },
   NumberOfConnectors: { readonly: true, get: (st) => String(st.evses.length) },
   SupportedFeatureProfiles: { readonly: true, get: () => 'Core,SmartCharging,RemoteTrigger' },
   ChargeProfileMaxStackLevel: { readonly: true, get: () => String(SMART_CHARGING_16.maxStackLevel) },
@@ -226,23 +178,8 @@ function handleCall(st: StationContext, call: CallFrame): CallOutcome {
       if (evseId !== undefined && !st.evse(evseId)) {
         return { result: { status: 'Rejected' } satisfies v16.TriggerMessageResponse };
       }
-      let after: (() => Promise<void>) | undefined;
-      switch (p.requestedMessage) {
-        case 'BootNotification':
-          after = () => st.boot('Triggered');
-          break;
-        case 'Heartbeat':
-          after = () => st.sendHeartbeat();
-          break;
-        case 'StatusNotification':
-          after = () => st.sendStatus(evseId);
-          break;
-        case 'MeterValues':
-          after = () => st.sendMeterValues(evseId);
-          break;
-        default:
-          return { result: { status: 'NotImplemented' } satisfies v16.TriggerMessageResponse };
-      }
+      const after = triggered(st, p.requestedMessage, evseId);
+      if (!after) return { result: { status: 'NotImplemented' } satisfies v16.TriggerMessageResponse };
       return { result: { status: 'Accepted' } satisfies v16.TriggerMessageResponse, after };
     }
     case 'ChangeAvailability': {

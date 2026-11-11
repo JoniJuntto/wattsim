@@ -13,18 +13,16 @@ import { keywordDocs } from './keyword-docs.macro' with { type: 'macro' };
 export type ServerOptions = {
   /** Delay between the last change and the re-check, in ms (default 200). */
   debounceMs?: number;
-  /** Keyword hover text; defaults to the map extracted from docs/dsl.md at build time. */
-  docs?: KeywordDocs;
 };
 
-const DOCS: KeywordDocs = keywordDocs();
+/** Keyword hover text, extracted from docs/dsl.md at build time. */
+const docs: KeywordDocs = keywordDocs();
 
 const toPath = (uri: string): string | undefined => (uri.startsWith('file:') ? fileURLToPath(uri) : undefined);
 
 /** Register every handler on `connection`. The caller calls `connection.listen()`. */
 export function startServer(connection: Connection, opts: ServerOptions = {}): TextDocuments<TextDocument> {
   const debounceMs = opts.debounceMs ?? 200;
-  const docs = opts.docs ?? DOCS;
   const documents = new TextDocuments(TextDocument);
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
 

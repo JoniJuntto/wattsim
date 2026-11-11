@@ -2,7 +2,6 @@ import { PlusIcon, Trash2Icon } from 'lucide-react';
 import { type FormEvent, useId, useState } from 'react';
 import { useAddChaos, useMeta, useRemoveChaos } from '@/api/queries';
 import type { ChaosRuleBody, ChaosRuleView, StationView } from '@/api/types';
-import { ActionPicker } from '@/components/app/action-picker';
 import { Button } from '@/components/ui/button';
 import { Field, FieldDescription, FieldError, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
@@ -22,6 +21,9 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { FAULT_GROUPS, FAULTS, type FaultField, faultParams, faultSpec } from '@/lib/faults';
 
 type Trigger = 'always' | 'nth' | 'every' | 'probability';
+
+/** The "Any action" entry: Radix Select items cannot carry an empty value. */
+const ANY = '__any__';
 
 function RuleRow({ rule, onRemove, removing }: { rule: ChaosRuleView; onRemove: () => void; removing: boolean }) {
   const spec = faultSpec(rule.fault);
@@ -73,6 +75,10 @@ export function ChaosPanel({ station }: { station: StationView }) {
   const [error, setError] = useState<string | null>(null);
 
   const acts = meta.data?.actions[station.version];
+  const groups: Array<[string, string[]]> = [
+    ['Sent by the station', acts?.stationSends ?? []],
+    ['Sent by the CSMS', acts?.csmsSends ?? []],
+  ];
   const spec = faultSpec(fault);
   const only = spec?.onlyDirection;
   const paramValue = (f: FaultField) => values[`${fault}.${f.key}`] ?? f.default;
@@ -152,17 +158,27 @@ export function ChaosPanel({ station }: { station: StationView }) {
           </Field>
           <Field>
             <FieldLabel htmlFor={`${uid}-action`}>Action</FieldLabel>
-            <ActionPicker
-              id={`${uid}-action`}
-              value={action}
-              onChange={setAction}
-              allowAny
-              groups={[
-                { heading: 'Sent by the station', actions: acts?.stationSends ?? [] },
-                { heading: 'Sent by the CSMS', actions: acts?.csmsSends ?? [] },
-              ]}
-              className="w-full"
-            />
+            <Select value={action || ANY} onValueChange={(v) => setAction(v === ANY ? '' : v)}>
+              <SelectTrigger id={`${uid}-action`} className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ANY}>Any action</SelectItem>
+                {groups.map(([heading, list]) =>
+                  list.length === 0 ? null : (
+                    <SelectGroup key={heading}>
+                      <SelectSeparator />
+                      <SelectLabel>{heading}</SelectLabel>
+                      {list.map((a) => (
+                        <SelectItem key={`${heading}-${a}`} value={a}>
+                          {a}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  ),
+                )}
+              </SelectContent>
+            </Select>
             <FieldDescription>Responses match the action of the CALL they answer.</FieldDescription>
           </Field>
         </div>

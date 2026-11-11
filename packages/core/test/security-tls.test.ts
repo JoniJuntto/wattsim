@@ -45,7 +45,7 @@ afterEach(async () => {
 });
 
 function csms(opts: ConstructorParameters<typeof SecureCsms>[0] = {}): SecureCsms {
-  const c = new SecureCsms({ now: () => clock.date(), ...opts });
+  const c = new SecureCsms({ now: () => new Date(clock.now()), ...opts });
   servers.push(c);
   return c;
 }

@@ -11,6 +11,8 @@ import {
   type Attachment,
   attachEvses,
   type ControllerStmt,
+  dslNumber,
+  dslString,
   formatSite,
   issueLoc,
   type Linked,
@@ -23,10 +25,10 @@ import {
   type StringExpr,
   siteSetup,
 } from '@wattsim/scenario';
-import { dslNumber, dslString } from './session';
+
 import type { OcppVersion } from './types';
 
-export type SandboxStation = {
+type SandboxStation = {
   id: string;
   /** From the block's `version` statement, when it has one. */
   version?: OcppVersion;

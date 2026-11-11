@@ -258,7 +258,7 @@ await csms.stop();
 
 The station connects to `<url>/<identity>`; the CSMS picks the first subprotocol in the client's offer that it speaks (`versions` narrows it) and answers anything else with HTTP 400. With `basicAuth` (a password per identity, or a check function) the user name must be the identity, as in security profile 1; a failed check is HTTP 401. `tls: { cert, key, ca?, requestCert? }` serves `wss://`.
 
-Out of the box it behaves like a reasonable CSMS for every station-initiated action of 1.6 (with the security extension), 2.0.1 and 2.1: BootNotification Accepted with `heartbeatInterval` (default 300 s), Authorize Accepted unless the token is in `blockedIdTokens`, StartTransaction with increasing ids, TransactionEvent and notifications accepted, DataTransfer `UnknownVendorId`, SignCertificate Accepted. With a `signer` hook each accepted SignCertificate is followed by a CertificateSigned CALL carrying the chain it returns. `respondWith(action, fn)` overrides a reply for every station (`csms.respondWith`) or one (`session.respondWith`); `fn` returns the payload, a `CsmsCallError`, or `undefined` for no answer, and gets `next()` for the default. Replies that fail their schema are not sent (the station gets `InternalError`) unless `strict: false`.
+Out of the box it behaves like a reasonable CSMS for every station-initiated action of 1.6 (with the security extension), 2.0.1 and 2.1: BootNotification Accepted with `heartbeatInterval` (default 300 s), Authorize Accepted, StartTransaction with increasing ids, TransactionEvent and notifications accepted, DataTransfer `UnknownVendorId`, SignCertificate Accepted. With a `signer` hook each accepted SignCertificate is followed by a CertificateSigned CALL carrying the chain it returns. `respondWith(action, fn)` overrides a reply for every station (`csms.respondWith`) or one (`session.respondWith`); `fn` returns the payload, a `CsmsCallError`, or `undefined` for no answer, and gets `next()` for the default. Replies that fail their schema are not sent (the station gets `InternalError`) unless `strict: false`.
 
 `session.call(action, payload)` validates the payload before sending (an invalid one throws), keeps one CALL in flight per station, and resolves with the CALLRESULT; a CALLERROR, a timeout (`callTimeoutMs`, default 30 s, on the injected `clock`) or a disconnect rejects. Events: `connected`, `disconnected`, `frame`, `call`, `violation`, `error`. A session keeps its boot and transaction state across reconnects, since a 1.6 station does not boot again after a network drop.
 
@@ -359,7 +359,6 @@ New EV properties (`EvConfig`; all optional):
 | `batteryTempC` | °C | `ambientC` | pack temperature at plug-in |
 | `heatPerHourC` | °C/h at 1C | 6 | heating, grows with the square of the power |
 | `coolingPerHour` | 1/h | 0.5 | share of the excess over ambient lost per hour |
-| `temperatureDerate` | function | 20% at -20 °C, 50% at 0 °C, 100% from 15 to 40 °C, 50% at 50 °C, 0 from 60 °C | power factor from the pack temperature |
 | `cableMaxA` | A per phase | none | caps the current |
 | `v2x` | boolean | false | follows negative 2.1 setpoints and limits by discharging |
 | `maxDischargeCurrentA` | A per phase | `maxCurrentA` | discharge limit |
@@ -369,17 +368,13 @@ New EV properties (`EvConfig`; all optional):
 | `departureMs` | ms after plug-in | none | ISO 15118 departure time |
 | `energyRequestKwh` | kWh | to `targetSoc` | ISO 15118 energy request |
 | `minCurrentA` | A per phase | 6 | `evMinCurrent` |
-| `emaid` | string | none | contract id for `station.plugAndCharge(evseId)` |
+| `emaid` | string | none | ISO 15118 contract id |
 
 **V2X (2.1).** A schedule period with a negative `setpoint` makes a `v2x` EV discharge at that rate, bounded by `dischargeLimit`, the EVSE rating and the EV's own discharge current. A positive setpoint is a charging target. A negative `limit` without a setpoint (the pre-2.1 convention) is read as a discharge too. While discharging, Power.Active.Import and Current.Import are negative, Power.Active.Export carries the magnitude, and Energy.Active.Export.Register grows while the import register stays put. A unidirectional EV, or any 1.6 / 2.0.1 station, offers nothing for a negative limit (SuspendedEVSE).
 
-**ISO 15118.** `station.plugAndCharge(evseId)` sends Authorize with idToken type eMAID and, when a V2G certificate chain is installed (SignCertificate `V2GCertificate`, then CertificateSigned), `iso15118CertificateHashData` for the chain's certificates. It starts the transaction under the eMAID when the CSMS accepts both the token and the certificate. `station.notifyEvChargingNeeds(evseId)` sends the EV's needs on demand; on 2.1 a V2X EV asks for `AC_BPT` with its charge and discharge power.
-
-**Signed meter values.** `signedMeterValues: true` signs every energy register reading as OCMF (`OCMF|{payload}|{"SA":"ECDSA-secp256r1-SHA256","SD":...}`) with a per-station P-256 key. The key is generated on first use, or you can pass `meterSigningKey` (PKCS#8 PEM). 2.x puts the record, base64, in the register's `signedMeterValue` (`encodingMethod: OCMF`, `publicKey`: base64 SPKI). 1.6 adds a second register value with `format: SignedData`. `station.meterSigner.publicKeyBase64` is the key a CSMS verifies against.
+**ISO 15118.** `station.notifyEvChargingNeeds(evseId)` sends the EV's needs on demand; on 2.1 a V2X EV asks for `AC_BPT` with its charge and discharge power.
 
 **Tariffs and cost (2.1).** The station handles SetDefaultTariff, GetTariffs, ClearTariffs and ChangeTransactionTariff, and computes the running cost locally. A transaction takes the default tariff in force when it starts (the EVSE's own, else the station's). Every TransactionEvent then carries `transactionInfo.tariffId` and `costDetails`: totals per dimension with and without tax, `totalUsage`, and one charging period per change of applicable prices. Energy, charging-time and idle-time prices are evaluated with their conditions (time of day, weekday, dates, energy, power, current, durations) on the virtual clock. Local time comes from the station's IANA `timeZone` (default UTC, also `ClockCtrlr.TimeZone` via SetVariables), so 22:00 or midnight lands on the right instant on both sides of a DST change. A price boundary inside a meter interval is charged exactly. Fixed fees apply at the start. Stacked tax rates and `minCost` / `maxCost` are applied. Elements whose power, current or energy bounds are negative price discharging; the others price charging only. On 2.0.1 the station keeps the CSMS's running cost (CostUpdated, TransactionEventResponse `totalCost`) as `tx.csmsTotalCost`.
-
-**Models.** `meterModel: 'constant'` draws one constant power per transaction (the EV's limit at its initial soc, capped by the offer) and leaves soc and temperature alone. Use it for load runs. `evFactory` and `meterFactory` in `StationConfig` build the `EvModel` / `MeterModel` for each EV and EVSE, so a subclass can replace either model.
 
 ## Electrical site model
 
@@ -467,7 +462,7 @@ Chaos applies per connection and per direction, the way a simulated station appl
 
 **Trace to scenario.** `--export out.ws` (or `-` for stdout) writes the trace as a `.ws` scenario instead of replaying it. Station messages become `boot`, `heartbeat` and `authorize` where those send exactly the recorded message, and nothing more: a BootNotification becomes `boot` only when it was accepted and followed by exactly the StatusNotifications `boot` sends itself, otherwise `send BootNotification`. Everything else becomes `send ACTION {payload}`, so the scenario sends the trace's station messages and nothing else. The CSMS's answers become `expect result` and `expect error`, its CALLs `expect call`, and the station's recorded answers become `on` handlers. `wait`s keep the recorded gaps. The output passes `wattsim check` and `wattsim fmt --check`.
 
-From TypeScript (`@wattsim/trace`): `new Recorder({ path }).attach(station)` records a core `Station`, `startProxy(...)` runs the proxy, `replay(entries, { csmsUrl, virtual })` returns a report, `toScenario(entries)` returns `.ws` text, and `readTrace`, `parseTrace`, `formatTrace` and `writeTrace` handle the files.
+From TypeScript (`@wattsim/trace`): `new Recorder({ path }).attach(station)` records a core `Station`, `new OcppProxy(...)` runs the proxy, `replay(entries, { csmsUrl, virtual })` returns a report, `toScenario(entries)` returns `.ws` text, and `readTrace`, `parseTrace` and `formatTrace` handle the files.
 
 ## Quirk profiles
 

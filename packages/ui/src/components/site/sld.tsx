@@ -37,7 +37,6 @@ export type SldProps = {
   selected?: string;
   onSelect: (id: string) => void;
   onToggleGroup: (busId: string) => void;
-  reducedMotion: boolean;
   /** Per EVSE leaf: the limit the DLM gave it at this instant, A per phase. */
   limits?: ReadonlyMap<string, number>;
   /** Scale of the drawing (1: one SVG unit per CSS pixel). */
@@ -129,10 +128,10 @@ export const Sld = memo(function Sld(p: SldProps) {
           strokeLinecap="butt"
           strokeDasharray={r.energized ? undefined : '3 3'}
         />
-        {flowing && !p.reducedMotion && len > 10 && (
+        {flowing && len > 10 && (
           <path
             d={d}
-            className="sld-flow"
+            className="sld-flow motion-reduce:hidden"
             data-reverse={exporting}
             stroke="var(--sld-paper)"
             strokeOpacity={0.85}
@@ -141,8 +140,16 @@ export const Sld = memo(function Sld(p: SldProps) {
             style={{ '--flow-s': `${flowDur(r.powerW)}s` } as React.CSSProperties}
           />
         )}
-        {flowing && p.reducedMotion && len > 14 && (
-          <Chevron x={(x1 + x2) / 2} y={(y1 + y2) / 2} up={exporting} color="var(--sld-paper)" size={Math.max(3, sw)} />
+        {flowing && len > 14 && (
+          <g className="motion-safe:hidden">
+            <Chevron
+              x={(x1 + x2) / 2}
+              y={(y1 + y2) / 2}
+              up={exporting}
+              color="var(--sld-paper)"
+              size={Math.max(3, sw)}
+            />
+          </g>
         )}
       </g>
     );

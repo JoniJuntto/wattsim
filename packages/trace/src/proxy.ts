@@ -32,12 +32,12 @@
  * What a connection holds (delayed and reordered frames, a half-open state and its timer) is discarded when either
  * side closes, as a real connection loses what was in flight.
  */
-import type { ChaosEffect, ChaosFaultEffect, ChaosRule, Clock, Timer } from '@wattsim/core';
+import type { ChaosEffect, ChaosRule, Clock, Timer } from '@wattsim/core';
 import { ChaosEngine, mutatePayload, TypedEmitter, WallClock } from '@wattsim/core';
 import type { CallErrorFrame, Frame, OcppVersion } from '@wattsim/protocol';
 import { encodeFrame, isOcppVersion, MessageType, newMessageId } from '@wattsim/protocol';
 import type { ChaosNote, TraceDirection, TraceEntry } from './entry';
-import { Correlator, makeEntry, opposite } from './entry';
+import { Correlator, makeEntry, openSocket, opposite } from './entry';
 import { Recorder } from './recorder';
 import type { TraceFileFormat } from './write';
 
@@ -57,8 +57,6 @@ export type ProxyOptions = {
   chaos?: ChaosEngine | ((identity: string) => ChaosEngine | undefined);
   /** Timestamps and chaos delays; default the wall clock. */
   clock?: Clock;
-  /** TLS for the listening side (wss://). Accepted and passed to `Bun.serve`; plain ws is what is tested. */
-  tls?: Bun.TLSOptions;
   /** How long to wait for the upstream handshake; default 10000 ms. */
   connectTimeoutMs?: number;
 };
@@ -128,9 +126,19 @@ type ChaosOutcome = {
 
 /**
  * Decided when the frame arrives, so the trace entry can say what actually reached the other side (`copies`,
- * `delivered`) before it is recorded, even when the effect itself runs after a delay.
+ * `delivered`) before it is recorded, even when the effect itself runs after a delay. `jitter` and `slowRead` never
+ * get here (`decide` resolves them to a delay). The protocol mutations are core's `mutatePayload`, applied as
+ * `Connection` applies them to an outbound frame: a CALLRESULT payload as the action's response, anything else as its
+ * request. The engine never decides them for an inbound frame.
  */
-function chaosOutcome(frame: Frame, data: Data, effect: ChaosEffect): ChaosOutcome {
+function chaosOutcome(
+  dir: TraceDirection,
+  frame: Frame,
+  data: Data,
+  effect: ChaosEffect,
+  version: OcppVersion,
+  action: string | undefined,
+): ChaosOutcome {
   switch (effect.kind) {
     case 'drop':
     case 'noResponse':
@@ -152,38 +160,27 @@ function chaosOutcome(frame: Frame, data: Data, effect: ChaosEffect): ChaosOutco
       return { forward: [data] };
     case 'mutate':
       return { forward: ['payload' in frame ? encodeFrame({ ...frame, payload: effect.fn(frame.payload) }) : data] };
-  }
-}
-
-/**
- * The outcome of a milestone-4 fault that is not a delay (`decide` resolves `jitter` and `slowRead` to a delay). The
- * protocol mutations are core's `mutatePayload`, applied as `Connection` applies them to an outbound frame: a CALLRESULT
- * payload as the action's response, anything else as its request. The engine never decides them for an inbound frame.
- */
-function faultOutcome(
-  dir: TraceDirection,
-  frame: Frame,
-  data: Data,
-  fault: ChaosFaultEffect,
-  version: OcppVersion,
-  action: string | undefined,
-): ChaosOutcome {
-  switch (fault.kind) {
     case 'reorder':
       // A charger CALL is only released by a later charger frame, and the charger sends its next CALL only after
       // this one is answered: holding it would always time out. `ChaosEngine` never matches one; pass it on anyway.
       if (dir === 'out' && frame.type === MessageType.Call) return { forward: [data] };
-      return { forward: [data], hold: Math.max(1, fault.after ?? 1) };
+      return { forward: [data], hold: Math.max(1, effect.after ?? 1) };
     case 'halfOpen':
-      return { forward: [], halfOpen: fault.ms === undefined ? {} : { ms: fault.ms } };
+      return { forward: [], halfOpen: effect.ms === undefined ? {} : { ms: effect.ms } };
     case 'reconnectStorm':
-      return { forward: [data], storm: { count: fault.count, windowMs: fault.windowMs } };
-    default: {
+      return { forward: [data], storm: { count: effect.count, windowMs: effect.windowMs } };
+    case 'invalidEnum':
+    case 'missingField':
+    case 'timestamp':
+    case 'oversized': {
       if (!('payload' in frame)) return { forward: [data] };
       const kind = frame.type === MessageType.CallResult ? 'response' : 'request';
-      const payload = mutatePayload(version, action, kind, frame.payload, fault);
+      const payload = mutatePayload(version, action, kind, frame.payload, effect);
       return { forward: [encodeFrame({ ...frame, payload })] };
     }
+    case 'jitter':
+    case 'slowRead':
+      return { forward: [data] };
   }
 }
 
@@ -243,16 +240,14 @@ class Session {
     const swallowed = this.halfOpen;
     const decision = frame && !(swallowed && dir === 'in') ? this.chaos?.decide(dir, frame, action) : undefined;
     const rule = decision?.rule;
-    if (!frame || !decision || !rule || (!decision.effect && !decision.fault)) {
+    if (!frame || !decision || !rule || !decision.effect) {
       if (swallowed) entry.chaos = halfOpenNote(swallowed.rule);
       this.proxy.recordEntry(entry);
       this.deliver(dir, data);
       return;
     }
-    const { effect, fault, delayed } = decision;
-    const outcome = fault
-      ? faultOutcome(dir, frame, data, fault, this.version ?? 'ocpp2.1', action)
-      : chaosOutcome(frame, data, effect as ChaosEffect);
+    const { effect, delayed } = decision;
+    const outcome = chaosOutcome(dir, frame, data, effect, this.version ?? 'ocpp2.1', action);
     // The rule's own kind: a `jitter` or `slowRead` is noted as such, with the delay the engine drew.
     entry.chaos = { rule: rule.id, effect: rule.effect.kind };
     if (outcome.delayMs !== undefined) entry.chaos.delayMs = outcome.delayMs;
@@ -429,7 +424,6 @@ export class OcppProxy extends TypedEmitter<ProxyEvents> {
     this.server = Bun.serve<SocketData>({
       port: listen.port,
       hostname: listen.hostname ?? '127.0.0.1',
-      ...(opts.tls ? { tls: opts.tls } : {}),
       fetch: (req, server) => this.handshake(req, server),
       websocket: {
         open: (ws) => ws.data.session.attachCharger(ws),
@@ -438,8 +432,7 @@ export class OcppProxy extends TypedEmitter<ProxyEvents> {
       },
     });
     this.port = this.server.port ?? 0;
-    const scheme = opts.tls ? 'wss' : 'ws';
-    this.url = `${scheme}://${listen.hostname ?? '127.0.0.1'}:${this.port}`;
+    this.url = `ws://${listen.hostname ?? '127.0.0.1'}:${this.port}`;
   }
 
   /** Identities connected through right now. */
@@ -501,10 +494,14 @@ export class OcppProxy extends TypedEmitter<ProxyEvents> {
     const target = `${this.opts.upstream.replace(/\/+$/, '')}/${segment}`;
     const upstream = new WebSocket(target, { protocols: offered, headers });
     upstream.binaryType = 'arraybuffer';
-    const opened = await this.awaitOpen(upstream);
+    const opened = await openSocket(upstream, this.clock, this.opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
     if (!opened.ok) {
-      this.emit('refused', identity, opened.status, opened.message);
-      return new Response(`upstream ${target}: ${opened.message}`, { status: opened.status });
+      // A refusal carries the upstream HTTP status when Bun reports one.
+      const message = opened.timedOut ? 'upstream handshake timed out' : `upstream ${opened.message}`;
+      const reported = Number(/status code:? (\d{3})/i.exec(opened.message)?.[1] ?? 502);
+      const status = opened.timedOut ? 504 : reported >= 200 && reported !== 101 ? reported : 502;
+      this.emit('refused', identity, status, message);
+      return new Response(`upstream ${target}: ${message}`, { status });
     }
     const protocol = upstream.protocol;
     const chaos = typeof this.opts.chaos === 'function' ? this.opts.chaos(identity) : this.opts.chaos;
@@ -526,33 +523,6 @@ export class OcppProxy extends TypedEmitter<ProxyEvents> {
     this.sessions.add(session);
     this.emit('open', identity, protocol);
     return undefined;
-  }
-
-  /** Wait for the upstream handshake. A refusal carries the upstream HTTP status when Bun reports one. */
-  private awaitOpen(ws: WebSocket): Promise<{ ok: true } | { ok: false; status: number; message: string }> {
-    return new Promise((resolve) => {
-      let message = 'upstream closed the connection during the handshake';
-      const timer = this.clock.setTimeout(() => {
-        ws.close();
-        done({ ok: false, status: 504, message: 'upstream handshake timed out' });
-      }, this.opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
-      const done = (r: { ok: true } | { ok: false; status: number; message: string }) => {
-        timer.cancel();
-        ws.onopen = null;
-        ws.onerror = null;
-        ws.onclose = null;
-        resolve(r);
-      };
-      ws.onopen = () => done({ ok: true });
-      ws.onerror = (ev) => {
-        const m = (ev as ErrorEvent).message;
-        if (m) message = m;
-      };
-      ws.onclose = () => {
-        const status = Number(/status code:? (\d{3})/i.exec(message)?.[1] ?? 502);
-        done({ ok: false, status: status >= 200 && status !== 101 ? status : 502, message });
-      };
-    });
   }
 }
 
@@ -579,9 +549,4 @@ export function chaosPerIdentity(
     engines.set(identity, engine);
     return engine;
   };
-}
-
-/** Start a proxy listening for chargers. Resolves once it is listening. */
-export async function startProxy(opts: ProxyOptions): Promise<OcppProxy> {
-  return new OcppProxy(opts);
 }

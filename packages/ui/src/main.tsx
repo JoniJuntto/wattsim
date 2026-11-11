@@ -14,7 +14,8 @@ const queryClient = new QueryClient({
 });
 
 async function start() {
-  // Dev-only fake server: `?mock` in the URL (remembered for the tab). Tree-shaken out of production builds.
+  // Dev-only fake server (an empty fleet, a droppable stream): `?mock` in the URL, remembered for the tab until
+  // `?nomock`. Tree-shaken out of production builds.
   if (import.meta.env.DEV) {
     const params = new URLSearchParams(window.location.search);
     if (params.has('mock')) sessionStorage.setItem('wattsim-mock', '1');

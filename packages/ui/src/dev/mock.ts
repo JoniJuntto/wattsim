@@ -1,7 +1,9 @@
 /**
- * Dev-only fake wattsim server, enabled with `?mock` (and `?mock=empty` for an empty fleet). It patches `fetch` for
- * `/api/*` and `WebSocket` for `/api/stream`, implements the contract well enough to click through every screen, and
- * keeps a few stations charging, faulting and exchanging frames. Never imported by production builds.
+ * Dev-only fake wattsim server, enabled with `?mock`: an empty fleet to add stations to, and a stream that can be
+ * dropped from the console (`window.wattsimMock.dropStream()`) to check reconnect behaviour. It patches `fetch` for
+ * `/api/*` and `WebSocket` for `/api/stream`, and keeps the stations added through the UI charging and exchanging
+ * frames; scenarios, runs, recordings, the test CSMS and chart history come back empty. For the real thing run
+ * `wattsim ui` and the dev server proxies `/api` to it. Never imported by production builds.
  */
 import type {
   ChaosRuleBody,
@@ -10,26 +12,13 @@ import type {
   EvseView,
   FrameEvent,
   Meta,
-  OcppVersion,
   StationAction,
   StationView,
   StreamMessage,
   ValidateBody,
   Violation,
 } from '../api/types';
-import {
-  chartsTick,
-  fillerStations,
-  fleetSeries,
-  fleetStations,
-  historyAt,
-  historySegments,
-  schedule as mockSchedule,
-  seedHistory,
-  stationSeries,
-} from './mock-charts';
-import { type MockContext, MockHttpError, seedServerMode, serverModeRoute, serverModeTick } from './mock-server-mode';
-import { siteRoute } from './mock-site';
+import { json, siteRoute } from './mock-site';
 
 const FRAME_CAP = 2000;
 
@@ -195,6 +184,7 @@ function makeStation(id: string, o: CreateStationOptions): Sim {
       id,
       version: o.version,
       csmsUrl: o.csmsUrl,
+      folder: o.folder?.trim() || undefined,
       connection: 'idle',
       booted: false,
       chaos: [],
@@ -503,11 +493,10 @@ function chaosDetail(b: ChaosRuleBody): string | undefined {
   }
 }
 
-const json = (body: unknown, status = 200) =>
-  new Response(body === undefined ? null : JSON.stringify(body), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  });
+const EMPTY_CSMS = {
+  summary: { running: false, sessions: 0, connected: 0, totals: { total: 0, errors: 0, warnings: 0 }, byRule: {} },
+  sessions: [],
+};
 
 async function route(method: string, url: URL, body: unknown): Promise<Response> {
   const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent); // ['api', ...]
@@ -550,29 +539,69 @@ async function route(method: string, url: URL, body: unknown): Promise<Response>
       for (const s of created) emit({ type: 'station', station: s });
       return json(o.template !== undefined ? created : created[0]);
     }
-    if (a === 'fleet') {
-      const q = url.searchParams;
-      const to = Number(q.get('to') ?? Date.now());
-      const from = Number(q.get('from') ?? to - 3_600_000);
-      const views = [...stations.values()].map((s) => s.view);
-      if (b === 'series') return json(fleetSeries(views, from, to, Number(q.get('step') ?? 10_000)));
-      if (b === 'stations') {
-        const metric = q.get('metric') === 'status' ? 'status' : 'power';
-        return json(fleetStations(views, from, to, Number(q.get('bins') ?? 120), metric));
+    // No history in the mock: the chart queries get empty views, the server-mode lists are empty.
+    const q = url.searchParams;
+    const to = Number(q.get('to') ?? Date.now());
+    const from = Number(q.get('from') ?? to - 3_600_000);
+    const step = Number(q.get('step') ?? 10_000);
+    if (a === 'fleet' && b === 'series')
+      return json({
+        from,
+        to,
+        step,
+        binMs: 10_000,
+        statuses: [],
+        t: [],
+        kw: [],
+        kwMin: [],
+        kwMax: [],
+        stations: [],
+        connected: [],
+        counts: [],
+      });
+    if (a === 'fleet' && b === 'stations')
+      return json({
+        from,
+        to,
+        step,
+        metric: q.get('metric') === 'status' ? 'status' : 'power',
+        statuses: [],
+        rows: [],
+      });
+    if ((a === 'scenarios' || a === 'runs' || a === 'recordings') && !b && method === 'GET') return json([]);
+    if (a === 'csms' && !b && method === 'GET') return json(EMPTY_CSMS);
+    if (a === 'csms' && (b === 'violations' || b === 'reports') && method === 'GET') return json([]);
+    if (a === 'csms' && b === 'findings')
+      return json({ from, to, step, t: [], rules: [], byRule: [], errors: [], warnings: [], stations: [], matrix: [] });
+    if (a === 'stations' && b === 'folder' && method === 'POST') {
+      const o = body as { ids: string[]; folder: string | null };
+      const moved = o.ids.map((id) => {
+        const s = stations.get(id);
+        if (!s) throw new HttpError(404, `No station ${id}`);
+        return s;
+      });
+      for (const s of moved) {
+        s.view = { ...s.view, folder: o.folder ?? undefined };
+        emit({ type: 'station', station: s.view });
       }
+      return json(moved.map((s) => s.view));
     }
     const sim = b ? stations.get(b) : undefined;
     if (a === 'stations' && b) {
       if (!sim) throw new HttpError(404, `No station ${b}`);
-      if (c === 'series') {
-        const q = url.searchParams;
-        const to = Number(q.get('to') ?? Date.now());
-        const from = Number(q.get('from') ?? to - 3_600_000);
-        return json(stationSeries(sim.view, from, to, Number(q.get('step') ?? 0)));
-      }
+      if (c === 'series') return json({ stationId: b, from, to, step, fullResolutionFrom: null, evses: [] });
       if (c === 'schedule') {
-        const q = url.searchParams;
-        return json(mockSchedule(sim.view, Number(q.get('evse') ?? 1), Number(q.get('duration') ?? 86_400)));
+        const evse = Number(q.get('evse') ?? 1);
+        const ratedKw = sim.view.evses.find((e) => e.id === evse)?.offeredKw ?? 0;
+        return json({
+          stationId: b,
+          evse,
+          from: Date.now(),
+          durationMs: Number(q.get('duration') ?? 86_400) * 1000,
+          ratedKw,
+          profiles: 0,
+          periods: [],
+        });
       }
       if (!c && method === 'DELETE') {
         stations.delete(b);
@@ -600,11 +629,9 @@ async function route(method: string, url: URL, body: unknown): Promise<Response>
     }
     const site = siteRoute(method, parts, body, emit);
     if (site) return site;
-    const served = serverModeRoute(mockContext, method, url, parts, body);
-    if (served) return served;
     throw new HttpError(404, `Mock has no route ${method} ${url.pathname}`);
   } catch (e) {
-    if (e instanceof HttpError || e instanceof MockHttpError) return json({ error: e.message }, e.status);
+    if (e instanceof HttpError) return json({ error: e.message }, e.status);
     throw e;
   }
 }
@@ -656,32 +683,9 @@ class FakeSocket {
 
 const mockState = { streamDown: false };
 
-const mockContext: MockContext = {
-  emit,
-  stationFrames: (id) => (stations.has(id) ? (frames.get(id) ?? []) : undefined),
-  stationIds: () => [...stations.keys()],
-  stationVersion: (id) => stations.get(id)?.view.version,
-  stationState: (id) => {
-    const view = stations.get(id)?.view;
-    const v16 = view?.version === 'ocpp1.6';
-    // 2.x has no Charging / Preparing connector status: those are Occupied.
-    const wire = (status: string) =>
-      v16 || ['Available', 'Unavailable', 'Faulted', 'Reserved'].includes(status) ? status : 'Occupied';
-    return {
-      statuses: Object.fromEntries((view?.evses ?? []).map((e) => [v16 ? String(e.id) : `${e.id}/1`, wire(e.status)])),
-      activeTransactions: (view?.evses ?? []).flatMap((e) =>
-        e.transactionId === undefined ? [] : [String(e.transactionId)],
-      ),
-    };
-  },
-};
-
-/** Stations added by `?mock&fleet=N`: static, never ticked. */
-const filler = new Set<string>();
-
 function tick() {
   for (const sim of stations.values()) {
-    if (sim.view.connection !== 'open' || filler.has(sim.view.id)) continue;
+    if (sim.view.connection !== 'open') continue;
     let changed = false;
     sim.meterTick++;
     for (const e of sim.view.evses) {
@@ -777,241 +781,7 @@ function tick() {
   }
 }
 
-function seed() {
-  const mk = (id: string, version: OcppVersion, evses: number, csmsUrl = 'ws://localhost:9000/ocpp') => {
-    const sim = makeStation(id, { version, csmsUrl, evses, maxCurrentA: 32, phases: 3 });
-    sim.view = { ...sim.view, connection: 'open', booted: true };
-    stations.set(id, sim);
-    return sim;
-  };
-  const a = mk('CP-001', 'ocpp1.6', 2);
-  setEvse(a, 1, {
-    status: 'Charging',
-    transactionId: 4127,
-    idTag: 'TAG-0001',
-    txEnergyWh: 8420,
-    limitKw: 16,
-    ev: { state: 'Charging', soc: 0.42, targetSoc: 0.8, batteryKwh: 77, maxKw: 22 },
-  });
-  a.nextTx = 4128;
-  const b = mk('CP-002', 'ocpp2.0.1', 2, 'wss://csms.staging.example.net/ocpp/v201');
-  setEvse(b, 1, { status: 'Faulted' });
-  setEvse(b, 2, {
-    status: 'SuspendedEV',
-    transactionId: 'a3f0c2e1-7b4d-4e7a-9c1d-2b9f3e8a6d10',
-    idTag: 'RFID-77',
-    txEnergyWh: 30120,
-    ev: { state: 'Suspended', soc: 0.79, targetSoc: 0.8, batteryKwh: 58, maxKw: 11 },
-  });
-  b.view = { ...b.view, chaos: [chaosView({ fault: 'drop', direction: 'out', action: 'MeterValues', nth: 3 })] };
-  const c = mk('CP-003', 'ocpp1.6', 1);
-  setEvse(c, 1, {
-    status: 'Preparing',
-    ev: { state: 'Plugged', soc: 0.3, targetSoc: 0.9, batteryKwh: 40, maxKw: 7.4 },
-  });
-  c.view = { ...c.view, connection: 'reconnecting', booted: false };
-  const d = mk('CP-004', 'ocpp2.1', 4);
-  setEvse(d, 1, { status: 'Reserved' });
-  setEvse(d, 2, { status: 'Unavailable' });
-  setEvse(d, 3, { status: 'Finishing', ev: { state: 'Full', soc: 0.8, targetSoc: 0.8, batteryKwh: 64, maxKw: 50 } });
-  setEvse(d, 4, { status: 'SuspendedEVSE', transactionId: 'tx-88', idTag: 'APP-3', txEnergyWh: 1200, limitKw: 0 });
-  mk('CP-005', 'ocpp2.0.1', 2);
-  const f = mk('CP-006', 'ocpp1.6', 1);
-  f.view = { ...f.view, connection: 'closed', booted: false };
-}
-
-/**
- * CP-001's frame log for the last 6 h, told from the same history as its telemetry: heartbeats every 30 s (the
- * CSMS flags them as too often), and per EVSE every status change, the authorize and transaction start and stop of
- * each session, MeterValues while charging, and the TxProfile that set the limit. Enough frames to exercise the
- * log's virtualization; the newest 2000 are kept.
- */
-function seedFrames() {
-  const sim = stations.get('CP-001');
-  if (!sim) return;
-  const view = sim.view;
-  const now = Date.now();
-  const from = now - 6 * 3_600_000;
-  const events: { t: number; run: (at: Date) => void }[] = [];
-  const add = (t: number, run: (at: Date) => void) => {
-    if (t > from && t < now) events.push({ t, run });
-  };
-  const opts = (at: Date) => ({ silent: true, at });
-  add(from + 1, (at) =>
-    exchange(
-      'CP-001',
-      'out',
-      'BootNotification',
-      { chargePointVendor: 'wattsim', chargePointModel: 'sim-1' },
-      { status: 'Accepted', currentTime: at.toISOString(), interval: 300 },
-      opts(at),
-    ),
-  );
-  for (let t = from + 5000; t < now; t += 30_000) {
-    add(t, (at) => exchange('CP-001', 'out', 'Heartbeat', {}, { currentTime: at.toISOString() }, opts(at)));
-  }
-  for (let t = from + 17 * 60_000; t < now; t += 47 * 60_000) {
-    add(t, (at) =>
-      exchange(
-        'CP-001',
-        'in',
-        'DataTransfer',
-        { vendorId: 'com.example' },
-        { error: 'NotImplemented', description: 'Unknown vendor' },
-        opts(at),
-      ),
-    );
-  }
-  for (const e of view.evses) {
-    const segs = historySegments(view, e.id);
-    const txIds = new Map<number, number | string>();
-    const liveSession = segs.at(-1)?.session ?? null;
-    let prev: (typeof segs)[number] | undefined;
-    for (const seg of segs) {
-      const t = seg.from;
-      if (prev && prev.status !== seg.status) {
-        add(t, (at) =>
-          exchange(
-            'CP-001',
-            'out',
-            'StatusNotification',
-            { connectorId: e.id, errorCode: 'NoError', status: seg.status },
-            {},
-            opts(at),
-          ),
-        );
-      }
-      const session = seg.session;
-      if (session !== null && prev?.session !== session) {
-        add(t + 2000, (at) =>
-          exchange(
-            'CP-001',
-            'out',
-            'Authorize',
-            { idTag: 'TAG-0001' },
-            { idTagInfo: { status: 'Accepted' } },
-            opts(at),
-          ),
-        );
-      }
-      if (session !== null && seg.inTx && !txIds.has(session)) {
-        const id =
-          session === liveSession && e.transactionId !== undefined ? e.transactionId : 3000 + e.id * 100 + session;
-        txIds.set(session, id);
-        const meterStart = Math.round(historyAt(view, e.id, t).wh);
-        add(t + 3000, (at) =>
-          exchange(
-            'CP-001',
-            'out',
-            'StartTransaction',
-            { connectorId: e.id, idTag: 'TAG-0001', meterStart, timestamp: at.toISOString() },
-            { transactionId: id, idTagInfo: { status: 'Accepted' } },
-            opts(at),
-          ),
-        );
-      }
-      if (seg.limitKw !== null && seg.limitKw > 0 && prev?.limitKw !== seg.limitKw) {
-        const limitW = seg.limitKw * 1000;
-        add(t - 1500, (at) =>
-          exchange(
-            'CP-001',
-            'in',
-            'SetChargingProfile',
-            {
-              connectorId: e.id,
-              csChargingProfiles: {
-                chargingProfileId: 7,
-                stackLevel: 0,
-                chargingProfilePurpose: 'TxProfile',
-                chargingProfileKind: 'Absolute',
-                chargingSchedule: {
-                  chargingRateUnit: 'W',
-                  chargingSchedulePeriod: [{ startPeriod: 0, limit: limitW }],
-                },
-              },
-            },
-            { status: 'Accepted' },
-            opts(at),
-          ),
-        );
-      }
-      if (session !== null && prev?.inTx && !seg.inTx && prev.session === session) {
-        const id = txIds.get(session) ?? 0;
-        const meterStop = Math.round(historyAt(view, e.id, t).wh);
-        add(t + 1000, (at) =>
-          exchange(
-            'CP-001',
-            'out',
-            'StopTransaction',
-            { transactionId: id, meterStop, timestamp: at.toISOString(), reason: 'EVDisconnected' },
-            { idTagInfo: { status: 'Accepted' } },
-            opts(at),
-          ),
-        );
-      }
-      if (seg.status === 'Charging' && seg.inTx) {
-        const every = session === liveSession ? 10_000 : 30_000;
-        const end = Math.min(seg.to, now);
-        for (let mt = Math.ceil((seg.from + 1) / every) * every; mt < end; mt += every) {
-          add(mt, (at) => {
-            const h = historyAt(view, e.id, mt);
-            const sampled = [
-              { value: String(Math.round(h.wh)), measurand: 'Energy.Active.Import.Register', unit: 'Wh' },
-              { value: h.kw.toFixed(2), measurand: 'Power.Active.Import', unit: 'kW' },
-            ];
-            if (h.soc !== null)
-              sampled.push({ value: String(Math.round(h.soc * 100)), measurand: 'SoC', unit: 'Percent' });
-            exchange(
-              'CP-001',
-              'out',
-              'MeterValues',
-              {
-                connectorId: e.id,
-                transactionId: txIds.get(session as number),
-                meterValue: [{ timestamp: at.toISOString(), sampledValue: sampled }],
-              },
-              {},
-              opts(at),
-            );
-          });
-        }
-      }
-      prev = seg;
-    }
-  }
-  events.sort((a, b) => a.t - b.t);
-  for (const ev of events) ev.run(new Date(ev.t));
-  // A response whose id matches no CALL (what chaos `wrongId` produces) and a corrupted frame.
-  pushFrame(
-    'CP-001',
-    { dir: 'in', raw: JSON.stringify([3, '999999', { status: 'Accepted' }]), type: 3, id: '999999' },
-    new Date(now - 2000),
-  );
-  pushFrame(
-    'CP-001',
-    {
-      dir: 'out',
-      raw: '[2,"5000","MeterValues",{"connectorId":1,"meterValue":[{"timest',
-      type: 2,
-      id: '5000',
-      action: 'MeterValues',
-    },
-    new Date(now - 1000),
-  );
-}
-
 export function installMock() {
-  const empty = new URLSearchParams(window.location.search).get('mock') === 'empty';
-  if (!empty) seed();
-  const fleetSize = Number(new URLSearchParams(window.location.search).get('fleet') ?? 0);
-  for (const view of fillerStations(Number.isInteger(fleetSize) ? Math.min(fleetSize, 5000) : 0)) {
-    stations.set(view.id, { view, meterTick: 0, nextTx: 1 });
-    filler.add(view.id);
-  }
-  // Every EVSE's history ends in the state just seeded, and the live mock carries on from there.
-  seedHistory([...stations.values()].map((sim) => sim.view));
-  if (!empty) seedFrames();
-  seedServerMode(mockContext, empty);
   const realFetch = window.fetch.bind(window);
   window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input), window.location.origin);
@@ -1026,16 +796,7 @@ export function installMock() {
     if (String(url).endsWith('/api/stream')) return new FakeSocket(String(url));
     return new RealWebSocket(url, protocols);
   } as unknown as typeof WebSocket;
-  const chartDeps = {
-    stations: () => [...stations.values()].map((s) => s.view),
-    live: (id: string) => !filler.has(id),
-    emit,
-  };
-  setInterval(() => {
-    tick();
-    serverModeTick(mockContext);
-    chartsTick(chartDeps);
-  }, 1000);
+  setInterval(tick, 1000);
   // Console hooks for checking reconnect behaviour by hand.
   Object.assign(window, {
     wattsimMock: {

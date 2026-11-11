@@ -23,8 +23,9 @@
 import { dlopen, FFIType, ptr } from 'bun:ffi';
 import { readFileSync } from 'node:fs';
 import { cpus, totalmem } from 'node:os';
+import { attachMetrics } from '../packages/cli/src/metrics';
 import type { Clock, StationConfig } from '../packages/core/src/index';
-import { attachMetrics, ConnectPacer, pace, Station, VirtualClock, WallClock } from '../packages/core/src/index';
+import { ConnectPacer, pace, Station, VirtualClock, WallClock } from '../packages/core/src/index';
 import { startCsms } from '../packages/csms/src/index';
 import type { Frame, OcppVersion } from '../packages/protocol/src/index';
 import { MessageType } from '../packages/protocol/src/index';

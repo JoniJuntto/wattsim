@@ -191,7 +191,7 @@ describe('step and constant loads, and models from a description', () => {
         { kind: 'evse', id: 'CP' },
         { kind: 'load', id: 'Base' },
         { kind: 'load', id: 'HVAC', pf: 0.85, model: { type: 'constant', watts: 9000 } },
-        { kind: 'load', id: 'Office', model: { type: 'daily', points: [[0, 1000]] } },
+        { kind: 'load', id: 'Office', model: { type: 'profile', csv: '00:00,1000', loop: 'daily' } },
         { kind: 'pv', id: 'PV', peakW: 10_000 },
         { kind: 'battery', id: 'BESS', capacityWh: 1000, maxChargeW: 500, maxDischargeW: 500, setpointW: 500 },
         { kind: 'step', id: 'HP', onW: 3000, on: true },

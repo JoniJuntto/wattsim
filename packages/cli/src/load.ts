@@ -6,6 +6,36 @@ export type Loaded = { src: string; scenario: Scenario };
 export const out = (text: string) => Bun.write(Bun.stdout, text);
 export const err = (text: string) => Bun.write(Bun.stderr, text);
 
+/** Print `message` to stderr and exit with `code` (2: bad flags or input). */
+export async function fail(code: number, message: string): Promise<never> {
+  await err(`${message}\n`);
+  process.exit(code);
+}
+
+/** Serialise stdout writes so event lines land in order and `process.exit` cannot truncate them. */
+export class Printer {
+  private pending: Promise<unknown> = Promise.resolve();
+  write(text: string): void {
+    this.pending = this.pending.then(() => out(text));
+  }
+  flush(): Promise<unknown> {
+    return this.pending;
+  }
+}
+
+/** `HH:MM:SS.mmm` in UTC from epoch ms. */
+export function clockTime(ms: number): string {
+  return new Date(ms).toISOString().slice(11, 23);
+}
+
+const LINE_WIDTH = 120;
+
+/** `text` on one line, cut to `LINE_WIDTH` characters with an ellipsis. */
+export function compact(text: string): string {
+  const oneLine = text.replace(/\s+/g, ' ');
+  return oneLine.length > LINE_WIDTH ? `${oneLine.slice(0, LINE_WIDTH - 1)}…` : oneLine;
+}
+
 /**
  * Read and parse a `.ws` file. On failure prints a one-line diagnostic to stderr
  * (`file:line:col: message` for syntax errors, `cannot read <file>: <reason>` otherwise)

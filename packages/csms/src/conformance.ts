@@ -278,7 +278,7 @@ export function checkStationCall(
  * the CSMS answered on an earlier connection for a different message (warning: OCPP-J only requires ids to be
  * unique per connection, but such a CALL cannot be told apart from a retransmission).
  */
-export function ruleMessageId(s: SessionState, f: CallFrame | SendFrame): Finding[] {
+function ruleMessageId(s: SessionState, f: CallFrame | SendFrame): Finding[] {
   if (s.conn.seenIds.has(f.id)) {
     return [finding(s, 'rpc.message-id-reuse', `message id ${f.id} (${f.action}) was already used on this connection`)];
   }
@@ -295,7 +295,7 @@ export function ruleMessageId(s: SessionState, f: CallFrame | SendFrame): Findin
 }
 
 /** `rpc.call-in-flight`: a CALL while the previous station CALL is unanswered and not yet timed out. */
-export function ruleInFlight(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
+function ruleInFlight(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
   const prev = s.conn.inflight;
   if (f.type !== 2 || !prev || now - prev.at >= cfg.stationCallTimeoutMs) return [];
   return [
@@ -308,7 +308,7 @@ export function ruleInFlight(s: SessionState, f: CallFrame | SendFrame, now: num
 }
 
 /** `rpc.send-misuse` (2.1): SEND for a non-SEND action, or a SEND-only action in a CALL. */
-export function ruleSendMisuse(s: SessionState, f: CallFrame | SendFrame): Finding[] {
+function ruleSendMisuse(s: SessionState, f: CallFrame | SendFrame): Finding[] {
   const sendOnly = SEND_ACTIONS[s.version].includes(f.action);
   if (f.type === 6 && !sendOnly && isKnownAction(s.version, f.action)) {
     return [finding(s, 'rpc.send-misuse', `${f.action} is not a SEND action; it must travel in a CALL`)];
@@ -320,7 +320,7 @@ export function ruleSendMisuse(s: SessionState, f: CallFrame | SendFrame): Findi
 }
 
 /** `rpc.unknown-action`: not an action of this version, or one only the CSMS initiates. */
-export function ruleUnknownAction(s: SessionState, f: CallFrame | SendFrame): Finding[] {
+function ruleUnknownAction(s: SessionState, f: CallFrame | SendFrame): Finding[] {
   if (!isKnownAction(s.version, f.action)) {
     return [finding(s, 'rpc.unknown-action', `${f.action} is not an OCPP ${versionLabel(s.version)} action`)];
   }
@@ -331,7 +331,7 @@ export function ruleUnknownAction(s: SessionState, f: CallFrame | SendFrame): Fi
 }
 
 /** `schema.request`: the payload against the action's request schema. */
-export function ruleSchema(s: SessionState, f: CallFrame | SendFrame): Finding[] {
+function ruleSchema(s: SessionState, f: CallFrame | SendFrame): Finding[] {
   const result = validatePayload(s.version, f.action, 'request', f.payload);
   if (result.ok) return [];
   const detail = result.violations
@@ -347,7 +347,7 @@ export function ruleSchema(s: SessionState, f: CallFrame | SendFrame): Finding[]
 }
 
 /** `boot.not-accepted` and `boot.retry-too-soon`. */
-export function ruleBoot(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
+function ruleBoot(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
   const { status, at, intervalMs } = s.boot;
   const v16 = s.version === 'ocpp1.6';
   if (f.action === 'BootNotification') {
@@ -406,7 +406,7 @@ function evseLimit(cfg: CheckerConfig): { evses: number; connectors: number } | 
 }
 
 /** `topology.unknown-evse`: an EVSE / connector outside the configured topology, or a transaction on 0. */
-export function ruleTopology(s: SessionState, f: CallFrame | SendFrame, cfg: CheckerConfig): Finding[] {
+function ruleTopology(s: SessionState, f: CallFrame | SendFrame, cfg: CheckerConfig): Finding[] {
   const topo = evseLimit(cfg);
   const out: Finding[] = [];
   if (s.version === 'ocpp1.6') {
@@ -468,7 +468,7 @@ export function ruleTopology(s: SessionState, f: CallFrame | SendFrame, cfg: Che
 const CONNECTOR_ZERO_16: ReadonlySet<string> = new Set(['Available', 'Unavailable', 'Faulted']);
 
 /** `status.connector-zero`: StatusNotification misuse of the station-level id 0. */
-export function ruleConnectorZero(s: SessionState, f: CallFrame | SendFrame): Finding[] {
+function ruleConnectorZero(s: SessionState, f: CallFrame | SendFrame): Finding[] {
   if (f.action !== 'StatusNotification') return [];
   if (s.version === 'ocpp1.6') {
     const p = f.payload as v16.StatusNotificationRequest;
@@ -498,11 +498,6 @@ type TimedReading = Reading & { t: number };
 
 type MeterValue16 = v16.MeterValuesRequest['meterValue'][number];
 
-/** Energy.Active.Import.Register readings of 1.6 meter values, in Wh. Signed and unparsable values are skipped. */
-export function registers16(meterValue: readonly MeterValue16[]): Reading[] {
-  return samples16(meterValue).map(({ key, wh }) => ({ key, wh }));
-}
-
 function samples16(meterValue: readonly MeterValue16[]): TimedReading[] {
   const out: TimedReading[] = [];
   for (const mv of meterValue) {
@@ -519,11 +514,6 @@ function samples16(meterValue: readonly MeterValue16[]): TimedReading[] {
 }
 
 type MeterValue2x = NonNullable<v201.TransactionEventRequest['meterValue']>[number];
-
-/** Energy.Active.Import.Register readings of 2.x meter values, in Wh (unit and multiplier applied). */
-export function registers2x(meterValue: readonly MeterValue2x[]): Reading[] {
-  return samples2x(meterValue).map(({ key, wh }) => ({ key, wh }));
-}
 
 function samples2x(meterValue: readonly MeterValue2x[]): TimedReading[] {
   const out: TimedReading[] = [];
@@ -627,7 +617,7 @@ function meterFindings(s: SessionState, tx: TxRecord, readings: readonly TimedRe
 const MAIN_REGISTER = '|Outlet';
 
 /** `tx.*` and `meter.backwards`: the transaction state machine of either version. */
-export function ruleTransactions(s: SessionState, f: CallFrame | SendFrame): Finding[] {
+function ruleTransactions(s: SessionState, f: CallFrame | SendFrame): Finding[] {
   return s.version === 'ocpp1.6' ? transactions16(s, f) : transactions2x(s, f);
 }
 
@@ -745,7 +735,7 @@ function draining(s: SessionState, now: number, cfg: CheckerConfig): boolean {
  * `time.skew`: future timestamps always; past ones except on queueable (offline-replayed) messages and on any CALL
  * in the first `offlineDrainMs` of a reconnection, when the station may be draining its offline queue.
  */
-export function ruleTimestamps(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
+function ruleTimestamps(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
   const offline = (f.payload as { offline?: unknown }).offline === true;
   const pastOk = offline || QUEUEABLE.has(f.action) || draining(s, now, cfg);
   for (const ts of timestampsOf(f.payload)) {
@@ -767,7 +757,7 @@ export function ruleTimestamps(s: SessionState, f: CallFrame | SendFrame, now: n
 }
 
 /** `heartbeat.too-often`: two Heartbeats closer than `heartbeatMinFraction` of the interval (unless triggered). */
-export function ruleHeartbeat(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
+function ruleHeartbeat(s: SessionState, f: CallFrame | SendFrame, now: number, cfg: CheckerConfig): Finding[] {
   if (f.action !== 'Heartbeat') return [];
   const interval = s.heartbeatIntervalMs;
   const last = s.lastHeartbeatAt;

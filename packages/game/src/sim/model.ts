@@ -18,6 +18,9 @@ export const DISCOUNT = 5;
 export const energyPrice = (h: number) => (h >= 17 && h < 20 ? 0.32 : h >= 8 && h < 17 ? 0.22 : 0.14);
 export const hhmm = (t: number) => new Date(t).toISOString().slice(11, 16);
 
+/** A uniform draw from `xs` with the given random stream. */
+export const pick = <T>(rng: () => number, xs: readonly T[]): T => xs[Math.floor(rng() * xs.length)] as T;
+
 /** Something to see or hear: a number rising off the scene, a sound, or both. */
 export type Sound = 'cash' | 'trip' | 'alarm' | 'ticket' | 'solved' | 'failed' | 'star' | 'dilemma';
 export type Fx = {
@@ -110,7 +113,6 @@ export type Fault = { code: string; fix: 'reset' | 'tech' | 'unlock'; since: num
 export type Charger = {
   /** Station id, unique across lots: lot code + bay. */
   id: string;
-  lot: string;
   bay: Bay;
   type: ChargerType;
   station: Station;
@@ -259,22 +261,34 @@ export function deviceName(id: string): string {
   return id;
 }
 
-/** Position along a drive path at `t`, eased. */
-export function pathAt(path: { pts: P2[]; t0: number; dur: number }, t: number): P2 {
-  const k = Math.min(1, Math.max(0, (t - path.t0) / path.dur));
-  const e = k * k * (3 - 2 * k);
-  const lens = path.pts
-    .slice(1)
-    .map((p, i) => Math.hypot(p[0] - (path.pts[i] as P2)[0], p[1] - (path.pts[i] as P2)[1]));
-  let d = e * lens.reduce((a, b) => a + b, 0);
-  for (const [i, len] of lens.entries()) {
-    const a = path.pts[i] as P2;
-    const b = path.pts[i + 1] as P2;
-    if (d <= len || i === lens.length - 1) {
-      const f = len > 0 ? Math.min(1, d / len) : 1;
+const segLen = (pts: readonly P2[], i: number) =>
+  Math.hypot((pts[i + 1] as P2)[0] - (pts[i] as P2)[0], (pts[i + 1] as P2)[1] - (pts[i] as P2)[1]);
+
+/** Length of a polyline. */
+export function pathLength(pts: readonly P2[]): number {
+  let total = 0;
+  for (let i = 0; i < pts.length - 1; i++) total += segLen(pts, i);
+  return total;
+}
+
+/** The point `d` along a polyline (clamped to its ends). */
+export function alongPath(pts: readonly P2[], d: number): P2 {
+  for (let i = 0; i < pts.length - 1; i++) {
+    const len = segLen(pts, i);
+    if (d <= len || i === pts.length - 2) {
+      const a = pts[i] as P2;
+      const b = pts[i + 1] as P2;
+      const f = len > 0 ? Math.min(1, Math.max(0, d / len)) : 1;
       return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
     }
     d -= len;
   }
-  return path.pts[path.pts.length - 1] as P2;
+  return pts[pts.length - 1] as P2;
+}
+
+/** Position along a drive path at `t`, eased. */
+export function pathAt(path: { pts: P2[]; t0: number; dur: number }, t: number): P2 {
+  const k = Math.min(1, Math.max(0, (t - path.t0) / path.dur));
+  const e = k * k * (3 - 2 * k);
+  return alongPath(path.pts, e * pathLength(path.pts));
 }

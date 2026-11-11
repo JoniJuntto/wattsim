@@ -2,9 +2,8 @@ import type {
   AtStmt,
   ChaosDirection,
   ChaosFault,
-  ChaosFaultSpec,
-  ChaosFaultStmt,
   ChaosFilters,
+  ChaosPlainFault,
   ChaosStmt,
   ChaosTrigger,
   ChooseBranch,
@@ -51,6 +50,7 @@ import type {
   StrExpr,
   StringExpr,
 } from './ast';
+import { forEachStmt } from './ast';
 import { type Comment, KEYWORDS, lex, ParseError, type Token } from './lexer';
 import { attachPoints, checkSiteBlock, SITE_UNITS, type SiteUnitKind, VIOLATION_WORDS } from './site';
 
@@ -69,7 +69,7 @@ const OCPP_VERSIONS: ReadonlySet<string> = new Set(['1.6', '2.0.1', '2.1']);
 /** `clock set` needs an explicit zone so a run means the same instant everywhere. */
 const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 const EV_ACTIONS: ReadonlySet<string> = new Set(['plug', 'unplug', 'ready', 'suspend', 'resume']);
-const CHAOS_FAULTS: ReadonlySet<string> = new Set([
+const CHAOS_FAULTS: readonly string[] = [
   'drop',
   'delay',
   'duplicate',
@@ -77,9 +77,6 @@ const CHAOS_FAULTS: ReadonlySet<string> = new Set([
   'wrongId',
   'callError',
   'noResponse',
-]);
-/** Chaos faults added in milestone 4: they parse to `ChaosFaultStmt`. */
-export const CHAOS_FAULTS_M4: readonly string[] = [
   'jitter',
   'reorder',
   'halfOpen',
@@ -90,10 +87,8 @@ export const CHAOS_FAULTS_M4: readonly string[] = [
   'timestamp',
   'oversized',
 ];
-const CHAOS_FAULTS_NEW: ReadonlySet<string> = new Set(CHAOS_FAULTS_M4);
 /** Protocol faults mutate what the station sends; `slowRead` delays what it reads. */
 const CHAOS_OUT_ONLY: ReadonlySet<string> = new Set(['invalidEnum', 'missingField', 'timestamp', 'oversized']);
-const CHAOS_ALL_FAULTS = [...CHAOS_FAULTS, ...CHAOS_FAULTS_M4];
 const CHAOS_TAIL_WORDS: ReadonlySet<string> = new Set(['nth', 'every', 'from', 'probability', 'once']);
 const ENERGY_UNITS: Record<string, [wh: number, unit: 'Wh' | 'kWh']> = { Wh: [1, 'Wh'], kWh: [1000, 'kWh'] };
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -108,7 +103,6 @@ const QUIRK_STMTS: ReadonlySet<string> = new Set([
   'connectors',
   'auth',
   'chaos',
-  'chaosFault',
   'on',
   'clock',
   'log',
@@ -148,59 +142,6 @@ const SITE_NODE_TYPES: ReadonlySet<string> = new Set([
   'step',
 ]);
 const SITE_LEAVES: ReadonlySet<string> = new Set(['load', 'pv', 'battery', 'step']);
-/** Words of site lines, for highlighting (the line specs below are the grammar). */
-export const SITE_WORDS: ReadonlySet<string> = new Set([
-  'supply',
-  'tolerance',
-  'time',
-  'reference',
-  'none',
-  'rotate',
-  'gG',
-  'mcb',
-  'rcbo',
-  'mccb',
-  'Cu',
-  'Al',
-  'sdm630',
-  'em24',
-  'generic',
-  'profile',
-  'shape',
-  'office',
-  'residential',
-  'flat',
-  'linear',
-  'daily',
-  'weekly',
-  'margin',
-  'imbalance',
-  'current',
-  'violation',
-  'trip',
-  'phase',
-  'phases',
-  'reclose',
-  'attempts',
-  'port',
-  'unit',
-  'rating',
-  'sunrise',
-  'sunset',
-  'clouds',
-  'setpoint',
-  'discharge',
-  'efficiency',
-  'conductors',
-  'ampacity',
-  'neutral',
-  'utc',
-  'pf',
-  'rated',
-  'seed',
-  'set',
-  'off',
-]);
 const COMMON_KEYS: Record<string, SiteSpec> = { phases: PHASES_SPEC };
 const LINE_SPECS: Record<SiteNodeType | 'supply', LineSpec> = {
   supply: {
@@ -327,7 +268,7 @@ export function parse(src: string, file?: string): Scenario {
 }
 
 /** Split a raw string literal into literal chunks and `{var}` references, resolving escapes in the chunks. */
-export function parseStringParts(raw: string, loc: Loc, file?: string): StringExpr['parts'] {
+function parseStringParts(raw: string, loc: Loc, file?: string): StringExpr['parts'] {
   const parts: StringExpr['parts'] = [];
   let buf = '';
   let i = 0;
@@ -1474,26 +1415,24 @@ class Parser {
    * most one per EVSE, to the scenario's site, at a node that can take children.
    */
   private checkAttachments(scenario: Scenario): void {
-    const nested = (body: Stmt[], where: string) => {
-      const walk = (stmts: Stmt[], top: boolean) => {
-        for (const st of stmts) {
-          if (st.kind === 'site' && !top) {
-            this.fail(
-              `'site ... at' wires the station to the site: it belongs at the top level of a station block, not in ${where}`,
-              st.loc,
-            );
-          }
-          if (st.kind === 'at' || st.kind === 'repeat') walk(st.body, false);
-          if (st.kind === 'choose') for (const b of st.branches) walk(b.body, false);
+    const nested = (body: Stmt[], where: string) =>
+      forEachStmt(body, (st) => {
+        if (st.kind === 'site') {
+          this.fail(
+            `'site ... at' wires the station to the site: it belongs at the top level of a station block, not in ${where}`,
+            st.loc,
+          );
         }
-      };
-      walk(body, where === 'a station block');
-    };
+      });
     for (const p of scenario.procs) nested(p.body, `proc ${p.name}`);
     for (const q of scenario.quirks) nested(q.body, `quirk "${q.name.raw}"`);
     const points = scenario.site ? attachPoints(scenario.site) : undefined;
     for (const st of scenario.stations) {
-      nested(st.body, 'a station block');
+      // The top-level attachments are the wiring; one in a nested block is the error.
+      nested(
+        st.body.filter((s) => s.kind !== 'site'),
+        'a station block',
+      );
       const evses = new Map<number, Loc>();
       for (const s of st.body) {
         if (s.kind !== 'site') continue;
@@ -1742,36 +1681,22 @@ class Parser {
     return withEnd<ChooseStmt>({ kind: 'choose', branches, loc }, end);
   }
 
-  private parseChaos(loc: Loc): ChaosStmt | ChaosFaultStmt {
+  /** `chaos FAULT`, the fault's arguments, then the filters. */
+  private parseChaos(loc: Loc): ChaosStmt {
     this.advance();
-    const faultTok = this.peek();
-    if (Parser.isWord(faultTok) && CHAOS_FAULTS_NEW.has(faultTok.value)) return this.parseChaosFault(loc);
-    if (!Parser.isWord(faultTok) || !CHAOS_FAULTS.has(faultTok.value)) {
+    const tok = this.peek();
+    if (!Parser.isWord(tok) || !CHAOS_FAULTS.includes(tok.value)) {
       this.fail(
-        `unknown chaos fault ${Parser.describe(faultTok)}, expected ${CHAOS_ALL_FAULTS.slice(0, -1).join(', ')} or ${CHAOS_ALL_FAULTS.at(-1)}`,
+        `unknown chaos fault ${Parser.describe(tok)}, expected ${CHAOS_FAULTS.slice(0, -1).join(', ')} or ${CHAOS_FAULTS.at(-1)}`,
       );
     }
     this.advance();
-    const node: ChaosStmt = { kind: 'chaos', fault: faultTok.value as ChaosFault, once: false, loc };
-    if (node.fault === 'delay') node.delay = this.parseDur("after 'chaos delay'");
-    this.parseChaosFilters(node);
-    return node;
-  }
-
-  /** `[in|out] [ACTION]` and the trigger tail of a chaos rule. */
-  private parseChaosFilters(node: ChaosFilters): void {
-    if (this.atWord('in') || this.atWord('out')) node.direction = this.advance().value as ChaosDirection;
-    const t = this.peek();
-    if (Parser.isWord(t) && !CHAOS_TAIL_WORDS.has(t.value)) node.action = this.advance().value;
-    this.parseChaosTail(node);
-  }
-
-  /** A milestone-4 chaos fault: its arguments, then the usual filters. */
-  private parseChaosFault(loc: Loc): ChaosFaultStmt {
-    const tok = this.advance();
     const what = `after 'chaos ${tok.value}'`;
-    let fault: ChaosFaultSpec;
+    let fault: ChaosFault;
     switch (tok.value) {
+      case 'delay':
+        fault = { kind: 'delay', delay: this.parseDur(what) };
+        break;
       case 'jitter': {
         const min = this.parseDur(what);
         this.expectPunct('..', "between the jitter bounds, as in 'jitter 100ms..2s'");
@@ -1807,7 +1732,7 @@ class Parser {
       }
       case 'invalidEnum':
       case 'missingField': {
-        const mutation: Extract<ChaosFaultSpec, { path?: string }> = { kind: tok.value };
+        const mutation: Extract<ChaosFault, { path?: string }> = { kind: tok.value };
         const path = this.parsePayloadPath();
         if (path !== undefined) mutation.path = path;
         fault = mutation;
@@ -1816,7 +1741,7 @@ class Parser {
       case 'timestamp':
         fault = { kind: 'timestamp', shift: this.parseDur(what, true) };
         break;
-      default: {
+      case 'oversized': {
         const kb = this.parseNum(`size in kB ${what}`);
         if (kb.kind === 'number') {
           const unit = this.peek();
@@ -1828,9 +1753,12 @@ class Parser {
           this.advance();
         }
         fault = { kind: 'oversized', kb };
+        break;
       }
+      default:
+        fault = { kind: tok.value as ChaosPlainFault };
     }
-    const node: ChaosFaultStmt = { kind: 'chaosFault', fault, once: false, loc };
+    const node: ChaosStmt = { kind: 'chaos', fault, once: false, loc };
     const dirTok = this.peek();
     this.parseChaosFilters(node);
     if (node.direction === 'in' && CHAOS_OUT_ONLY.has(tok.value)) {
@@ -1840,6 +1768,14 @@ class Parser {
       this.fail("'slowRead' delays frames the station reads: use 'in' or no direction", dirTok);
     }
     return node;
+  }
+
+  /** `[in|out] [ACTION]` and the trigger tail of a chaos rule. */
+  private parseChaosFilters(node: ChaosFilters): void {
+    if (this.atWord('in') || this.atWord('out')) node.direction = this.advance().value as ChaosDirection;
+    const t = this.peek();
+    if (Parser.isWord(t) && !CHAOS_TAIL_WORDS.has(t.value)) node.action = this.advance().value;
+    this.parseChaosTail(node);
   }
 
   /**

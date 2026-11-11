@@ -5,14 +5,13 @@
 import { type ReactNode, useState } from 'react';
 import type { RunTimeline, TimelineLane } from '@/api/types';
 import { formatOffset, linear, timeStep } from '@/lib/chart';
-import { STATUS_LABEL } from '@/lib/status';
+import { statusLabel } from '@/lib/status';
 import { Tip } from './bars';
 import { useWidth } from './frame';
 
 const LABEL_W = 104;
 const LANE_H = 30;
 const MAX_LANES = 200;
-const statusLabel = (s: string) => STATUS_LABEL[s as keyof typeof STATUS_LABEL] ?? s;
 
 export function Swimlanes({ timeline }: { timeline: RunTimeline }) {
   const { ref, width } = useWidth<HTMLDivElement>();

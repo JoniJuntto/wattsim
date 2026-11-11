@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { FLEET_BIN_MS } from '../src/fleet';
 import type {
   FindingsBinsView,
   FleetSeriesView,
@@ -17,7 +18,7 @@ let stream: StreamClient;
 let csmsUrl: string;
 
 beforeAll(async () => {
-  api = await boot({ fleetBinMs: 50 });
+  api = await boot();
   stream = await StreamClient.open(api.url);
   csmsUrl = ((await (await api.post('/api/loopback')).json()) as { url: string }).url;
 });
@@ -116,34 +117,39 @@ describe('time series endpoints', () => {
     expect((await api.get('/api/stations/TS-1/schedule?duration=0')).status).toBe(400);
   });
 
-  test('fleet bins and the per-station heatmap', async () => {
-    await until(() => stream.of('fleet').length >= 3, 2000, 'fleet bins');
-    const bin = stream.of('fleet').at(-1)?.bin;
-    expect(bin?.stations).toBe(1);
-    expect(bin?.counts.reduce((a, b) => a + b, 0)).toBe(2);
-    const now = Date.now();
-    const series = await json<FleetSeriesView>(api.get(`/api/fleet/series?from=${now - 10_000}&to=${now}`));
-    expect(series.t.length).toBeGreaterThan(2);
-    expect(series.statuses).toContain('Charging');
-    expect(Math.max(...series.kw)).toBeGreaterThan(0);
-    const charging = series.counts[series.statuses.indexOf('Charging')] ?? [];
-    expect(charging.at(-1)).toBe(1);
+  test(
+    'fleet bins and the per-station heatmap',
+    async () => {
+      // One bin every FLEET_BIN_MS since the server started.
+      await until(() => stream.of('fleet').length >= 1, FLEET_BIN_MS + 5_000, 'a fleet bin');
+      const bin = stream.of('fleet').at(-1)?.bin;
+      expect(bin?.stations).toBe(1);
+      expect(bin?.counts.reduce((a, b) => a + b, 0)).toBe(2);
+      const now = Date.now();
+      const series = await json<FleetSeriesView>(api.get(`/api/fleet/series?from=${now - 2 * FLEET_BIN_MS}&to=${now}`));
+      expect(series.t.length).toBeGreaterThanOrEqual(1);
+      expect(series.statuses).toContain('Charging');
+      expect(Math.max(...series.kw)).toBeGreaterThan(0);
+      const charging = series.counts[series.statuses.indexOf('Charging')] ?? [];
+      expect(charging.at(-1)).toBe(1);
 
-    const power = await json<FleetStationsView>(
-      api.get(`/api/fleet/stations?from=${now - 5_000}&to=${now}&bins=10&metric=power`),
-    );
-    const row = power.rows.find((r) => r.id === 'TS-1');
-    expect(row?.values.length).toBe(10);
-    expect(row?.energyWh).toBeGreaterThanOrEqual(0);
-    expect(Math.max(...(row?.values.filter((v): v is number => v !== null) ?? [0]))).toBeGreaterThan(0);
-    const status = await json<FleetStationsView>(
-      api.get(`/api/fleet/stations?from=${now - 5_000}&to=${now}&bins=10&metric=status`),
-    );
-    const last = status.rows.find((r) => r.id === 'TS-1')?.values.at(-1);
-    expect(status.statuses[last as number]).toBe('Charging');
-    expect((await api.get('/api/fleet/stations?metric=nope')).status).toBe(400);
-    expect((await api.get('/api/fleet/stations?bins=100000')).status).toBe(400);
-  });
+      const power = await json<FleetStationsView>(
+        api.get(`/api/fleet/stations?from=${now - 5_000}&to=${now}&bins=10&metric=power`),
+      );
+      const row = power.rows.find((r) => r.id === 'TS-1');
+      expect(row?.values.length).toBe(10);
+      expect(row?.energyWh).toBeGreaterThanOrEqual(0);
+      expect(Math.max(...(row?.values.filter((v): v is number => v !== null) ?? [0]))).toBeGreaterThan(0);
+      const status = await json<FleetStationsView>(
+        api.get(`/api/fleet/stations?from=${now - 5_000}&to=${now}&bins=10&metric=status`),
+      );
+      const last = status.rows.find((r) => r.id === 'TS-1')?.values.at(-1);
+      expect(status.statuses[last as number]).toBe('Charging');
+      expect((await api.get('/api/fleet/stations?metric=nope')).status).toBe(400);
+      expect((await api.get('/api/fleet/stations?bins=100000')).status).toBe(400);
+    },
+    FLEET_BIN_MS + 10_000,
+  );
 
   test('test CSMS findings binned over time', async () => {
     const now = Date.now();

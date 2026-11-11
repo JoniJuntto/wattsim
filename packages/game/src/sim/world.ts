@@ -92,7 +92,6 @@ export class World {
   private ids = 1;
   private nextAgentAt = 0;
   private stepping = false;
-  private readonly listeners = new Set<() => void>();
 
   private constructor(readonly seed: number) {
     this.rng = mulberry32(seed ^ 0x5eed);
@@ -165,14 +164,9 @@ export class World {
     this.changed();
   }
 
-  subscribe(fn: () => void): () => void {
-    this.listeners.add(fn);
-    return () => this.listeners.delete(fn);
-  }
-
+  /** Bumps `version`, which the components poll (`useTick`). */
   changed(): void {
     this.version++;
-    for (const fn of this.listeners) fn();
   }
 
   private sync(): void {

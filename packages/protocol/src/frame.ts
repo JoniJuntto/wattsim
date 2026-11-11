@@ -41,7 +41,7 @@ export function encodeFrame(f: Frame): string {
 }
 
 /** OCPP-J caps the message id at 36 characters (a UUID). */
-export const MAX_MESSAGE_ID_LENGTH = 36;
+const MAX_MESSAGE_ID_LENGTH = 36;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);

@@ -11,11 +11,11 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@wattsim/core": "workspace:*",
     "@wattsim/protocol": "workspace:*"
   },
   "devDependencies": {
     "@types/bun": "catalog:",
-    "@wattsim/core": "workspace:*",
     "typescript": "catalog:"
   }
 }

@@ -31,11 +31,11 @@ import {
 } from '@wattsim/csms';
 import type { CallFrame, OcppVersion } from '@wattsim/protocol';
 import { CALL_ERROR_CODES, MessageType, validatePayload } from '@wattsim/protocol';
-import { format, formatDuration, link, parse } from '@wattsim/scenario';
+import { DSL_VERSION, dslJson, dslString, format, formatDuration, link, parse } from '@wattsim/scenario';
 import type { TraceEntry } from '@wattsim/trace';
 import { normalizeVersion, readTrace, TraceFormatError } from '@wattsim/trace';
-import { defineCommand, runMain } from 'citty';
-import { err, out } from '../load';
+import { defineCommand } from 'citty';
+import { fail, out } from '../load';
 
 // ---- --quirk flags ---------------------------------------------------------------------------------------------
 
@@ -83,9 +83,6 @@ const QUEUEABLE: ReadonlySet<string> = new Set([
   'TransactionEvent',
   'SecurityEventNotification',
 ]);
-const DSL_VERSION: Record<OcppVersion, string> = { 'ocpp1.6': '1.6', 'ocpp2.0.1': '2.0.1', 'ocpp2.1': '2.1' };
-const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
 type Noted = Finding & { line: number };
 /** The station's answer to one CSMS CALL. */
 type Answer =
@@ -93,28 +90,6 @@ type Answer =
   | { kind: 'none'; line: number }
   | { kind: 'error'; code: string; description: string; line: number }
   | { kind: 'invalid'; payload: unknown; line: number };
-
-/** A DSL string literal; `{` would start an interpolation. */
-function dslString(s: string): string {
-  return `"${s
-    .replace(/[\\"{]/g, (c) => `\\${c}`)
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t')}"`;
-}
-
-function dslJson(v: unknown): string {
-  if (v === null || v === undefined) return 'null';
-  if (typeof v === 'string') return dslString(v);
-  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'null';
-  if (typeof v === 'boolean') return String(v);
-  if (Array.isArray(v)) return `[${v.map(dslJson).join(', ')}]`;
-  if (typeof v === 'object') {
-    const entries = Object.entries(v as Record<string, unknown>).filter(([, x]) => x !== undefined);
-    return `{${entries.map(([k, x]) => `${IDENT_RE.test(k) ? k : dslString(k)}: ${dslJson(x)}`).join(', ')}}`;
-  }
-  return 'null';
-}
 
 const oneLine = (s: string) => s.replace(/[\r\n]+/g, ' ');
 
@@ -563,11 +538,6 @@ export function deriveQuirk(entries: readonly TraceEntry[], opts: DeriveOptions 
 
 // ---- command ---------------------------------------------------------------------------------------------------
 
-async function badInput(message: string): Promise<never> {
-  await err(`${message}\n`);
-  process.exit(2);
-}
-
 const derive = defineCommand({
   meta: {
     name: 'derive',
@@ -587,22 +557,22 @@ const derive = defineCommand({
     let version: OcppVersion | undefined;
     if (args.version !== undefined) {
       version = normalizeVersion(args.version);
-      if (!version) await badInput(`invalid --version: ${args.version} (1.6, 2.0.1 or 2.1)`);
+      if (!version) await fail(2, `invalid --version: ${args.version} (1.6, 2.0.1 or 2.1)`);
     }
     let trace: TraceEntry[] = [];
     try {
       trace = await readTrace(args.trace, { version });
     } catch (e) {
-      if (e instanceof TraceFormatError) await badInput(String(e));
-      await badInput(`cannot read ${args.trace}: ${e instanceof Error ? e.message : String(e)}`);
+      if (e instanceof TraceFormatError) await fail(2, String(e));
+      await fail(2, `cannot read ${args.trace}: ${e instanceof Error ? e.message : String(e)}`);
     }
-    if (trace.length === 0) await badInput(`${args.trace}: the trace is empty`);
+    if (trace.length === 0) await fail(2, `${args.trace}: the trace is empty`);
     let text = '';
     try {
       text = deriveQuirk(trace, { version, name: args.name, source: args.trace });
       await link(parse(text), {});
     } catch (e) {
-      await badInput(`${args.trace}: ${e instanceof Error ? e.message : String(e)}`);
+      await fail(2, `${args.trace}: ${e instanceof Error ? e.message : String(e)}`);
     }
     if (args.output && args.output !== '-') await Bun.write(args.output, text);
     else await out(text);
@@ -614,5 +584,3 @@ export const quirk = defineCommand({
   meta: { name: 'quirk', description: 'Work with vendor quirk profiles' },
   subCommands: { derive },
 });
-
-if (import.meta.main) await runMain(quirk);

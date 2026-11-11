@@ -3,8 +3,8 @@ import type { StationConfig } from '@wattsim/core';
 import { Station, VirtualClock, WallClock } from '@wattsim/core';
 import type { Frame, Violation } from '@wattsim/protocol';
 import { encodeFrame, MessageType } from '@wattsim/protocol';
-import type { AssertResult, RunResult } from '@wattsim/scenario';
-import { driveVirtual, format, isIdle, ParseError, parse, run } from '@wattsim/scenario';
+import type { AssertResult, RunResult, Scenario } from '@wattsim/scenario';
+import { driveVirtual, isIdle, ParseError, parse, run } from '@wattsim/scenario';
 
 /** Same cap as `wattsim run --virtual`. */
 export const MAX_VIRTUAL_MS = 24 * 3_600_000;
@@ -30,28 +30,13 @@ function syntax(e: unknown): never {
   throw e;
 }
 
-export type CheckResult = { ok: true; stations: number } | { ok: false; error: ScenarioError & { text: string } };
-
-export function checkScenario(text: string): CheckResult {
+/** Parse scenario text; a syntax error is a `ScenarioSyntaxError`. */
+export function parseScenario(text: string): Scenario {
   try {
-    return { ok: true, stations: parse(text).stations.length };
-  } catch (e) {
-    if (!(e instanceof ParseError)) throw e;
-    return {
-      ok: false,
-      error: { line: e.line, col: e.col, message: e.message, text: `${e.line}:${e.col}: ${e.message}` },
-    };
-  }
-}
-
-export function formatScenario(text: string): { formatted: string; changed: boolean } {
-  let formatted: string;
-  try {
-    formatted = format(parse(text));
+    return parse(text);
   } catch (e) {
     syntax(e);
   }
-  return { formatted, changed: formatted !== text };
 }
 
 export type FrameLine = { at: string; dir: 'in' | 'out'; action?: string; message: unknown };
@@ -95,12 +80,7 @@ export type RunScenarioOptions = {
 
 /** Run scenario text against `csmsUrl` (which overrides any `csms` line) and summarise the result. */
 export async function runScenario(text: string, opts: RunScenarioOptions): Promise<RunReport> {
-  let scenario: ReturnType<typeof parse>;
-  try {
-    scenario = parse(text);
-  } catch (e) {
-    syntax(e);
-  }
+  const scenario = parseScenario(text);
   const keep = opts.failureFrames ?? DEFAULT_FAILURE_FRAMES;
   const wall = new WallClock();
   const frames = new Map<string, { lines: FrameLine[]; truncated: boolean; calls: Map<string, string> }>();

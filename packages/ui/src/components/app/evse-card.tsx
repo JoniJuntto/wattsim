@@ -16,7 +16,6 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Field, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
-import { Separator } from '@/components/ui/separator';
 import { useNow } from '@/hooks/use-now';
 import { kw, kwh, percent } from '@/lib/format';
 import { MANUAL_STATUSES, STATUS_LABEL, statusStyle } from '@/lib/status';
@@ -225,7 +224,7 @@ export function EvseCard({
         </div>
       </div>
 
-      <Separator />
+      <hr className="border-t" />
 
       {ev ? (
         <div className="flex flex-col gap-2.5">
@@ -262,7 +261,7 @@ export function EvseCard({
         </div>
       )}
 
-      <Separator />
+      <hr className="border-t" />
 
       <div className="flex flex-wrap items-end gap-2">
         <Field className="w-40 gap-1">

@@ -55,28 +55,3 @@ export function currentPhasor(amps: number, phase: Phase, pf = 1): Complex {
   const angle = PHASE_ANGLE[phaseIndex(phase)] - Math.acos(Math.min(1, Math.max(0, pf)));
   return { re: amps * Math.cos(angle), im: amps * Math.sin(angle) };
 }
-
-export function magnitude(c: Complex): number {
-  return Math.hypot(c.re, c.im);
-}
-
-/** Neutral current magnitude of a set of single-phase currents (each to neutral). */
-export function neutralCurrent(currents: ReadonlyArray<{ phase: Phase; amps: number; pf?: number }>): number {
-  let re = 0;
-  let im = 0;
-  for (const c of currents) {
-    const p = currentPhasor(c.amps, c.phase, c.pf ?? 1);
-    re += p.re;
-    im += p.im;
-  }
-  return Math.hypot(re, im);
-}
-
-/** Spread leaf-phase currents onto site phases through a mapping. */
-export function mapToSitePhases(mapping: readonly Phase[], amps: readonly number[]): Triple {
-  const out: Triple = [0, 0, 0];
-  mapping.forEach((p, i) => {
-    out[phaseIndex(p)] += amps[i] ?? 0;
-  });
-  return out;
-}

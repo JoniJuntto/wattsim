@@ -14,7 +14,7 @@ import { STATE_INTERVAL_MS } from './stream';
 import type { CsmsRuleTally, CsmsSessionView, CsmsSummary, CsmsView, FindingsBinsView, FrameEvent } from './types';
 
 /** CSMS-side frames kept per station. */
-export const CSMS_FRAMES_PER_STATION = 500;
+const CSMS_FRAMES_PER_STATION = 500;
 const PENDING_IDS = 1000;
 
 const iso = (ms: number | undefined) => (ms === undefined ? undefined : new Date(ms).toISOString());

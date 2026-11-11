@@ -3,7 +3,7 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { INVALID_ENUM_VALUE, PADDING_FIELD, Station, VirtualClock } from '@wattsim/core';
 import { FakeCsms, until } from '../../core/test/fake-csms';
 import type { ReplayReport, TraceEntry } from '../src/index';
-import { chaosPerIdentity, makeEntry, parseChaosRules, readTrace, startProxy } from '../src/index';
+import { chaosPerIdentity, makeEntry, OcppProxy, parseChaosRules, readTrace } from '../src/index';
 import { replay, settle, T0, tmpPath } from './helpers';
 
 const targets: FakeCsms[] = [];
@@ -11,9 +11,9 @@ afterAll(async () => {
   for (const c of targets) await c.stop();
 });
 
-/** A CSMS double; `listen` also serves it on TCP, for a proxy's upstream. */
-async function target(listen = false): Promise<FakeCsms> {
-  const csms = await FakeCsms.start({ listen });
+/** A CSMS double on a free local port. */
+async function target(): Promise<FakeCsms> {
+  const csms = await FakeCsms.start();
   targets.push(csms);
   return csms;
 }
@@ -91,12 +91,12 @@ describe('replay of the new chaos notes', () => {
 });
 
 test('a recording made through a proxy applying the new faults replays cleanly against the same CSMS', async () => {
-  const csms = await target(true);
+  const csms = await target();
   csms.respondWith('DataTransfer', () => ({ status: 'Accepted' }));
   const path = await tmpPath('faults.jsonl');
   const pclock = new VirtualClock(T0);
   const sclock = new VirtualClock(T0);
-  const proxy = await startProxy({
+  const proxy = new OcppProxy({
     listen: 0,
     upstream: csms.url,
     record: path,
@@ -140,7 +140,7 @@ test('a recording made through a proxy applying the new faults replays cleanly a
   expect(await auth).toBe(true);
   await station.plugIn(1);
   await station.startTransaction(1, 'TAG-1');
-  await station.sendRaw('DataTransfer', { vendorId: 'v' });
+  await station.request('DataTransfer', { vendorId: 'v' });
   await settle(station, sclock);
   await station.disconnect();
   await proxy.stop();

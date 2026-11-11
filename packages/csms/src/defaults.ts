@@ -12,17 +12,11 @@ export type DefaultContext = {
   nowMs: number;
   /** BootNotification interval, seconds. */
   heartbeatInterval: number;
-  /** idTokens / idTags answered `Blocked`. */
-  blocked: ReadonlySet<string>;
   /** The next 1.6 transaction id; called once per StartTransaction. */
   nextTransactionId: () => number;
 };
 
 const DAY_MS = 86_400_000;
-
-function idStatus(ctx: DefaultContext, token: string | undefined): 'Accepted' | 'Blocked' {
-  return token !== undefined && ctx.blocked.has(token) ? 'Blocked' : 'Accepted';
-}
 
 /** The default reply payload, or `undefined` when no default exists (the CSMS answers NotImplemented). */
 export function defaultReply(action: string, payload: unknown, ctx: DefaultContext): unknown {
@@ -41,18 +35,16 @@ function reply16(action: string, payload: unknown, ctx: DefaultContext): unknown
       return { currentTime: ctx.now } satisfies v16.HeartbeatResponse;
     case 'Authorize':
       return {
-        idTagInfo: { status: idStatus(ctx, (payload as v16.AuthorizeRequest).idTag) },
+        idTagInfo: { status: 'Accepted' },
       } satisfies v16.AuthorizeResponse;
     case 'StartTransaction':
       return {
         transactionId: ctx.nextTransactionId(),
-        idTagInfo: { status: idStatus(ctx, (payload as v16.StartTransactionRequest).idTag) },
+        idTagInfo: { status: 'Accepted' },
       } satisfies v16.StartTransactionResponse;
     case 'StopTransaction': {
       const idTag = (payload as v16.StopTransactionRequest).idTag;
-      return (
-        idTag === undefined ? {} : { idTagInfo: { status: idStatus(ctx, idTag) } }
-      ) satisfies v16.StopTransactionResponse;
+      return (idTag === undefined ? {} : { idTagInfo: { status: 'Accepted' } }) satisfies v16.StopTransactionResponse;
     }
     case 'DataTransfer':
       return { status: 'UnknownVendorId' } satisfies v16.DataTransferResponse;
@@ -83,12 +75,12 @@ function reply2x(action: string, payload: unknown, ctx: DefaultContext): unknown
       return { currentTime: ctx.now } satisfies v201.HeartbeatResponse;
     case 'Authorize':
       return {
-        idTokenInfo: { status: idStatus(ctx, (payload as v201.AuthorizeRequest).idToken.idToken) },
+        idTokenInfo: { status: 'Accepted' },
       } satisfies v201.AuthorizeResponse;
     case 'TransactionEvent': {
       const token = (payload as v201.TransactionEventRequest).idToken?.idToken;
       return (
-        token === undefined ? {} : { idTokenInfo: { status: idStatus(ctx, token) } }
+        token === undefined ? {} : { idTokenInfo: { status: 'Accepted' } }
       ) satisfies v201.TransactionEventResponse;
     }
     case 'DataTransfer':

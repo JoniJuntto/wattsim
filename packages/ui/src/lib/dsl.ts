@@ -3,7 +3,7 @@
  * lexer's own `KEYWORDS`, imported from source so it follows the grammar. The lexer file has no imports, so this pulls
  * nothing else of `@wattsim/scenario` into the browser bundle.
  */
-import { type StreamParser, StringStream } from '@codemirror/language';
+import type { StreamParser, StringStream } from '@codemirror/language';
 import { tags } from '@lezer/highlight';
 import { KEYWORDS } from '../../../scenario/src/lexer';
 
@@ -81,20 +81,4 @@ function stringBody(stream: StringStream, state: DslState): string {
   // The DSL has no multi-line strings: an unterminated one ends with its line (the checker reports it).
   state.inString = false;
   return 'string';
-}
-
-/** Tokenize one line, for tests: `[text, style]` pairs, whitespace skipped. */
-export function tokenizeLine(
-  line: string,
-  state: DslState = dslParser.startState?.(2) ?? { inString: false, depth: 0 },
-) {
-  const out: [string, string | null][] = [];
-  const stream = new StringStream(line, 2, 2);
-  while (!stream.eol()) {
-    const style = dslParser.token(stream, state);
-    const text = stream.current();
-    if (text.trim() !== '') out.push([text, style]);
-    stream.start = stream.pos;
-  }
-  return out;
 }

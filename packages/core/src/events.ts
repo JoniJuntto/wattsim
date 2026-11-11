@@ -62,10 +62,6 @@ export class TypedEmitter<Events extends Record<string, unknown[]>> {
     return true;
   }
 
-  listenerCount<K extends keyof Events>(event: K): number {
-    return this.listeners.get(event)?.length ?? 0;
-  }
-
   removeAllListeners(event?: keyof Events): void {
     if (event === undefined) this.listeners.clear();
     else this.listeners.delete(event);

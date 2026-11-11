@@ -8,7 +8,7 @@
  *
  * A curve has two parts:
  *   - `thermalTime(m)`: the inverse-time part with thermal memory (bimetal, fuse element, long-time release).
- *     Infinity below the pickup. The thermal memory (`heatRate`, `heatAfter`, `timeToTrip` below) trips when
+ *     Infinity below the pickup. The thermal memory (`heatAfter`, `timeToTrip` below) trips when
  *     heat reaches 1, from cold at exactly thermalTime(m); in the adiabatic region (thermalTime ∝ 1/m²) heat is
  *     I²t normalised by the curve.
  *   - `elements`: memoryless definite-time releases (magnetic, short-time, instantaneous): trip once the current
@@ -146,7 +146,6 @@ export const MCB_MAGNETIC: Readonly<Record<McbCharacteristic, readonly [number, 
 };
 
 export const MCB_MAX_RATING_A = 125;
-export const MCB_DEFAULT_COOLING_S = 300;
 
 export function mcbCurve(characteristic: McbCharacteristic, ratingA: number, opts: BandOptions = {}): TripCurve {
   if (!(ratingA > 0 && ratingA <= MCB_MAX_RATING_A)) {
@@ -170,7 +169,7 @@ export function mcbCurve(characteristic: McbCharacteristic, ratingA: number, opt
     band: p,
     i2: 1.45,
     conventionalTimeS,
-    coolingS: opts.coolingS ?? MCB_DEFAULT_COOLING_S,
+    coolingS: opts.coolingS ?? 300,
     pickup: thermalTime.pickup,
     thermalTime,
     elements: [{ m: lerp(lo, hi, p), delayS: INSTANTANEOUS_S, cause: 'instantaneous' }],
@@ -351,14 +350,11 @@ export type MccbSettings = {
   ii?: number;
 };
 
-export const MCCB_DEFAULT_TR_S = 10;
-export const MCCB_DEFAULT_COOLING_S = 900;
-
 export function mccbCurve(ratingA: number, settings: MccbSettings = {}, opts: BandOptions = {}): TripCurve {
   if (!(ratingA > 0)) throw new RangeError(`MCCB rating must be > 0, got ${ratingA}`);
   const p = bandOf(opts);
   const ir = settings.ir ?? 1;
-  const tr = settings.tr ?? MCCB_DEFAULT_TR_S;
+  const tr = settings.tr ?? 10;
   const pickup = lerp(1.05, 1.3, p);
   const trEff = tr * lerp(0.8, 1.2, p);
   const tol = lerp(0.8, 1.2, p);
@@ -375,7 +371,7 @@ export function mccbCurve(ratingA: number, settings: MccbSettings = {}, opts: Ba
     band: p,
     i2: 1.3 * ir,
     conventionalTimeS: ratingA <= 63 ? 3600 : 7200,
-    coolingS: opts.coolingS ?? MCCB_DEFAULT_COOLING_S,
+    coolingS: opts.coolingS ?? 900,
     pickup: pickup * ir,
     thermalTime: (m: number) => {
       const mr = m / ir;
@@ -434,12 +430,6 @@ export function crawlRate(curve: TripCurve, m: number): number {
 function steadyHeat(curve: TripCurve, m: number): number {
   const x = Math.min(1, m / curve.pickup);
   return PICKUP_HEAT * x * x;
-}
-
-/** dh/dt of the thermal memory at a constant m × In, 1/s. */
-export function heatRate(curve: TripCurve, m: number, heat: number): number {
-  const relax = (steadyHeat(curve, m) - heat) / curve.coolingS;
-  return Number.isFinite(curve.thermalTime(m)) ? Math.max(relax, crawlRate(curve, m)) : relax;
 }
 
 /** Heat after `dtS` seconds at a constant m × In from `heat`, capped at 1. */

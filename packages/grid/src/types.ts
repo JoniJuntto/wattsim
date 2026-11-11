@@ -148,13 +148,6 @@ export type LoadModelSpec =
       /** Epoch ms that relative timestamps count from when not looped. Default 0. */
       startMs?: number;
     }
-  | {
-      type: 'daily';
-      /** [hour of day 0..24, W]. */
-      points: Array<[number, number]>;
-      interpolation?: 'step' | 'linear';
-      utcOffsetMin?: number;
-    }
   | { type: 'shape'; preset: 'office' | 'residential' | 'flat'; peakW: number; utcOffsetMin?: number };
 
 export type LoadDescription = LeafBase & {

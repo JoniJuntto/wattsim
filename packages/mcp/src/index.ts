@@ -11,7 +11,7 @@ import { createWattsimMcp } from './server';
 
 export { Api, ApiError } from './api';
 export * from './scenario';
-export { attachedCsmsUrl, createWattsimMcp, DEFAULT_FRAME_LIMIT, DSL_DOC_PATH, type WattsimMcpOptions } from './server';
+export { attachedCsmsUrl, createWattsimMcp, type WattsimMcpOptions } from './server';
 
 export type McpOptions = {
   /** URL of a running `wattsim ui` to drive instead of embedding a server. */

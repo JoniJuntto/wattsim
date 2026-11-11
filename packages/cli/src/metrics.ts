@@ -6,9 +6,10 @@
  * CALLs for inbound results (that pair also yields the request duration, measured on the station's clock), inbound
  * CALLs for outbound results.
  */
+
+import type { Station } from '@wattsim/core';
 import type { Frame } from '@wattsim/protocol';
 import { Counter, Gauge, Histogram, Registry } from 'prom-client';
-import type { Station } from './station';
 
 export const registry = new Registry();
 

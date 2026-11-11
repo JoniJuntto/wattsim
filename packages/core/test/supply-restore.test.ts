@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import type { OcppVersion } from '@wattsim/protocol';
 import type { Csms } from '../../csms/src/index';
-import { connectInMemory, startCsms } from '../../csms/src/index';
+import { startCsms } from '../../csms/src/index';
 import type { EvseSupply, MeterSample } from '../src/index';
 import { Station, VirtualClock } from '../src/index';
 
@@ -35,14 +35,13 @@ async function until(cond: () => boolean, ms: number, what: string): Promise<voi
 
 function setup(version: OcppVersion) {
   const clock = new VirtualClock(T0);
-  const server = startCsms({ listen: false, clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
+  const server = startCsms({ clock, topology: { evses: 1 }, callTimeoutMs: 5000 });
   csms = server;
   let supply: EvseSupply | null = LIVE;
   const st = new Station({
     id: `RST-${version}`,
     version,
     csmsUrl: server.url,
-    socket: connectInMemory,
     clock,
     meterIntervalMs: MIN,
     supply: () => supply,

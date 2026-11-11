@@ -1,14 +1,17 @@
 import { Link } from '@tanstack/react-router';
-import { PlusIcon, SearchIcon, ZapIcon } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { ChevronRightIcon, FolderIcon, PlusIcon, SearchIcon, ZapIcon } from 'lucide-react';
+import { type FormEvent, type ReactNode, useMemo, useState } from 'react';
+import { useMoveStations } from '@/api/queries';
 import type { StationView } from '@/api/types';
 import { AddStationDialog } from '@/components/app/add-station-dialog';
 import { FleetCharts } from '@/components/app/fleet-charts';
+import { FolderInput } from '@/components/app/folder-input';
 import { ConnectionPill, EvseChip, VersionBadge } from '@/components/app/status';
 import { Button } from '@/components/ui/button';
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
 import { Skeleton } from '@/components/ui/skeleton';
+import { type FolderGroup, groupByFolder, matchesQuery } from '@/lib/folders';
 import { kw } from '@/lib/format';
 import { STATUS_LABEL, STATUSES, statusStyle } from '@/lib/status';
 import { useLive, useStreamStatus } from '@/state/live';
@@ -144,6 +147,81 @@ function FleetStrip({ stations }: { stations: StationView[] }) {
   );
 }
 
+const COLLAPSED_KEY = 'wattsim.fleet.collapsed';
+
+function loadCollapsed(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? '[]');
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The key a group is remembered under; the empty string is the stations without a folder (a folder name is never empty). */
+const groupKey = (g: FolderGroup) => g.folder ?? '';
+
+/** One folder: a header that sums it up and folds its cards away. The cards are only rendered while it is open. */
+function FolderSection({
+  group,
+  open,
+  onOpenChange,
+  children,
+}: {
+  group: FolderGroup;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  children: ReactNode;
+}) {
+  const { stations } = group;
+  const connected = stations.filter((s) => s.connection === 'open').length;
+  const power = stations.reduce((sum, s) => sum + s.evses.reduce((p, e) => p + e.powerKw, 0), 0);
+  return (
+    <details open={open} onToggle={(e) => onOpenChange(e.currentTarget.open)} className="group/folder">
+      <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md border bg-panel px-3 py-2 outline-none hover:border-foreground/30 focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+        <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform group-open/folder:rotate-90" />
+        {group.folder !== undefined && <FolderIcon className="size-4 shrink-0 text-muted-foreground" />}
+        <span className="truncate font-semibold text-sm">{group.folder ?? 'Ungrouped'}</span>
+        <span className="ml-auto flex shrink-0 gap-x-4 text-muted-foreground text-xs">
+          <span>
+            {stations.length} {stations.length === 1 ? 'station' : 'stations'}
+          </span>
+          <span>{connected} connected</span>
+          <span>{kw(power)} kW</span>
+        </span>
+      </summary>
+      {open && <div className="pt-3">{children}</div>}
+    </details>
+  );
+}
+
+/** Moves every station the filter shows into one folder; an empty name takes them out of theirs. */
+function MoveBar({ ids }: { ids: string[] }) {
+  const move = useMoveStations();
+  const [folder, setFolder] = useState('');
+  const name = folder.trim();
+  const n = `${ids.length} ${ids.length === 1 ? 'station' : 'stations'}`;
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    move.mutate({ ids, folder: name || null }, { onSuccess: () => setFolder('') });
+  }
+  return (
+    <form onSubmit={submit} className="flex flex-wrap items-center gap-2 text-sm">
+      <span className="text-muted-foreground">{n} match the filter.</span>
+      <FolderInput
+        className="w-48"
+        value={folder}
+        onChange={(e) => setFolder(e.target.value)}
+        aria-label="Folder to move the matching stations to"
+        placeholder="Folder name"
+      />
+      <Button type="submit" variant="outline" size="sm" disabled={move.isPending}>
+        {name ? `Move ${n} to folder` : `Take ${n} out of folder`}
+      </Button>
+    </form>
+  );
+}
+
 function Stat({ value, unit }: { value: string; unit: string }) {
   return (
     <span className="flex items-baseline gap-1.5">
@@ -188,10 +266,37 @@ export function FleetPage() {
   const [query, setQuery] = useState('');
 
   const list = useMemo(() => order.map((id) => stations[id]).filter((s): s is StationView => !!s), [order, stations]);
-  const shown = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return q ? list.filter((s) => s.id.toLowerCase().includes(q)) : list;
-  }, [list, query]);
+  const [collapsed, setCollapsed] = useState(loadCollapsed);
+  const shown = useMemo(() => list.filter((s) => matchesQuery(s, query)), [list, query]);
+  const groups = useMemo(() => groupByFolder(shown), [shown]);
+  const foldered = useMemo(() => list.some((s) => s.folder !== undefined), [list]);
+  const filtering = query.trim() !== '';
+
+  function setOpen(key: string, open: boolean) {
+    setCollapsed((prev) => {
+      if (open !== prev.includes(key)) return prev;
+      const next = open ? prev.filter((k) => k !== key) : [...prev, key];
+      try {
+        localStorage.setItem(COLLAPSED_KEY, JSON.stringify(next));
+      } catch {
+        // Storage blocked: the folders are open again after a reload.
+      }
+      return next;
+    });
+  }
+
+  const grid = (items: StationView[]) => (
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3">
+      {items.map((s) => (
+        <StationCard
+          key={s.id}
+          station={s}
+          violations={violations[s.id]?.length ?? 0}
+          lastError={errors[s.id]?.at(-1)?.message}
+        />
+      ))}
+    </div>
+  );
   const loading = snapshots === 0 && status.state !== 'open';
 
   return (
@@ -204,10 +309,10 @@ export function FleetPage() {
           {list.length > 0 && (
             <InputGroup className="w-48 sm:w-64">
               <InputGroupInput
-                placeholder="Filter by station id"
+                placeholder="Filter by id or folder"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                aria-label="Filter stations by id"
+                aria-label="Filter stations by id or folder"
               />
               <InputGroupAddon>
                 <SearchIcon />
@@ -233,18 +338,22 @@ export function FleetPage() {
         <>
           <FleetStrip stations={list} />
           <FleetCharts />
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3">
-            {shown.map((s) => (
-              <StationCard
-                key={s.id}
-                station={s}
-                violations={violations[s.id]?.length ?? 0}
-                lastError={errors[s.id]?.at(-1)?.message}
-              />
-            ))}
-          </div>
+          {filtering && shown.length > 0 && <MoveBar ids={shown.map((s) => s.id)} />}
+          {foldered
+            ? groups.map((g) => (
+                <FolderSection
+                  key={groupKey(g)}
+                  group={g}
+                  // A filter opens every folder it finds something in.
+                  open={filtering || !collapsed.includes(groupKey(g))}
+                  onOpenChange={(open) => filtering || setOpen(groupKey(g), open)}
+                >
+                  {grid(g.stations)}
+                </FolderSection>
+              ))
+            : grid(shown)}
           {shown.length === 0 && (
-            <p className="text-muted-foreground text-sm">No station id contains "{query.trim()}".</p>
+            <p className="text-muted-foreground text-sm">No station id or folder contains "{query.trim()}".</p>
           )}
         </>
       )}

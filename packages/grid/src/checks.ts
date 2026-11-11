@@ -19,7 +19,7 @@
  */
 import { type CNode, type CompiledSite, compileSite, SiteValidationError } from './compile';
 import { gGCurve, gGGates, MCB_MAGNETIC, mcbCurve, mccbCurve, type TripCurve } from './curves';
-import { PHASES, type Phase, type Triple } from './phases';
+import { PHASES, type Phase, phaseIndex, type Triple } from './phases';
 import { type BreakerDescription, type SiteDescription, SUPPLY_ID } from './types';
 
 export type CheckIssue = {
@@ -51,7 +51,7 @@ function describe(n: CNode): string {
 }
 
 /** Current at which a device is certain to operate fast, A. */
-export function faultThresholdA(n: CNode): number | undefined {
+function faultThresholdA(n: CNode): number | undefined {
   const d = n.desc;
   if (d.kind === 'fuse') return gGGates(d.ratingA).max01;
   if (d.kind !== 'breaker') return undefined;
@@ -200,7 +200,7 @@ function pairSelectivity(c: CompiledSite, up: CNode, down: CNode): SelectivityRe
 }
 
 /** Sum of declared leaf maxima below a node, per site phase, A; `known` is false when a leaf declares none. */
-export function designCurrent(c: CompiledSite, index: number): { perPhase: Triple; known: boolean } {
+function designCurrent(c: CompiledSite, index: number): { perPhase: Triple; known: boolean } {
   const perPhase: Triple = [0, 0, 0];
   let known = true;
   const walk = (i: number) => {
@@ -222,7 +222,7 @@ export function designCurrent(c: CompiledSite, index: number): { perPhase: Tripl
       known = false;
       return;
     }
-    for (const p of legs) perPhase[PHASES.indexOf(p) as 0 | 1 | 2] += amps;
+    for (const p of legs) perPhase[phaseIndex(p)] += amps;
   };
   walk(index);
   return { perPhase, known };

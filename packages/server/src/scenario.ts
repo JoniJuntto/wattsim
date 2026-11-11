@@ -12,7 +12,7 @@ import { format, link, ParseError, parse, QuirkError, useStatements } from '@wat
 import type { ScenarioCheck, ScenarioDiagnostic } from './types';
 
 /** The name a browser scenario's diagnostics and relative paths are resolved under. */
-export const EDITOR_FILE = 'editor.ws';
+const EDITOR_FILE = 'editor.ws';
 
 const IDENT = /[A-Za-z0-9_]/;
 const NO_PLUGINS = 'use plugin is not allowed in scenarios from the browser; run it with wattsim run';
@@ -55,14 +55,14 @@ export function toDiagnostic(source: string, err: unknown, file: string): Scenar
   throw err;
 }
 
-export type PrepareOptions = {
+type PrepareOptions = {
   /** The scenario folder: relative paths resolve against it, and nothing outside it is read. */
   dir: string;
   /** The most stations the fleet may have; default no limit. */
   maxStations?: number;
 };
 
-export type Prepared =
+type Prepared =
   | { ok: true; scenario: Scenario; linked: Linked; file: string }
   | { ok: false; diagnostics: ScenarioDiagnostic[] };
 

@@ -8,7 +8,7 @@
  *   any --unplug--> Unplugged
  *
  * `Ready` is IEC 61851 state C (the EV asks for energy); it becomes `Charging` on the first
- * `requestedPowerKw` / `drawKw` call with a positive offer, i.e. when the EVSE closes the contactor. A V2X EV
+ * `drawKw` call with a positive offer, i.e. when the EVSE closes the contactor. A V2X EV
  * (`v2x`) in `Charging` also discharges: a negative `drawKw` target makes it feed energy back.
  *
  * Power: the EV draws at most `curve(soc) * derate(temperature) * phases * V * min(maxCurrentA, cableMaxA)`.
@@ -27,8 +27,6 @@ export type EvConfig = {
   targetSoc: number; // 0..1, default 0.8
   maxCurrentA: number; // per phase, default 32
   phases: 1 | 3; // default 3
-  /** Fraction 0..1 of max power allowed at a given soc. Default: 1.0 until 0.8, linear to 0.1 at 1.0. */
-  curve?: (soc: number) => number;
   /** soc at which the EV pauses itself (SuspendedEV). Fires once per plug-in. */
   suspendAt?: number;
   /** ms after a suspension (EV-requested or `suspend`) after which the EV asks for energy again. Default: never. */
@@ -41,8 +39,6 @@ export type EvConfig = {
   heatPerHourC?: number;
   /** Share of the temperature difference to ambient lost per hour (Newton cooling rate, 1/h). Default 0.5. */
   coolingPerHour?: number;
-  /** Fraction 0..1 of max power allowed at a battery temperature (°C). Default `defaultTemperatureDerate`. */
-  temperatureDerate?: (tempC: number) => number;
   /** Charging cable rating, A per phase. Caps the current like the EVSE does. Default: no cable limit. */
   cableMaxA?: number;
   /** Bidirectional (ISO 15118-20 BPT): follows negative 2.1 setpoints and limits by discharging. Default false. */
@@ -59,7 +55,7 @@ export type EvConfig = {
   energyRequestKwh?: number;
   /** Lowest current the EV can charge with, A per phase (`evMinCurrent`). Default 6. */
   minCurrentA?: number;
-  /** Plug & Charge contract id (eMAID). `Station.plugAndCharge` authorizes with it. Default: none. */
+  /** ISO 15118 contract id (eMAID). Default: none. */
   emaid?: string;
 };
 
@@ -135,7 +131,6 @@ export class EvModel {
       targetSoc: cfg.targetSoc ?? 0.8,
       maxCurrentA: cfg.maxCurrentA ?? 32,
       phases: cfg.phases ?? 3,
-      curve: cfg.curve ?? defaultChargeCurve,
     };
     if (!(full.batteryKwh > 0)) throw new RangeError(`EvConfig.batteryKwh must be > 0, got ${full.batteryKwh}`);
     if (!(full.maxCurrentA >= 0)) throw new RangeError(`EvConfig.maxCurrentA must be >= 0, got ${full.maxCurrentA}`);
@@ -192,8 +187,7 @@ export class EvModel {
 
   /** Power factor 0..1 from the battery temperature right now. */
   get derate(): number {
-    const f = (this.cfg.temperatureDerate ?? defaultTemperatureDerate)(this._tempC);
-    return Math.max(0, Math.min(1, f));
+    return Math.max(0, Math.min(1, defaultTemperatureDerate(this._tempC)));
   }
 
   plug(): void {
@@ -222,8 +216,8 @@ export class EvModel {
 
   /** Most the EV draws right now on `phases` phases at `voltageV`, kW: curve x temperature derate x current limit. */
   maxChargeKw(voltageV: number, phases: number = this.cfg.phases): number {
-    const curve = this.cfg.curve ?? defaultChargeCurve;
-    return (curve(this._soc) * this.derate * Math.min(phases, this.cfg.phases) * voltageV * this.maxCurrentA) / 1000;
+    const curve = defaultChargeCurve(this._soc);
+    return (curve * this.derate * Math.min(phases, this.cfg.phases) * voltageV * this.maxCurrentA) / 1000;
   }
 
   /** Most a V2X EV feeds back right now, kW (positive); 0 for a unidirectional EV or at `minDischargeSoc`. */
@@ -231,15 +225,6 @@ export class EvModel {
     if (!this.cfg.v2x || this._soc <= (this.cfg.minDischargeSoc ?? 0.2)) return 0;
     const amps = Math.min(this.cfg.maxDischargeCurrentA ?? this.cfg.maxCurrentA, this.cfg.cableMaxA ?? Infinity);
     return (this.derate * Math.min(phases, this.cfg.phases) * voltageV * amps) / 1000;
-  }
-
-  /**
-   * Power the EV will draw given what the EVSE offers. Returns 0 unless the EV is (or, on a positive offer,
-   * becomes) Charging. A Ready or Charging EV whose soc is already at or above `targetSoc` goes Full and
-   * draws nothing. Cap = curve(soc) * derate * phases * voltage * min(maxCurrentA, cableMaxA) / 1000.
-   */
-  requestedPowerKw(offeredKw: number, voltageV: number): number {
-    return this.drawKw(offeredKw, voltageV, this.cfg.phases);
   }
 
   /**
@@ -298,21 +283,13 @@ export class EvModel {
   /** The soc at which the charge curve has moved the power limit enough to re-evaluate `kw`. */
   private curveMark(kw: number, voltageV: number, phases: number): number {
     const soc = this._soc;
-    const curve = this.cfg.curve ?? defaultChargeCurve;
-    if (curve === defaultChargeCurve) {
-      if (soc < CURVE_KNEE - SOC_EPS) return CURVE_KNEE;
-      const u = defaultChargeCurve(soc);
-      const full = this.maxChargeKw(voltageV, phases) / u; // the limit at curve 1
-      // Held back by the curve: step until it has fallen by POWER_STEP. Held back by the offer: until the limit
-      // falls to the offer, where the curve takes over.
-      if (kw >= full * u * (1 - 1e-9)) return soc + (POWER_STEP * u) / CURVE_SLOPE;
-      return CURVE_KNEE + (1 - kw / full) / CURVE_SLOPE;
-    }
-    // Another curve: step by its local slope, at most 1% soc, so a corner is not stepped over by much.
-    const c = curve(soc);
-    const h = soc < 1 - 1e-4 ? 1e-4 : -1e-4;
-    const slope = (curve(soc + h) - c) / h;
-    return soc + (slope < 0 ? Math.min(0.01, (POWER_STEP * Math.max(c, 0.05)) / -slope) : 0.01);
+    if (soc < CURVE_KNEE - SOC_EPS) return CURVE_KNEE;
+    const u = defaultChargeCurve(soc);
+    const full = this.maxChargeKw(voltageV, phases) / u; // the limit at curve 1
+    // Held back by the curve: step until it has fallen by POWER_STEP. Held back by the offer: until the limit
+    // falls to the offer, where the curve takes over.
+    if (kw >= full * u * (1 - 1e-9)) return soc + (POWER_STEP * u) / CURVE_SLOPE;
+    return CURVE_KNEE + (1 - kw / full) / CURVE_SLOPE;
   }
 
   /** ms until the battery temperature, moving at power `kw`, reaches the next temperature worth re-evaluating at. */
@@ -334,18 +311,10 @@ export class EvModel {
 
   /**
    * The next temperature, rising (`up`) or falling, at which the derate has moved by POWER_STEP or reaches a corner of
-   * the default curve. Undefined on a flat stretch without a corner ahead.
+   * the derating curve. Undefined on a flat stretch without a corner ahead.
    */
   private temperatureMark(up: boolean): number | undefined {
     const t = this._tempC;
-    const dir = up ? 1 : -1;
-    const custom = this.cfg.temperatureDerate;
-    if (custom) {
-      const f = custom(t);
-      const slope = Math.abs(custom(t + dir * 0.01) - f) / 0.01;
-      const step = slope > 1e-9 ? Math.min(1, Math.max(0.01, (POWER_STEP * Math.max(f, 0.05)) / slope)) : 1;
-      return t + dir * step;
-    }
     let corner: number | undefined;
     for (let i = 0; i < DERATE_POINTS.length; i++) {
       const tc = (DERATE_POINTS[up ? i : DERATE_POINTS.length - 1 - i] as readonly [number, number])[0];

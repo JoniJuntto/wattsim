@@ -68,8 +68,8 @@
  * - Fault statements (see core's `faults.ts`): `bootLoop N`, `fault evse N [code]`, `meter backwards|reset` and
  *   `reset hard|soft` call the core functions of the same names on the station; `net drop d duplicate` adds, on
  *   reconnect, a chaos `duplicate` rule for outbound CALLs that is removed once as many distinct CALLs as were
- *   pending at the reconnect have gone out. `chaos` with a milestone-4 fault adds a core `ChaosFaultEffect` rule;
- *   its duration and count arguments are resolved once, like `chaos delay`.
+ *   pending at the reconnect have gone out. `chaos` adds the core rule `chaosRule` (chaos.ts) builds; its duration
+ *   and count arguments are resolved once.
  * - `ev plug` properties set `EvConfig` fields through the `EV_PROPS` table (ev-props.ts), converting units; an
  *   unknown property fails the station with the list of valid names.
  * - `use plugin "p"` modules are imported when the run starts. The module's default export is called with the
@@ -78,18 +78,7 @@
  *   fails the station.
  */
 import { resolve } from 'node:path';
-import type {
-  CallAnswer,
-  ChaosEffect,
-  ChaosFaultEffect,
-  ChaosMatch,
-  Clock,
-  ConnectorStatus,
-  EvConfig,
-  EvseState,
-  StationConfig,
-  Timer,
-} from '@wattsim/core';
+import type { CallAnswer, Clock, ConnectorStatus, EvConfig, EvseState, StationConfig, Timer } from '@wattsim/core';
 import {
   bootLoop,
   CallError,
@@ -106,15 +95,15 @@ import {
   resetStation,
   SkewedClock,
   Station,
+  sleep,
   ViolationError,
   type VirtualClock,
   WallClock,
 } from '@wattsim/core';
+import { hashString } from '@wattsim/grid';
 import type { Frame, Violation } from '@wattsim/protocol';
 import { CALL_ERROR_CODES, MessageType } from '@wattsim/protocol';
 import type {
-  ChaosFaultStmt,
-  ChaosFilters,
   ChaosStmt,
   ClockStmt,
   DistExpr,
@@ -139,6 +128,8 @@ import type {
   StringExpr,
   UseStmt,
 } from './ast';
+import { forEachStmt } from './ast';
+import { chaosRule } from './chaos';
 import type { EvPropInput } from './ev-props';
 import { EV_LABEL_PROP, EV_PROPS, evPropNames, evPropValue } from './ev-props';
 import { formatDuration, formatDurExpr } from './format';
@@ -245,7 +236,7 @@ export type RunResult = {
   site?: SiteResult;
 };
 
-export const DEFAULT_EXPECT_TIMEOUT_MS = 30_000;
+const DEFAULT_EXPECT_TIMEOUT_MS = 30_000;
 
 /**
  * Resolving quirks and loading plugins reads files, which takes event-loop turns; `driveVirtual` waits for it so the
@@ -340,14 +331,8 @@ class StationFailure extends Error {
   }
 }
 
-export function fnv1a(s: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h >>> 0;
-}
+/** Seeds are FNV-1a hashes of names, the same hash the grid's seeded tolerances use. */
+export { hashString as fnv1a };
 
 const CHAOS_SEED_SALT = 0x5bd1e995;
 
@@ -529,20 +514,12 @@ class StationClock implements Clock {
     return this.frozenAt ?? this.inner.now() + this.offsetMs;
   }
 
-  date(): Date {
-    return new Date(this.now());
-  }
-
   setTimeout(fn: () => void, ms: number): Timer {
     return this.inner.setTimeout(fn, ms);
   }
 
   setInterval(fn: () => void, ms: number): Timer {
     return this.inner.setInterval(fn, ms);
-  }
-
-  sleep(ms: number): Promise<void> {
-    return this.inner.sleep(ms);
   }
 
   set(epochMs: number): void {
@@ -604,15 +581,17 @@ type Branch = { cursor: number; scope: DrawScope; dir: string };
 
 class Run {
   private readonly scenario: Scenario;
-  private readonly opts: RunOptions;
-  private readonly clock: Clock;
-  private readonly procs = new Map<string, Stmt[]>();
+  readonly opts: RunOptions;
+  readonly clock: Clock;
+  readonly procs = new Map<string, Stmt[]>();
   private readonly lets = new Map<string, LetDecl>();
-  private readonly barriers = new Barriers();
-  private readonly violations: Violation[] = [];
+  readonly barriers = new Barriers();
+  readonly violations: Violation[] = [];
   private readonly runners: InstanceRunner[] = [];
-  private linked: Linked | undefined;
-  private plugins = new Map<string, QuirkPlugin>();
+  /** Quirk resolution, set by `ready`. */
+  linked: Linked | undefined;
+  /** Loaded `use plugin` modules by absolute path, set by `ready`. */
+  plugins = new Map<string, QuirkPlugin>();
   /** The electrical site, once the run started it (scenarios with a `site` block). */
   site: SiteRun | undefined;
   /** Quirk resolution and plugin loading, started at construction. */
@@ -670,7 +649,9 @@ class Run {
         ...(this.opts.siteController ? { controller: this.opts.siteController } : {}),
         ...(this.opts.siteModbus ? { modbus: this.opts.siteModbus } : {}),
         ...(this.opts.siteModbusHost ? { modbusHost: this.opts.siteModbusHost } : {}),
-        ...(this.wallClock && this.speed !== 1 ? { speed: this.speed } : {}),
+        ...(this.clock instanceof WallClock && this.opts.speed !== undefined && this.opts.speed !== 1
+          ? { speed: this.opts.speed }
+          : {}),
         log: (message) => this.emit({ type: 'log', message, at: this.clock.now() }),
       });
       csmsUrl = this.site.csmsUrl;
@@ -706,63 +687,13 @@ class Run {
     }
   }
 
-  // ---- shared services for instances --------------------------------------------------------------------------
-
-  get runClock(): Clock {
-    return this.clock;
-  }
-
-  get seed(): number {
-    return this.opts.seed ?? 0;
-  }
-
-  get speed(): number {
-    return this.opts.speed ?? 1;
-  }
-
-  get wallClock(): boolean {
-    return this.clock instanceof WallClock;
-  }
-
-  get stationFactory(): (cfg: StationConfig) => Station {
-    return this.opts.stationFactory ?? ((cfg) => new Station(cfg));
-  }
-
-  get barrierRegistry(): Barriers {
-    return this.barriers;
-  }
-
-  proc(name: string): Stmt[] | undefined {
-    return this.procs.get(name);
-  }
-
-  /** Whether this instance's station body can ever run `expect` (it decides whether frames are kept). */
-  mayExpect(inst: Instance): boolean {
-    return mayExpect(inst.block.body, this.procs);
-  }
-
-  get dir(): string {
-    return this.linked?.dir ?? process.cwd();
-  }
-
-  get appliedQuirks(): QuirkSource[] {
-    return this.linked?.applied ?? [];
-  }
-
-  quirk(name: string): QuirkSource | undefined {
-    return this.linked?.quirks.get(name);
-  }
-
-  plugin(abs: string): QuirkPlugin | undefined {
-    return this.plugins.get(abs);
-  }
-
-  emit(e: RunEvent): void {
+  private emit(e: RunEvent): void {
     this.opts.onEvent?.(e);
   }
 
-  recordViolation(v: Violation): void {
-    this.violations.push(v);
+  /** Directory the scenario's relative paths resolve against. */
+  private get dir(): string {
+    return this.linked?.dir ?? process.cwd();
   }
 
   /** Resolve `name` from the instance's loop variables and the `let`s to its typed value. */
@@ -936,30 +867,16 @@ function stringify(v: Value): string {
 /** Calls `visit` on every statement a body can reach, through procs and every nested block, each proc once. */
 function walkReachable(body: Stmt[], procs: Map<string, Stmt[]>, visit: (s: Stmt) => void): void {
   const seen = new Set<string>();
-  const walk = (stmts: Stmt[]) => {
-    for (const s of stmts) {
+  const walk = (stmts: Stmt[]) =>
+    forEachStmt(stmts, (s) => {
       visit(s);
-      switch (s.kind) {
-        case 'at':
-        case 'repeat':
-          walk(s.body);
-          break;
-        case 'choose':
-          for (const b of s.branches) walk(b.body);
-          break;
-        case 'call': {
-          const proc = procs.get(s.proc);
-          if (proc && !seen.has(s.proc)) {
-            seen.add(s.proc);
-            walk(proc);
-          }
-          break;
-        }
-        default:
-          break;
+      if (s.kind !== 'call') return;
+      const proc = procs.get(s.proc);
+      if (proc && !seen.has(s.proc)) {
+        seen.add(s.proc);
+        walk(proc);
       }
-    }
-  };
+    });
   walk(body);
 }
 
@@ -999,6 +916,7 @@ type PendingConfig = {
   skewMs: number;
   driftPpm: number;
 };
+type ConfigKind = 'version' | 'evses' | 'connectors' | 'vendor' | 'model' | 'serial' | 'auth';
 
 class InstanceRunner {
   readonly name: string;
@@ -1012,6 +930,16 @@ class InstanceRunner {
   private readonly asserts: AssertResult[] = [];
   private readonly branches: Promise<void>[] = [];
   private readonly cfg: PendingConfig = { skewMs: 0, driftPpm: 0 };
+  /** What each configuration statement sets, before the station exists. */
+  private readonly configOf: { [K in ConfigKind]: (s: Extract<Stmt, { kind: K }>) => Partial<PendingConfig> } = {
+    version: (s) => ({ version: `ocpp${s.version}` }),
+    evses: (s) => ({ evses: this.num(s.count, s.loc, "'evses'", 1) }),
+    connectors: (s) => ({ connectors: this.num(s.count, s.loc, "'connectors'", 1) }),
+    vendor: (s) => ({ vendor: this.text(s.value, s.loc) }),
+    model: (s) => ({ model: this.text(s.value, s.loc) }),
+    serial: (s) => ({ serial: this.text(s.value, s.loc) }),
+    auth: (s) => ({ basicAuth: { user: this.text(s.user, s.loc), password: this.text(s.password, s.loc) } }),
+  };
   private readonly stationClock: StationClock;
   private station: Station | undefined;
   private speedOverride: number | undefined;
@@ -1029,10 +957,10 @@ class InstanceRunner {
     this.inst = inst;
     this.name = inst.name;
     this.csmsUrl = csmsUrl;
-    this.log = new FrameLog(run.mayExpect(inst));
-    this.clock = run.runClock;
+    this.log = new FrameLog(mayExpect(inst.block.body, run.procs));
+    this.clock = run.clock;
     this.stationClock = new StationClock(this.clock);
-    const seed = (fnv1a(inst.name) ^ run.seed) >>> 0;
+    const seed = (hashString(inst.name) ^ (run.opts.seed ?? 0)) >>> 0;
     this.chaos = new ChaosEngine(lcg((seed ^ CHAOS_SEED_SALT) >>> 0));
     this.aborted = new Promise<never>((_, reject) => {
       this.rejectAbort = reject;
@@ -1044,8 +972,8 @@ class InstanceRunner {
     const start = this.clock.now();
     this.emit({ type: 'station', station: this.name, status: 'started', at: start });
     try {
-      const branch: Branch = { cursor: 0, scope: { path: '', counts: new Map() }, dir: this.run.dir };
-      for (const q of this.run.appliedQuirks) {
+      const branch: Branch = { cursor: 0, scope: { path: '', counts: new Map() }, dir: this.dir };
+      for (const q of this.run.linked?.applied ?? []) {
         const scope = this.subScope(branch, `quirk:${q.decl.name.raw}`, q.decl.loc);
         await this.applyQuirk(q, { ...branch, scope }, q.decl.name.raw);
       }
@@ -1055,7 +983,7 @@ class InstanceRunner {
       this.abort(toError(err));
       await this.awaitBranches();
     }
-    this.run.barrierRegistry.release(this.inst.index);
+    this.run.barriers.release(this.inst.index);
     const error = this.failure?.message;
     const ok = !this.failure && this.asserts.every((a) => a.ok);
     const at = this.clock.now();
@@ -1131,38 +1059,14 @@ class InstanceRunner {
     const vars = this.inst.vars;
     switch (stmt.kind) {
       case 'version':
-        this.configure(stmt.kind, () => {
-          this.cfg.version = `ocpp${stmt.version}`;
-        });
-        return;
       case 'evses':
-        this.configure(stmt.kind, () => {
-          this.cfg.evses = this.num(stmt.count, stmt.loc, "'evses'", 1);
-        });
-        return;
       case 'connectors':
-        this.configure(stmt.kind, () => {
-          this.cfg.connectors = this.num(stmt.count, stmt.loc, "'connectors'", 1);
-        });
-        return;
       case 'vendor':
-        this.configure(stmt.kind, () => {
-          this.cfg.vendor = this.text(stmt.value, stmt.loc);
-        });
-        return;
       case 'model':
-        this.configure(stmt.kind, () => {
-          this.cfg.model = this.text(stmt.value, stmt.loc);
-        });
-        return;
       case 'serial':
-        this.configure(stmt.kind, () => {
-          this.cfg.serial = this.text(stmt.value, stmt.loc);
-        });
-        return;
       case 'auth':
         this.configure(stmt.kind, () => {
-          this.cfg.basicAuth = { user: this.text(stmt.user, stmt.loc), password: this.text(stmt.password, stmt.loc) };
+          Object.assign(this.cfg, (this.configOf[stmt.kind] as (s: Stmt) => Partial<PendingConfig>)(stmt));
         });
         return;
       case 'heartbeat':
@@ -1217,18 +1121,18 @@ class InstanceRunner {
       }
       case 'send': {
         const payload = stmt.payload ? this.run.resolveJson(stmt.payload, vars) : {};
-        await this.race(this.ensureStation('send').sendRaw(stmt.action, payload));
+        await this.race(this.ensureStation('send').request(stmt.action, payload));
         return;
       }
       case 'expect':
         await this.expect(stmt, branch);
         return;
       case 'wait':
-        if (stmt.until !== undefined) await this.race(this.run.barrierRegistry.wait(stmt.until));
+        if (stmt.until !== undefined) await this.race(this.run.barriers.wait(stmt.until));
         else await this.sleep(this.scaled(this.ms(stmt.duration, stmt.loc, "'wait'", branch.scope)));
         return;
       case 'barrier':
-        this.run.barrierRegistry.arrive(stmt.name, this.inst.index);
+        this.run.barriers.arrive(stmt.name, this.inst.index);
         return;
       case 'at': {
         const due = blockStart + this.scaled(this.ms(stmt.offset, stmt.loc, "'at'", branch.scope));
@@ -1250,7 +1154,8 @@ class InstanceRunner {
       case 'choose': {
         const key = `choose@${at(stmt.loc)}`;
         const n = bump(branch.scope, key);
-        const draw = lcg((fnv1a(`${this.name}${branch.scope.path}@${key}#${n}`) ^ this.run.seed) >>> 0)() * 100;
+        const draw =
+          lcg((hashString(`${this.name}${branch.scope.path}@${key}#${n}`) ^ (this.run.opts.seed ?? 0)) >>> 0)() * 100;
         let acc = 0;
         let chosen = stmt.branches[stmt.branches.length - 1];
         for (const b of stmt.branches) {
@@ -1278,9 +1183,6 @@ class InstanceRunner {
       case 'chaos':
         this.addChaos(stmt, branch.scope);
         return;
-      case 'chaosFault':
-        this.addChaosFault(stmt, branch.scope);
-        return;
       case 'bootLoop': {
         const n = this.num(stmt.count, stmt.loc, "'bootLoop' count", 0);
         await this.race(bootLoop(this.ensureStation('bootLoop'), n));
@@ -1303,13 +1205,13 @@ class InstanceRunner {
         this.clockStmt(stmt, branch.scope);
         return;
       case 'call': {
-        const body = this.run.proc(stmt.proc);
+        const body = this.run.procs.get(stmt.proc);
         if (!body) throw new StationFailure(`unknown proc '${stmt.proc}'`);
         if (this.callDepth > 32) throw new StationFailure(`proc '${stmt.proc}' recurses too deeply`);
         this.callDepth++;
         try {
           const scope = this.subScope(branch, 'call', stmt.loc);
-          await this.runBlock(body, { cursor: branch.cursor, scope, dir: this.run.dir });
+          await this.runBlock(body, { cursor: branch.cursor, scope, dir: this.dir });
         } finally {
           this.callDepth--;
         }
@@ -1475,7 +1377,7 @@ class InstanceRunner {
   private sample(d: DistExpr, loc: Loc, what: string, scope: DrawScope): number {
     const key = at(loc);
     const n = bump(scope, key);
-    const rng = lcg((fnv1a(`${this.name}${scope.path}@${key}#${n}`) ^ this.run.seed) >>> 0);
+    const rng = lcg((hashString(`${this.name}${scope.path}@${key}#${n}`) ^ (this.run.opts.seed ?? 0)) >>> 0);
     let v: number;
     switch (d.kind) {
       case 'normal': {
@@ -1504,7 +1406,12 @@ class InstanceRunner {
   }
 
   private emit(e: RunEvent): void {
-    this.run.emit(e);
+    this.run.opts.onEvent?.(e);
+  }
+
+  /** Directory the scenario's relative paths resolve against. */
+  private get dir(): string {
+    return this.run.linked?.dir ?? process.cwd();
   }
 
   private configure(kind: string, apply: () => void): void {
@@ -1515,7 +1422,7 @@ class InstanceRunner {
 
   /** Divide a DSL timing duration by the effective speed. */
   private scaled(ms: number): number {
-    const speed = this.speedOverride ?? this.run.speed;
+    const speed = this.speedOverride ?? this.run.opts.speed ?? 1;
     return speed > 0 && speed !== 1 ? ms / speed : ms;
   }
 
@@ -1525,7 +1432,7 @@ class InstanceRunner {
   }
 
   private sleep(ms: number): Promise<void> {
-    return this.race(this.clock.sleep(ms));
+    return this.race(sleep(this.clock, ms));
   }
 
   private ensureStation(kind: string): Station {
@@ -1556,13 +1463,13 @@ class InstanceRunner {
       config.onDraw = hooks.onDraw;
       if (wiring.maxA !== undefined) config.maxCurrentA = wiring.maxA;
     }
-    const station = this.run.stationFactory(config);
+    const station = this.run.opts.stationFactory ? this.run.opts.stationFactory(config) : new Station(config);
     this.station = station;
     if (wiring && this.run.site) for (const leaf of wiring.leaves) this.run.site.runtime.register(leaf, station);
     for (const install of this.pendingInstall.splice(0)) install(station);
     station.on('frame', (direction, frame) => this.onFrame(direction, frame));
     station.on('violation', (v) => {
-      this.run.recordViolation(v);
+      this.run.violations.push(v);
       this.emit({ type: 'violation', station: this.name, violation: v, at: this.clock.now() });
     });
     station.on('error', (e) => {
@@ -1625,13 +1532,13 @@ class InstanceRunner {
   private async use(stmt: UseStmt, branch: Branch): Promise<void> {
     const name = stmt.name.parts.join('');
     if (stmt.target === 'quirk') {
-      const q = this.run.quirk(name);
+      const q = this.run.linked?.quirks.get(name);
       if (!q) throw new StationFailure(`${at(stmt.name.loc)}: unknown quirk "${name}"`);
       await this.applyQuirk(q, { ...branch, scope: this.subScope(branch, 'use', stmt.loc) }, name);
       return;
     }
     const abs = resolve(branch.dir, name);
-    const plugin = this.run.plugin(abs);
+    const plugin = this.run.plugins.get(abs);
     if (!plugin) throw new StationFailure(`${at(stmt.name.loc)}: plugin ${name} was not loaded`);
     const install = (station: Station) => {
       let cleanup: unknown;
@@ -1829,68 +1736,6 @@ class InstanceRunner {
     this.branches.push(task);
   }
 
-  private chaosMatch(stmt: ChaosFilters & { loc: Loc }): ChaosMatch {
-    const match: ChaosMatch = { direction: stmt.direction, action: stmt.action };
-    const t = stmt.trigger;
-    if (t?.kind === 'nth') match.nth = this.num(t.n, stmt.loc, "'nth'", 1);
-    if (t?.kind === 'every') {
-      match.every = this.num(t.n, stmt.loc, "'every'", 1);
-      if (t.from) match.from = this.num(t.from, stmt.loc, "'from'", 1);
-    }
-    if (stmt.probability) match.probability = this.num(stmt.probability, stmt.loc, "'probability'") / 100;
-    return match;
-  }
-
-  private addChaosFault(stmt: ChaosFaultStmt, scope: DrawScope): void {
-    const f = stmt.fault;
-    const loc = stmt.loc;
-    const ms = (e: DurExpr, what: string, signed = false) => this.ms(e, loc, what, scope, signed);
-    let effect: ChaosFaultEffect;
-    switch (f.kind) {
-      case 'jitter': {
-        const minMs = ms(f.min, "'jitter' minimum");
-        const maxMs = ms(f.max, "'jitter' maximum");
-        if (maxMs < minMs) {
-          throw new StationFailure(
-            `${at(loc)}: jitter MIN..MAX needs MAX >= MIN, got ${formatDuration({ ms: minMs })}..${formatDuration({ ms: maxMs })}`,
-          );
-        }
-        effect = { kind: 'jitter', minMs, maxMs };
-        break;
-      }
-      case 'reorder':
-        effect = { kind: 'reorder', after: f.after ? this.num(f.after, loc, "'reorder after'", 1) : 1 };
-        break;
-      case 'halfOpen':
-        effect = f.for ? { kind: 'halfOpen', ms: ms(f.for, "'halfOpen for'") } : { kind: 'halfOpen' };
-        break;
-      case 'slowRead':
-        effect = { kind: 'slowRead', stepMs: ms(f.step, "'slowRead'") };
-        break;
-      case 'reconnectStorm':
-        effect = {
-          kind: 'reconnectStorm',
-          count: this.num(f.count, loc, "'reconnectStorm' count", 1),
-          windowMs: ms(f.within, "'reconnectStorm ... within'"),
-        };
-        break;
-      case 'invalidEnum':
-      case 'missingField':
-        effect = f.path === undefined ? { kind: f.kind } : { kind: f.kind, path: f.path };
-        break;
-      case 'timestamp':
-        effect = { kind: 'timestamp', shiftMs: ms(f.shift, "'timestamp'", true) };
-        break;
-      case 'oversized': {
-        const kb = this.num(f.kb, loc, "'oversized' size");
-        if (!(kb > 0)) throw new StationFailure(`${at(loc)}: 'oversized' size must be > 0 kB, got ${kb}`);
-        effect = { kind: 'oversized', bytes: Math.round(kb * 1024) };
-        break;
-      }
-    }
-    this.chaos.add({ match: this.chaosMatch(stmt), effect, once: stmt.once });
-  }
-
   /** 1.6: the code must be a ChargePointErrorCode; 2.x: it becomes NotifyEvent's techCode (at most 50 characters). */
   private checkFaultCode(station: Station, code: string | undefined, loc: Loc): void {
     if (code === undefined) return;
@@ -1926,19 +1771,23 @@ class InstanceRunner {
   }
 
   private addChaos(stmt: ChaosStmt, scope: DrawScope): void {
-    const match = this.chaosMatch(stmt);
-    const effect: ChaosEffect =
-      stmt.fault === 'delay'
-        ? { kind: 'delay', ms: stmt.delay ? this.ms(stmt.delay, stmt.loc, "'chaos delay'", scope) : 0 }
-        : { kind: stmt.fault };
-    this.chaos.add({ match, effect, once: stmt.once });
+    const loc = stmt.loc;
+    this.chaos.add(
+      chaosRule(stmt, {
+        num: (e, what, min) => this.num(e, loc, what, min),
+        ms: (e, what, signed) => this.ms(e, loc, what, scope, signed),
+        fail: (message) => {
+          throw new StationFailure(`${at(loc)}: ${message}`);
+        },
+      }),
+    );
   }
 
   private clockStmt(stmt: ClockStmt, scope: DrawScope): void {
     switch (stmt.mode) {
       case 'speed': {
         const speed = this.num(stmt.speed, stmt.loc, "'clock speed'");
-        if (this.run.wallClock) this.speedOverride = speed;
+        if (this.run.clock instanceof WallClock) this.speedOverride = speed;
         return;
       }
       case 'skew':

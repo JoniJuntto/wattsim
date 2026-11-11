@@ -8,11 +8,11 @@ import {
   ignoreMatcher,
   loosen,
   makeEntry,
+  OcppProxy,
   parseChaosRules,
   parseTrace,
   Recorder,
   readTrace,
-  startProxy,
 } from '../src/index';
 import { newStation, recordSession16, replay, settle, T0, tmpPath } from './helpers';
 
@@ -223,10 +223,10 @@ function entry(ms: number, dir: 'in' | 'out', raw: string, extra: Partial<TraceE
 
 describe('chaos in the trace: replay sends what reached the CSMS', () => {
   test('a trace recorded through a chaos proxy replays cleanly against the same CSMS', async () => {
-    const csms = await FakeCsms.start({ listen: true });
+    const csms = await FakeCsms.start();
     targets.push(csms);
     const path = await tmpPath('chaos.jsonl');
-    const proxy = await startProxy({
+    const proxy = new OcppProxy({
       listen: 0,
       upstream: csms.url,
       record: path,

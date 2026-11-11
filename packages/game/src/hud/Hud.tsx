@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { clock, loadColour, STATUS_COLOUR, useTick } from '../hooks';
+import { loadColour, STATUS_COLOUR, useTick } from '../hooks';
+import { hhmm } from '../sim/model';
 import {
   contractText,
   DISCOUNT,
@@ -37,21 +38,27 @@ export function TopBar(props: { world: World; onLog: () => void; onHelp: () => v
     <div className="panel pointer-events-auto flex flex-wrap items-center gap-x-5 gap-y-2 px-4 py-2 text-sm">
       <div className="font-semibold tracking-wide text-[var(--color-volt)]">WATTSIM OPERATOR</div>
       <div className="num text-slate-300">
-        Day {world.day} · <span className="text-white">{clock(world.now)}</span>
+        Day {world.day} · <span className="text-white">{hhmm(world.now)}</span>
       </div>
       <fieldset className="m-0 flex gap-1 border-0 p-0" aria-label="Game speed">
-        <SpeedButton active={world.paused} onClick={() => world.setPaused(!world.paused)} label="Pause (space)">
+        <Btn
+          pressed={world.paused}
+          onClick={() => world.setPaused(!world.paused)}
+          label="Pause (space)"
+          className={speedClass(world.paused)}
+        >
           {world.paused ? '▶' : '❚❚'}
-        </SpeedButton>
+        </Btn>
         {SPEEDS.map((s, i) => (
-          <SpeedButton
+          <Btn
             key={s.v}
-            active={!world.paused && world.speed === s.v}
+            pressed={!world.paused && world.speed === s.v}
             onClick={() => world.setSpeed(s.v)}
             label={`Speed ${s.label} (${i + 1})`}
+            className={speedClass(!world.paused && world.speed === s.v)}
           >
             {s.label}
-          </SpeedButton>
+          </Btn>
         ))}
       </fieldset>
       <LotTabs world={world} />
@@ -141,19 +148,32 @@ function LotTabs({ world }: { world: World }) {
   );
 }
 
-function SpeedButton(props: { active: boolean; onClick: () => void; label: string; children: React.ReactNode }) {
+/** The HUD's plain button; `className` carries the colours and size of its place. */
+function Btn(props: {
+  onClick: () => unknown;
+  disabled?: boolean;
+  className?: string;
+  label?: string;
+  pressed?: boolean;
+  children: React.ReactNode;
+}) {
   return (
     <button
       type="button"
       aria-label={props.label}
-      aria-pressed={props.active}
-      onClick={props.onClick}
-      className={`num min-w-8 rounded px-2 py-0.5 text-xs ${props.active ? 'bg-teal-400 text-black' : 'bg-white/5 hover:bg-white/15'}`}
+      aria-pressed={props.pressed}
+      disabled={props.disabled}
+      onClick={() => void props.onClick()}
+      className={`rounded px-2 disabled:opacity-35 ${props.className ?? ''}`}
     >
       {props.children}
     </button>
   );
 }
+
+const BTN = 'bg-white/10 enabled:hover:bg-teal-400 enabled:hover:text-black';
+const speedClass = (active: boolean) =>
+  `num min-w-8 py-0.5 text-xs ${active ? 'bg-teal-400 text-black' : 'bg-white/5 hover:bg-white/15'}`;
 
 function Stat({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
   return (
@@ -344,7 +364,7 @@ function TicketCard({ world, k, onSelect }: { world: World; k: Ticket; onSelect:
       )}
       {k.state === 'promised' && car && (
         <p className="num mt-1 text-sky-300">
-          Promised {Math.round(car.targetSoc * 100)} % by {clock(car.departAt)}: now {Math.round(car.soc * 100)} %
+          Promised {Math.round(car.targetSoc * 100)} % by {hhmm(car.departAt)}: now {Math.round(car.soc * 100)} %
         </p>
       )}
       {k.outcome && k.state !== 'promised' && <p className="mt-1 italic text-slate-400">↳ {k.outcome}</p>}
@@ -356,20 +376,28 @@ function TicketCard({ world, k, onSelect }: { world: World; k: Ticket; onSelect:
           <div className="flex flex-wrap gap-1">
             {k.kind === 'rush' && (
               <>
-                <Reply onClick={() => world.answer(k.id, 'promise')}>Promise it</Reply>
-                <Reply onClick={() => world.answer(k.id, 'decline')}>Can't promise</Reply>
+                <Btn className={`py-1 ${BTN}`} onClick={() => world.answer(k.id, 'promise')}>
+                  Promise it
+                </Btn>
+                <Btn className={`py-1 ${BTN}`} onClick={() => world.answer(k.id, 'decline')}>
+                  Can't promise
+                </Btn>
               </>
             )}
             {k.kind === 'billing' && (
               <>
-                <Reply onClick={() => world.answer(k.id, 'refund')}>
+                <Btn className={`py-1 ${BTN}`} onClick={() => world.answer(k.id, 'refund')}>
                   Refund €{((k.billed ?? 0) - (k.billed === k.metered ? 0 : (k.metered ?? 0))).toFixed(2)}
-                </Reply>
-                <Reply onClick={() => world.answer(k.id, 'decline')}>Bill is correct</Reply>
+                </Btn>
+                <Btn className={`py-1 ${BTN}`} onClick={() => world.answer(k.id, 'decline')}>
+                  Bill is correct
+                </Btn>
               </>
             )}
             {k.kind === 'not-charging' && (
-              <Reply onClick={() => world.answer(k.id, 'discount')}>Apologise, €{DISCOUNT} off</Reply>
+              <Btn className={`py-1 ${BTN}`} onClick={() => world.answer(k.id, 'discount')}>
+                Apologise, €{DISCOUNT} off
+              </Btn>
             )}
             {(k.kind === 'not-charging' || k.kind === 'stuck') && (
               <span className="self-center text-slate-400">Fix the charger to close it.</span>
@@ -378,18 +406,6 @@ function TicketCard({ world, k, onSelect }: { world: World; k: Ticket; onSelect:
         </>
       )}
     </article>
-  );
-}
-
-function Reply({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="rounded bg-white/10 px-2 py-1 hover:bg-teal-400 hover:text-black"
-    >
-      {children}
-    </button>
   );
 }
 
@@ -407,7 +423,7 @@ export function Alerts({ world, onSelect }: { world: World; onSelect: (s: Select
           onClick={() => a.target && onSelect(a.target)}
           className={`panel border-l-4 ${LEVEL[a.level]} px-3 py-1.5 text-left text-xs leading-snug enabled:hover:bg-white/10`}
         >
-          <span className="num mr-2 text-slate-400">{clock(a.t)}</span>
+          <span className="num mr-2 text-slate-400">{hhmm(a.t)}</span>
           {a.lot && world.lots.length > 1 && <span className="num mr-1 rounded bg-white/10 px-1">{a.lot}</span>}
           {a.text}
         </button>
@@ -468,7 +484,7 @@ function ChargerPanel({ world, id }: { world: World; id: string }) {
       </div>
       {ch.fault && (
         <div className="rounded border border-red-500/60 bg-red-500/10 px-2 py-1.5 text-xs">
-          <b>{ch.fault.code}</b> since {clock(ch.fault.since)}. {FIX_HINT[ch.fault.fix]}
+          <b>{ch.fault.code}</b> since {hhmm(ch.fault.since)}. {FIX_HINT[ch.fault.fix]}
         </div>
       )}
       {ch.hung && (
@@ -490,7 +506,7 @@ function ChargerPanel({ world, id }: { world: World; id: string }) {
                 ? `DC up to ${car.preset.dcKw} kW`
                 : `${car.preset.phases === 1 ? '1-phase' : '3-phase'} ${Math.min(car.preset.maxCurrentA, car.preset.cableMaxA ?? 32)} A`}
             </span>
-            <span className="num">leaves {clock(car.departAt)}</span>
+            <span className="num">leaves {hhmm(car.departAt)}</span>
           </div>
           <div className="relative h-2.5 rounded bg-white/10">
             <div className="h-full rounded bg-teal-400" style={{ width: `${car.soc * 100}%` }} />
@@ -532,28 +548,37 @@ function ChargerPanel({ world, id }: { world: World; id: string }) {
       </div>
       <div className="grid grid-cols-2 gap-1.5">
         {evse?.tx || !car ? (
-          <Action onClick={() => world.act(id, (l) => l.stopSession(id))} disabled={!evse?.tx}>
+          <Btn
+            className={`py-1.5 text-xs ${BTN}`}
+            onClick={() => world.act(id, (l) => l.stopSession(id))}
+            disabled={!evse?.tx}
+          >
             Stop session
-          </Action>
+          </Btn>
         ) : (
-          <Action
+          <Btn
+            className={`py-1.5 text-xs ${BTN}`}
             onClick={() => world.act(id, (l) => l.remoteStart(id))}
             disabled={!online || ch.starting || car.stuck}
           >
             Remote start
-          </Action>
+          </Btn>
         )}
-        <Action onClick={() => world.act(id, (l) => l.reset(id))} disabled={!online}>
+        <Btn className={`py-1.5 text-xs ${BTN}`} onClick={() => world.act(id, (l) => l.reset(id))} disabled={!online}>
           {ch.resetting ? 'Resetting…' : 'Reset'}
-        </Action>
-        <Action onClick={() => world.act(id, (l) => l.unlock(id))} disabled={!online}>
+        </Btn>
+        <Btn className={`py-1.5 text-xs ${BTN}`} onClick={() => world.act(id, (l) => l.unlock(id))} disabled={!online}>
           Unlock connector
-        </Action>
-        <Action onClick={() => world.act(id, (l) => l.setAvailable(id, ch.disabled))} disabled={!online}>
+        </Btn>
+        <Btn
+          className={`py-1.5 text-xs ${BTN}`}
+          onClick={() => world.act(id, (l) => l.setAvailable(id, ch.disabled))}
+          disabled={!online}
+        >
           {ch.disabled ? 'Make available' : 'Take out of service'}
-        </Action>
-        <Action
-          className="col-span-2"
+        </Btn>
+        <Btn
+          className={`col-span-2 py-1.5 text-xs ${BTN}`}
           onClick={() => world.act(id, (l) => l.dispatch(id))}
           disabled={!techFree || !!busyTech || (!ch.fault && !ch.hung)}
         >
@@ -562,7 +587,7 @@ function ChargerPanel({ world, id }: { world: World; id: string }) {
             : lot.techs.length === 0
               ? 'No technician at this lot (hire one)'
               : 'Send technician'}
-        </Action>
+        </Btn>
       </div>
     </div>
   );
@@ -615,7 +640,8 @@ function DevicePanel({ world, lot, id }: { world: World; lot: Lot; id: string })
         </div>
       )}
       <div className="grid grid-cols-2 gap-1.5">
-        <Action
+        <Btn
+          className={`py-1.5 text-xs ${BTN}`}
           onClick={() => {
             lot.reclose(id);
             world.changed();
@@ -623,8 +649,9 @@ function DevicePanel({ world, lot, id }: { world: World; lot: Lot; id: string })
           disabled={!n.tripped}
         >
           {id === 'F0' ? 'Replace fuse' : 'Reclose'}
-        </Action>
-        <Action
+        </Btn>
+        <Btn
+          className={`py-1.5 text-xs ${BTN}`}
           onClick={() => {
             lot.trip(id);
             world.changed();
@@ -632,7 +659,7 @@ function DevicePanel({ world, lot, id }: { world: World; lot: Lot; id: string })
           disabled={n.tripped || id === 'F0'}
         >
           Open
-        </Action>
+        </Btn>
       </div>
     </div>
   );
@@ -645,19 +672,6 @@ function Big({ label, value, unit }: { label: string; value: string; unit: strin
       <div className="num text-lg leading-tight">{value}</div>
       <div className="text-[10px] text-slate-400">{unit}</div>
     </div>
-  );
-}
-
-function Action(props: { onClick: () => unknown; disabled?: boolean; className?: string; children: React.ReactNode }) {
-  return (
-    <button
-      type="button"
-      disabled={props.disabled}
-      onClick={() => void props.onClick()}
-      className={`rounded bg-white/10 px-2 py-1.5 text-xs enabled:hover:bg-teal-400 enabled:hover:text-black disabled:opacity-35 ${props.className ?? ''}`}
-    >
-      {props.children}
-    </button>
   );
 }
 

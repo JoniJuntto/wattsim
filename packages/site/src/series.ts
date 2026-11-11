@@ -54,8 +54,6 @@ export class SeriesRecorder {
   private readonly nodes = new Map<string, NodeSeries>();
   /** The state nearest a rating since the last point, not recorded yet. */
   private held: { state: SiteState; peak: number } | undefined;
-  /** Times the series was thinned. */
-  thinnings = 0;
 
   constructor(
     resolutionMs = 10_000,
@@ -111,14 +109,7 @@ export class SeriesRecorder {
 
   /** The points at or after `t` (at most the newest `limit`): what a live view needs since it last asked. */
   since(t: number, limit = Number.POSITIVE_INFINITY): SiteSeries {
-    let lo = 0;
-    let hi = this.t.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if ((this.t[mid] as number) < t) lo = mid + 1;
-      else hi = mid;
-    }
-    const from = Math.max(lo, this.t.length - limit);
+    const from = Math.max(lowerBound(this.t, t), this.t.length - limit);
     const cut = (a: number[]) => a.slice(from);
     const nodes: Record<string, NodeSeries> = {};
     for (const [id, s] of this.nodes) {
@@ -228,8 +219,19 @@ export class SeriesRecorder {
       if (s.thermal) s.thermal = pick(s.thermal);
     }
     this.resolution *= 2;
-    this.thinnings++;
   }
+}
+
+/** The first index of the sorted `times` at or after `t` (`times.length` when none is). */
+export function lowerBound(times: readonly number[], t: number): number {
+  let lo = 0;
+  let hi = times.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((times[mid] as number) < t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /** Highest loading of any rated node, %, or the hottest device's thermal memory when that is higher (x 100). */

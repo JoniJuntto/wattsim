@@ -10,11 +10,12 @@ import {
 } from 'lucide-react';
 import type { TimeWindow } from '@/api/charts';
 import { downloads } from '@/api/http';
-import { useDeleteStation, useFrameHistory, useStationAction } from '@/api/queries';
+import { useDeleteStation, useFrameHistory, useMoveStations, useStationAction } from '@/api/queries';
 import type { StationAction, StationView } from '@/api/types';
 import { ChaosPanel } from '@/components/app/chaos-panel';
 import { EvseCard } from '@/components/app/evse-card';
 import { StationFaultsMenu } from '@/components/app/fault-actions';
+import { FolderInput } from '@/components/app/folder-input';
 import { MessageLog } from '@/components/app/message-log';
 import { SendMessagePanel } from '@/components/app/send-message';
 import { ConnectionPill, VersionBadge } from '@/components/app/status';
@@ -48,6 +49,11 @@ function evseOf(a: StationAction | undefined): number | undefined {
 function Header({ station }: { station: StationView }) {
   const action = useStationAction(station.id);
   const del = useDeleteStation();
+  const move = useMoveStations();
+  const setFolder = (value: string) => {
+    const folder = value.trim() || null;
+    if (folder !== (station.folder ?? null)) move.mutate({ ids: [station.id], folder });
+  };
   const navigate = useNavigate();
   const pending = action.isPending ? action.variables?.type : undefined;
   const online = station.connection === 'open';
@@ -77,6 +83,15 @@ function Header({ station }: { station: StationView }) {
           <span className="truncate font-mono text-muted-foreground text-xs" title="CSMS URL">
             {station.csmsUrl}
           </span>
+          {/* Keyed by the folder so a move made elsewhere shows here. Commits on Enter or on leaving the field. */}
+          <FolderInput
+            key={station.folder ?? ''}
+            className="h-6 w-40 text-xs md:text-xs"
+            defaultValue={station.folder ?? ''}
+            aria-label="Folder"
+            onBlur={(e) => setFolder(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+          />
         </div>
       </div>
       <div className="ml-auto flex flex-wrap items-center gap-1.5">

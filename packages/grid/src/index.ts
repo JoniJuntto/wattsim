@@ -1,11 +1,9 @@
-export * from './builder';
 export * from './cables';
 export * from './checks';
 export {
   type CNode,
   type CompiledSite,
   compileSite,
-  type LimitKind,
   SiteValidationError,
   type ValidationIssue,
 } from './compile';

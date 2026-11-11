@@ -69,8 +69,8 @@ The output passes `wattsim check` and `wattsim fmt --check`.
 | Export | Use |
 |---|---|
 | `new Recorder({ path }).attach(station)` | Record a core `Station` to a trace file |
-| `startProxy(...)` | Run the proxy |
+| `new OcppProxy(...)` | Run the proxy |
 | `replay(entries, { csmsUrl, virtual })` | Replay entries and return a report |
 | `toScenario(entries)` | Trace entries as `.ws` text |
-| `readTrace`, `parseTrace`, `formatTrace`, `writeTrace` | Read and write trace files |
+| `readTrace`, `parseTrace`, `formatTrace` | Read and write trace files |
 | `parseChaosRules(text)` | Parse the proxy's `--chaos` syntax into core chaos rules |

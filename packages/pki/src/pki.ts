@@ -82,18 +82,6 @@ export type SignCsrOptions = {
 
 export type ChainCheck = { ok: true } | { ok: false; reason: string };
 
-export type CertificateInfo = {
-  subject: string;
-  issuer: string;
-  commonName: string | undefined;
-  organization: string | undefined;
-  serialNumber: string;
-  notBefore: Date;
-  notAfter: Date;
-  isCa: boolean;
-  selfIssued: boolean;
-};
-
 const DAY_MS = 86_400_000;
 const BACKDATE_MS = 3_600_000;
 const EC_KEY = { name: 'ECDSA', namedCurve: 'P-256' } as const;
@@ -126,16 +114,6 @@ export async function exportPrivateKeyPem(key: CryptoKey): Promise<string> {
   return toPem('PRIVATE KEY', await crypto.subtle.exportKey('pkcs8', key));
 }
 
-/** Import a PKCS#8 PEM private key (EC P-256 or RSA) for signing. */
-export async function importPrivateKeyPem(pem: string): Promise<CryptoKey> {
-  const der = Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
-  try {
-    return await crypto.subtle.importKey('pkcs8', der, EC_KEY, true, ['sign']);
-  } catch {
-    return await crypto.subtle.importKey('pkcs8', der, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, true, ['sign']);
-  }
-}
-
 /** Every PEM certificate in a bundle, in order. */
 export function splitPemChain(pem: string): string[] {
   return pem.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g)?.map((p) => `${p}\n`) ?? [];
@@ -163,7 +141,17 @@ function firstField(name: x509.Name, field: string): string | undefined {
   return name.getField(field)[0];
 }
 
-export function describeCertificate(pem: string): CertificateInfo {
+export function describeCertificate(pem: string): {
+  subject: string;
+  issuer: string;
+  commonName: string | undefined;
+  organization: string | undefined;
+  serialNumber: string;
+  notBefore: Date;
+  notAfter: Date;
+  isCa: boolean;
+  selfIssued: boolean;
+} {
   const cert = parse(pem);
   const bc = cert.getExtension(x509.BasicConstraintsExtension);
   return {
@@ -425,12 +413,6 @@ export async function signCsr(ca: TestCa, csrPem: string, opts: SignCsrOptions =
 export async function publicKeyMatches(certPem: string, publicKey: CryptoKey): Promise<boolean> {
   const spki = await crypto.subtle.exportKey('spki', publicKey);
   return Buffer.from(parse(certPem).publicKey.rawData).equals(Buffer.from(spki));
-}
-
-/** The CSR's public key (SPKI DER) and common name, without verifying it. */
-export function describeCsr(csrPem: string): { commonName: string | undefined; organization: string | undefined } {
-  const csr = new x509.Pkcs10CertificateRequest(csrPem);
-  return { commonName: firstField(csr.subjectName, 'CN'), organization: firstField(csr.subjectName, 'O') };
 }
 
 function inValidity(cert: x509.X509Certificate, at: Date): string | undefined {

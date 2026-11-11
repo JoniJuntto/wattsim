@@ -106,14 +106,6 @@ function offsetAt(ms: number, tz: string): number {
 }
 
 /**
- * The first instant at which the wall clock in `tz` reads `wallMs` (local time written as UTC). A wall time that
- * occurs twice (autumn) gives the first; one that is skipped (spring) gives the instant the clock jumps past it.
- */
-export function wallToUtc(wallMs: number, tz: string): number {
-  return wallInstants(wallMs, tz)[0] as number;
-}
-
-/**
  * Every instant at which the wall clock in `tz` reaches `wallMs`, in order: one, two for a wall time the autumn change
  * repeats, or the instant of the jump for one the spring change skips.
  */

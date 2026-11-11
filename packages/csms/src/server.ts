@@ -4,6 +4,8 @@
  * station-initiated action with a reasonable default, sends CALLs to stations one at a time, and runs every inbound
  * frame through the conformance checker (`conformance.ts`). Timers run on the injected clock; only sockets are real.
  */
+import type { Clock, Timer } from '@wattsim/core';
+import { TypedEmitter, WallClock } from '@wattsim/core';
 import type {
   CallErrorFrame,
   CallFrame,
@@ -21,13 +23,10 @@ import {
   isKnownAction,
   isOcppVersion,
   MessageType,
-  newMessageId,
   OCPP_VERSIONS,
   validatePayload,
   violationErrorCode,
 } from '@wattsim/protocol';
-import type { Clock, Timer } from './clock';
-import { WallClock } from './clock';
 import type { CheckerConfig, CsmsReply, Finding, SessionState, Topology } from './conformance';
 import {
   applyCsmsCall,
@@ -44,9 +43,6 @@ import {
   startConnection,
 } from './conformance';
 import { defaultReply } from './defaults';
-import { Emitter } from './emitter';
-import type { MemoryEndpoint, MemorySocket } from './memory';
-import { connectMemory, listenInMemory } from './memory';
 import type { ConformanceReport } from './report';
 import { addToReport, emptyReport } from './report';
 import type { ConformanceViolation } from './rules';
@@ -72,17 +68,10 @@ export type CertificateSigner = (req: {
 }) => string | Promise<string>;
 
 export type CsmsOptions = {
-  /**
-   * Default true: listen on TCP (`port`, `host`, `tls`). False: no socket is opened; stations reach this CSMS only in
-   * memory, through `connect` or `connectInMemory`, at a `ws://memory-N.invalid` URL. Either way `connect` works.
-   */
-  listen?: boolean;
   /** 0 (default) picks a free port. */
   port?: number;
   /** Default 127.0.0.1. */
   host?: string;
-  /** Subprotocols accepted; default all of 1.6, 2.0.1, 2.1. */
-  versions?: OcppVersion[];
   /** Default wall clock. A core `VirtualClock` fits. */
   clock?: Clock;
   tls?: TlsServerOptions;
@@ -90,18 +79,12 @@ export type CsmsOptions = {
   basicAuth?: Record<string, string> | ((identity: string, password: string) => boolean);
   /** BootNotification `interval` in seconds; default 300. */
   heartbeatInterval?: number;
-  /** idTags / idTokens answered `Blocked` (Authorize, StartTransaction, TransactionEvent). */
-  blockedIdTokens?: Iterable<string>;
   /** Sign CSRs: every Accepted SignCertificate is followed by a CertificateSigned CALL with the chain. */
   signer?: CertificateSigner;
   /** EVSE layout per station, for the `topology.unknown-evse` rule. Unset: that rule only flags transactions on 0. */
   topology?: Topology | ((identity: string) => Topology | undefined);
   /** Default timeout of CSMS -> station CALLs; default 30000 ms. */
   callTimeoutMs?: number;
-  /** Default true: a responder's reply that fails its schema is not sent; the station gets InternalError. */
-  strict?: boolean;
-  /** Checker thresholds; see `CheckerConfig`. */
-  checker?: Partial<Omit<CheckerConfig, 'topology'>>;
   /** Frames kept per session in `received` / `sent`; default 1000. */
   frameHistory?: number;
   /** Violations kept in `Csms.violations`, newest last; default 10000. `report()` counts every one regardless. */
@@ -187,13 +170,7 @@ export type CsmsEvents = {
 };
 
 type SocketData = { identity: string; version: OcppVersion };
-/** What the CSMS uses of a server-side socket: a `Bun.ServerWebSocket` or the in-memory transport's server end. */
-type Socket = {
-  readonly data: SocketData;
-  readonly readyState: number;
-  send(raw: string): unknown;
-  close(code?: number, reason?: string): void;
-};
+type Socket = Bun.ServerWebSocket<SocketData>;
 
 type PendingCall = {
   frame: CallFrame;
@@ -202,26 +179,6 @@ type PendingCall = {
   reject: (err: Error) => void;
   timer?: Timer;
 };
-
-/** What a Session needs from its Csms. */
-type Host = {
-  clock: Clock;
-  checker: CheckerConfig;
-  strict: boolean;
-  callTimeoutMs: number;
-  frameHistory: number;
-  responders: Map<string, Responder>;
-  defaultReply(session: Session, action: string, payload: unknown): unknown;
-  afterReply(session: Session, call: CallFrame, reply: CsmsReply): void;
-  findings(session: Session, findings: Finding[], frameId?: string, action?: string): void;
-  emit<K extends keyof CsmsEvents>(event: K, ...args: CsmsEvents[K]): void;
-  error(err: unknown): void;
-};
-
-function push<T>(list: T[], item: T, max: number): void {
-  list.push(item);
-  if (list.length > max) list.splice(0, list.length - max);
-}
 
 /** Message id and type of a raw message that failed to decode, when readable. */
 function peek(raw: string): { type?: unknown; id?: string } {
@@ -244,7 +201,7 @@ export class Session {
   state: SessionState;
   /** Decodable frames received from the station, oldest first (bounded by `frameHistory`). */
   readonly received: Frame[] = [];
-  /** Frames sent to the station, oldest first (bounded). */
+  /** Frames sent to the station, oldest first (bounded the same way). */
   readonly sent: Frame[] = [];
 
   private ws: Socket | undefined;
@@ -255,9 +212,10 @@ export class Session {
   private pumpScheduled = false;
 
   constructor(
-    private readonly host: Host,
+    private readonly csms: Csms,
     identity: string,
     version: OcppVersion,
+    private readonly checker: CheckerConfig,
   ) {
     this.identity = identity;
     this.state = newSessionState(identity, version);
@@ -303,8 +261,8 @@ export class Session {
     if (!check.ok) throw new PayloadValidationError(action, 'request', check.violations);
     if (!this.ws) return Promise.reject(new Error(`${this.identity} is not connected`));
     return new Promise((resolve, reject) => {
-      const frame: CallFrame = { type: MessageType.Call, id: newMessageId(), action, payload };
-      this.queue.push({ frame, timeoutMs: opts.timeoutMs ?? this.host.callTimeoutMs, resolve, reject });
+      const frame: CallFrame = { type: MessageType.Call, id: crypto.randomUUID(), action, payload };
+      this.queue.push({ frame, timeoutMs: opts.timeoutMs ?? this.csms.callTimeoutMs, resolve, reject });
       this.schedulePump();
     });
   }
@@ -318,7 +276,7 @@ export class Session {
   sendRaw(raw: string): void {
     if (!this.ws) throw new Error(`${this.identity} is not connected`);
     this.ws.send(raw);
-    this.host.emit('frame', { identity: this.identity, direction: 'out', raw, at: this.host.clock.now() });
+    this.csms.safeEmit('frame', { identity: this.identity, direction: 'out', raw, at: this.csms.clock.now() });
   }
 
   /** Close the station's socket from the CSMS side. */
@@ -331,7 +289,7 @@ export class Session {
   /** @internal */
   attach(ws: Socket): void {
     if (ws.data.version !== this.state.version) this.state = newSessionState(this.identity, ws.data.version);
-    startConnection(this.state, this.host.clock.now());
+    startConnection(this.state, this.csms.clock.now());
     this.ws = ws;
   }
 
@@ -339,7 +297,7 @@ export class Session {
   detach(ws: Socket): boolean {
     if (this.ws !== ws) return false;
     this.ws = undefined;
-    this.lastDisconnect = this.host.clock.now();
+    this.lastDisconnect = this.csms.clock.now();
     const pending = [...(this.inflight ? [this.inflight] : []), ...this.queue.splice(0)];
     this.inflight = undefined;
     for (const p of pending) {
@@ -361,14 +319,14 @@ export class Session {
 
   /** @internal */
   onRaw(raw: string): void {
-    const now = this.host.clock.now();
+    const now = this.csms.clock.now();
     let frame: Frame;
     try {
       frame = decodeFrame(raw, { version: this.version });
     } catch (err) {
-      this.host.emit('frame', { identity: this.identity, direction: 'in', raw, at: now });
+      this.csms.safeEmit('frame', { identity: this.identity, direction: 'in', raw, at: now });
       const { type, id } = peek(raw);
-      this.host.findings(
+      this.csms.findings(
         this,
         [
           {
@@ -390,8 +348,9 @@ export class Session {
       }
       return;
     }
-    push(this.received, frame, this.host.frameHistory);
-    this.host.emit('frame', { identity: this.identity, direction: 'in', frame, raw, at: now });
+    this.received.push(frame);
+    if (this.received.length > this.csms.frameHistory) this.received.shift();
+    this.csms.safeEmit('frame', { identity: this.identity, direction: 'in', frame, raw, at: now });
     if (frame.type === MessageType.Call || frame.type === MessageType.Send) this.onStationCall(frame, now);
     else this.onStationReply(frame);
   }
@@ -403,44 +362,43 @@ export class Session {
     if (resent && f.type === MessageType.Call) {
       // The connection that should have carried the answer dropped: answer again, exactly as before.
       recordRetransmission(this.state, f);
-      this.host.emit('call', this, f);
+      this.csms.safeEmit('call', this, f);
       this.send(replyFrame(f.id, resent));
       return;
     }
-    const findings = checkStationCall(this.state, f, now, this.host.checker);
+    const findings = checkStationCall(this.state, f, now, this.checker);
     recordStationCall(this.state, f, now);
-    this.host.findings(this, findings, f.id, f.action);
-    this.host.emit('call', this, f);
+    this.csms.findings(this, findings, f.id, f.action);
+    this.csms.safeEmit('call', this, f);
     if (f.type === MessageType.Send) return;
     if (findings.some((x) => x.rule === 'rpc.unknown-action' || x.rule === 'rpc.send-misuse')) {
       const known = isKnownAction(this.version, f.action);
       this.answer(f, new CsmsCallError(known ? 'NotSupported' : 'NotImplemented', `${f.action} is not accepted here`));
       return;
     }
-    const schema = validatePayload(this.version, f.action, 'request', f.payload);
-    if (!schema.ok) {
-      const [first] = schema.violations;
+    if (findings.some((x) => x.rule === 'schema.request')) {
+      // The checker already found the payload invalid; the CALLERROR names the violations.
+      const schema = validatePayload(this.version, f.action, 'request', f.payload);
+      const violations = schema.ok ? [] : schema.violations;
       this.answer(
         f,
         new CsmsCallError(
-          violationErrorCode(this.version, first?.code ?? 'format'),
+          violationErrorCode(this.version, violations[0]?.code ?? 'format'),
           'payload failed schema validation',
-          {
-            violations: schema.violations.map((v) => ({ path: v.path, message: v.message })),
-          },
+          { violations: violations.map((v) => ({ path: v.path, message: v.message })) },
         ),
       );
       return;
     }
-    const responder = this.responders.get(f.action) ?? this.host.responders.get(f.action);
-    const next = () => this.host.defaultReply(this, f.action, f.payload);
+    const responder = this.responders.get(f.action) ?? this.csms.responder(f.action);
+    const next = () => this.csms.defaultReplyFor(this, f.action, f.payload);
     let out: unknown;
     try {
       out = responder
         ? responder(f.payload, this, next)
         : (next() ?? new CsmsCallError('NotImplemented', `no handler for ${f.action}`));
     } catch (err) {
-      this.host.error(err);
+      this.csms.error(err);
       out = new CsmsCallError('InternalError', `handler for ${f.action} threw`);
     }
     if (out instanceof Promise) {
@@ -450,7 +408,7 @@ export class Session {
           if (this.ws === ws) this.answer(f, r);
         },
         (err: unknown) => {
-          this.host.error(err);
+          this.csms.error(err);
           if (this.ws === ws) this.answer(f, new CsmsCallError('InternalError', `handler for ${f.action} failed`));
         },
       );
@@ -459,6 +417,7 @@ export class Session {
     this.answer(f, out);
   }
 
+  /** A responder's reply that fails its own schema is not sent; the station gets InternalError. */
   private answer(f: CallFrame, out: unknown): void {
     if (out === undefined || !this.ws) return;
     let reply: CallResultFrame | CallErrorFrame | undefined;
@@ -470,10 +429,10 @@ export class Session {
         description: out.description,
         details: out.details,
       };
-    } else if (this.host.strict) {
+    } else {
       const check = validatePayload(this.version, f.action, 'response', out);
       if (!check.ok) {
-        this.host.error(new PayloadValidationError(f.action, 'response', check.violations));
+        this.csms.error(new PayloadValidationError(f.action, 'response', check.violations));
         reply = {
           type: MessageType.CallError,
           id: f.id,
@@ -489,12 +448,12 @@ export class Session {
       reply.type === MessageType.CallResult
         ? { result: reply.payload }
         : { error: reply.code, description: reply.description, details: reply.details };
-    applyCsmsReply(this.state, f, result, this.host.clock.now());
-    this.host.afterReply(this, f, result);
+    applyCsmsReply(this.state, f, result, this.csms.clock.now());
+    this.csms.afterReply(this, f, result);
   }
 
   private onStationReply(f: CallResultFrame | CallErrorFrame | CallResultErrorFrame): void {
-    this.host.findings(this, checkStationReply(this.state, f), f.id);
+    this.csms.findings(this, checkStationReply(this.state, f), f.id);
     const settled = applyStationReply(this.state, f);
     const p = this.inflight;
     if (!settled || !p || p.frame.id !== f.id) return;
@@ -526,8 +485,8 @@ export class Session {
     const p = this.queue.shift();
     if (!p) return;
     this.inflight = p;
-    applyCsmsCall(this.state, p.frame, this.host.clock.now());
-    p.timer = this.host.clock.setTimeout(() => {
+    applyCsmsCall(this.state, p.frame, this.csms.clock.now());
+    p.timer = this.csms.clock.setTimeout(() => {
       if (this.inflight !== p) return;
       this.inflight = undefined;
       expireCsmsCall(this.state, p.frame.id);
@@ -540,8 +499,9 @@ export class Session {
   private transmit(frame: Frame, raw: string): void {
     if (!this.ws) throw new Error(`${this.identity} is not connected`);
     this.ws.send(raw);
-    push(this.sent, frame, this.host.frameHistory);
-    this.host.emit('frame', { identity: this.identity, direction: 'out', frame, raw, at: this.host.clock.now() });
+    this.sent.push(frame);
+    if (this.sent.length > this.csms.frameHistory) this.sent.shift();
+    this.csms.safeEmit('frame', { identity: this.identity, direction: 'out', frame, raw, at: this.csms.clock.now() });
   }
 }
 
@@ -572,25 +532,22 @@ function urlHost(host: string): string {
   return host.includes(':') ? `[${host}]` : host;
 }
 
-export class Csms extends Emitter<CsmsEvents> {
+export class Csms extends TypedEmitter<CsmsEvents> {
   readonly url: string;
   readonly port: number;
+  readonly clock: Clock;
   /** The newest violations found (at most `maxViolations`), oldest first. `report()` counts every one. */
   readonly violations: ConformanceViolation[] = [];
+  /** @internal Default timeout of CSMS -> station CALLs. */
+  readonly callTimeoutMs: number;
+  /** @internal Frames kept per session. */
+  readonly frameHistory: number;
 
-  /**
-   * A socket factory for `StationConfig.socket` / `ConnectionOptions.socket`: an in-memory connection to this CSMS,
-   * with the same handshake (identity, subprotocol, Basic auth) as over TCP. Ignores the URL's host.
-   */
-  readonly connect: (url: string, protocols?: string[], headers?: Record<string, string>) => MemorySocket;
-
-  private readonly server: Bun.Server<SocketData> | undefined;
-  private readonly unlisten: () => void;
-  private stopped = false;
-  private readonly clock: Clock;
+  private readonly server: Bun.Server<SocketData>;
   private readonly bySession = new Map<string, Session>();
   private readonly responders = new Map<string, Responder>();
-  private readonly host: Host;
+  private readonly signer: CertificateSigner | undefined;
+  private readonly heartbeatInterval: number;
   private nextTransactionId = 1;
   /** Exact counts of every violation, including those trimmed from `violations`. */
   private readonly totals: ConformanceReport = emptyReport();
@@ -600,79 +557,17 @@ export class Csms extends Emitter<CsmsEvents> {
   constructor(opts: CsmsOptions = {}) {
     super();
     this.clock = opts.clock ?? new WallClock();
-    const versions = opts.versions ?? [...OCPP_VERSIONS];
-    const blocked = new Set(opts.blockedIdTokens ?? []);
-    const heartbeatInterval = opts.heartbeatInterval ?? 300;
+    this.heartbeatInterval = opts.heartbeatInterval ?? 300;
     const topology = opts.topology;
-    const baseChecker: CheckerConfig = { ...DEFAULT_CHECKER_CONFIG, ...opts.checker };
     const checkerFor = (identity: string): CheckerConfig => ({
-      ...baseChecker,
+      ...DEFAULT_CHECKER_CONFIG,
       topology: typeof topology === 'function' ? topology(identity) : topology,
     });
-    const signer = opts.signer;
+    this.signer = opts.signer;
+    this.callTimeoutMs = opts.callTimeoutMs ?? 30_000;
+    this.frameHistory = opts.frameHistory ?? 1000;
     this.maxViolations = opts.maxViolations ?? 10_000;
     this.forgetAfterMs = opts.forgetAfterMs ?? 3_600_000;
-
-    this.host = {
-      clock: this.clock,
-      checker: baseChecker,
-      strict: opts.strict ?? true,
-      callTimeoutMs: opts.callTimeoutMs ?? 30_000,
-      frameHistory: opts.frameHistory ?? 1000,
-      responders: this.responders,
-      defaultReply: (session, action, payload) =>
-        defaultReply(action, payload, {
-          version: session.version,
-          now: this.clock.date().toISOString(),
-          nowMs: this.clock.now(),
-          heartbeatInterval,
-          blocked,
-          nextTransactionId: () => this.nextTransactionId++,
-        }),
-      afterReply: (session, call, reply) => {
-        if (!signer || call.action !== 'SignCertificate' || !('result' in reply)) return;
-        if ((reply.result as { status?: unknown }).status !== 'Accepted') return;
-        const req = call.payload as { csr: string; certificateType?: string };
-        setImmediate(() => {
-          Promise.resolve()
-            .then(() => signer({ identity: session.identity, version: session.version, ...req }))
-            .then((certificateChain) => {
-              const payload: Record<string, unknown> = { certificateChain };
-              if (session.version !== 'ocpp1.6' && req.certificateType !== undefined) {
-                payload.certificateType = req.certificateType;
-              }
-              return session.call('CertificateSigned', payload);
-            })
-            .catch((err: unknown) => this.host.error(err));
-        });
-      },
-      findings: (session, findings, frameId, action) => {
-        const at = this.clock.now();
-        for (const f of findings) {
-          const v: ConformanceViolation = {
-            identity: session.identity,
-            version: session.version,
-            ...f,
-            at,
-            ...(frameId === undefined ? {} : { frameId }),
-            ...(action === undefined ? {} : { action }),
-          };
-          addToReport(this.totals, v);
-          this.violations.push(v);
-          if (this.violations.length > this.maxViolations) this.violations.shift();
-          this.safeEmit('violation', v);
-        }
-      },
-      emit: (event, ...args) => this.safeEmit(event, ...args),
-      error: (err) => {
-        const e = err instanceof Error ? err : new Error(String(err));
-        try {
-          this.emit('error', e);
-        } catch {
-          // An error listener that throws has nowhere left to report to.
-        }
-      },
-    };
 
     const upgrade = (url: URL, headers: Headers): SocketData | Response => {
       let identity: string;
@@ -686,9 +581,9 @@ export class Csms extends Emitter<CsmsEvents> {
         .split(',')
         .map((p) => p.trim())
         .filter(Boolean);
-      const version = offered.find((p): p is OcppVersion => isOcppVersion(p) && versions.includes(p));
+      const version = offered.find(isOcppVersion);
       if (!version) {
-        return new Response(`unsupported subprotocol; this CSMS speaks ${versions.join(', ')}`, { status: 400 });
+        return new Response(`unsupported subprotocol; this CSMS speaks ${OCPP_VERSIONS.join(', ')}`, { status: 400 });
       }
       const auth = opts.basicAuth;
       if (auth) {
@@ -708,59 +603,9 @@ export class Csms extends Emitter<CsmsEvents> {
       }
       return { identity, version };
     };
-    const handlers = {
-      open: (ws: Socket) => {
-        const { identity, version } = ws.data;
-        this.forgetIdle();
-        let session = this.bySession.get(identity);
-        if (!session) {
-          session = new Session({ ...this.host, checker: checkerFor(identity) }, identity, version);
-          this.bySession.set(identity, session);
-        } else if (session.connected) {
-          // A station that reconnects replaces its old connection.
-          const old = session.socket();
-          session.close(1000, 'replaced by a new connection');
-          if (old) this.detach(session, old, 1000, 'replaced by a new connection');
-        }
-        session.attach(ws);
-        this.safeEmit('connected', session);
-      },
-      close: (ws: Socket, code: number, reason: string) => {
-        const session = this.bySession.get(ws.data.identity);
-        if (session) this.detach(session, ws, code, reason);
-        this.forgetIdle();
-      },
-      message: (ws: Socket, message: string | Buffer) => {
-        const session = this.bySession.get(ws.data.identity);
-        if (!session?.isSocket(ws)) return;
-        const raw = typeof message === 'string' ? message : Buffer.from(message).toString('utf8');
-        try {
-          session.onRaw(raw);
-        } catch (err) {
-          this.host.error(err);
-        }
-      },
-    };
-    const memory: MemoryEndpoint<SocketData> = {
-      upgrade: (req) => {
-        if (this.stopped) return null;
-        const r = upgrade(req.url, req.headers);
-        return r instanceof Response ? { status: r.status } : { data: r, protocol: r.version };
-      },
-      ...handlers,
-    };
-    this.connect = (url, protocols = [], headers = {}) => connectMemory(memory, url, protocols, headers);
 
     const tls = opts.tls;
     const host = opts.host ?? '127.0.0.1';
-    if (opts.listen === false) {
-      this.server = undefined;
-      this.port = 0;
-      const listening = listenInMemory(memory);
-      this.url = listening.url;
-      this.unlisten = listening.close;
-      return;
-    }
     this.server = Bun.serve<SocketData>({
       port: opts.port ?? 0,
       hostname: host,
@@ -782,12 +627,42 @@ export class Csms extends Emitter<CsmsEvents> {
         const upgraded = server.upgrade(req, { data, headers: { 'Sec-WebSocket-Protocol': data.version } });
         return upgraded ? undefined : new Response('expected a WebSocket upgrade', { status: 400 });
       },
-      websocket: handlers,
+      websocket: {
+        open: (ws) => {
+          const { identity, version } = ws.data;
+          this.forgetIdle();
+          let session = this.bySession.get(identity);
+          if (!session) {
+            session = new Session(this, identity, version, checkerFor(identity));
+            this.bySession.set(identity, session);
+          } else if (session.connected) {
+            // A station that reconnects replaces its old connection.
+            const old = session.socket();
+            session.close(1000, 'replaced by a new connection');
+            if (old) this.detach(session, old, 1000, 'replaced by a new connection');
+          }
+          session.attach(ws);
+          this.safeEmit('connected', session);
+        },
+        close: (ws, code, reason) => {
+          const session = this.bySession.get(ws.data.identity);
+          if (session) this.detach(session, ws, code, reason);
+          this.forgetIdle();
+        },
+        message: (ws, message) => {
+          const session = this.bySession.get(ws.data.identity);
+          if (!session?.isSocket(ws)) return;
+          const raw = typeof message === 'string' ? message : Buffer.from(message).toString('utf8');
+          try {
+            session.onRaw(raw);
+          } catch (err) {
+            this.error(err);
+          }
+        },
+      },
     });
     this.port = this.server.port ?? 0;
     this.url = `${tls ? 'wss' : 'ws'}://${urlHost(host)}:${this.port}`;
-    // Reachable in memory at its TCP URL too (`connectInMemory`), e.g. a CSMS a scenario's site starts itself.
-    this.unlisten = tls ? () => {} : listenInMemory(memory, this.url).close;
   }
 
   /** The session of a station that has connected at least once. */
@@ -832,10 +707,85 @@ export class Csms extends Emitter<CsmsEvents> {
   }
 
   async stop(): Promise<void> {
-    this.stopped = true;
     for (const session of this.bySession.values()) session.close(1001, 'CSMS stopping');
-    this.unlisten();
-    await this.server?.stop(true);
+    await this.server.stop(true);
+  }
+
+  // ---- used by Session -----------------------------------------------------------------------------------------
+
+  /** @internal The CSMS-wide responder for `action`, if any. */
+  responder(action: string): Responder | undefined {
+    return this.responders.get(action);
+  }
+
+  /** @internal The built-in reply to a station CALL (undefined when there is none). */
+  defaultReplyFor(session: Session, action: string, payload: unknown): unknown {
+    return defaultReply(action, payload, {
+      version: session.version,
+      now: new Date(this.clock.now()).toISOString(),
+      nowMs: this.clock.now(),
+      heartbeatInterval: this.heartbeatInterval,
+      nextTransactionId: () => this.nextTransactionId++,
+    });
+  }
+
+  /** @internal An Accepted SignCertificate is followed by CertificateSigned with the signer's chain. */
+  afterReply(session: Session, call: CallFrame, reply: CsmsReply): void {
+    const signer = this.signer;
+    if (!signer || call.action !== 'SignCertificate' || !('result' in reply)) return;
+    if ((reply.result as { status?: unknown }).status !== 'Accepted') return;
+    const req = call.payload as { csr: string; certificateType?: string };
+    setImmediate(() => {
+      Promise.resolve()
+        .then(() => signer({ identity: session.identity, version: session.version, ...req }))
+        .then((certificateChain) => {
+          const payload: Record<string, unknown> = { certificateChain };
+          if (session.version !== 'ocpp1.6' && req.certificateType !== undefined) {
+            payload.certificateType = req.certificateType;
+          }
+          return session.call('CertificateSigned', payload);
+        })
+        .catch((err: unknown) => this.error(err));
+    });
+  }
+
+  /** @internal Record the checker's findings for one frame as violations. */
+  findings(session: Session, findings: Finding[], frameId?: string, action?: string): void {
+    const at = this.clock.now();
+    for (const f of findings) {
+      const v: ConformanceViolation = {
+        identity: session.identity,
+        version: session.version,
+        ...f,
+        at,
+        ...(frameId === undefined ? {} : { frameId }),
+        ...(action === undefined ? {} : { action }),
+      };
+      addToReport(this.totals, v);
+      this.violations.push(v);
+      if (this.violations.length > this.maxViolations) this.violations.shift();
+      this.safeEmit('violation', v);
+    }
+  }
+
+  /** @internal Report a failure through `error` without letting a throwing listener escape. */
+  error(err: unknown): void {
+    const e = err instanceof Error ? err : new Error(String(err));
+    try {
+      this.emit('error', e);
+    } catch {
+      // An error listener that throws has nowhere left to report to.
+    }
+  }
+
+  /** @internal Emit without letting a throwing listener escape into the socket handler. */
+  safeEmit<K extends keyof CsmsEvents>(event: K, ...args: CsmsEvents[K]): void {
+    try {
+      this.emit(event, ...args);
+    } catch (err) {
+      if (event === 'error') return;
+      this.error(err);
+    }
   }
 
   /** Drop the sessions of stations disconnected for `forgetAfterMs` or longer. */
@@ -849,16 +799,6 @@ export class Csms extends Emitter<CsmsEvents> {
 
   private detach(session: Session, ws: Socket, code: number, reason: string): void {
     if (session.detach(ws)) this.safeEmit('disconnected', session, { code, reason });
-  }
-
-  /** Emit without letting a throwing listener escape into the socket handler. */
-  private safeEmit<K extends keyof CsmsEvents>(event: K, ...args: CsmsEvents[K]): void {
-    try {
-      this.emit(event, ...args);
-    } catch (err) {
-      if (event === 'error') return;
-      this.host.error(err);
-    }
   }
 }
 

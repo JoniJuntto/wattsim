@@ -68,7 +68,6 @@ test("deadMeter 'zero' keeps answering a dead meter with 0 V, 0 A and 0 Hz", asy
     expect(await f32(0x0046)).toBe(0);
     expect(await f32(0x0000)).toBe(0);
     expect(await f32(0x0006)).toBe(0);
-    expect(rt.meterReading('M1').frequency).toBe(0);
   } finally {
     client.close();
   }

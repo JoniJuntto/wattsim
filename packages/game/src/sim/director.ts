@@ -4,7 +4,7 @@
  */
 import { feederOf, MDB } from './layout';
 import type { Lot } from './lot';
-import { DAY, deviceName, EPOCH, HOUR, hhmm, MIN } from './model';
+import { DAY, deviceName, EPOCH, HOUR, hhmm, MIN, pick } from './model';
 import type { World } from './world';
 
 // ---- goals --------------------------------------------------------------------------------------------------------
@@ -53,7 +53,7 @@ export function planGoals(w: World): Goal[] {
     w.day === 1
       ? ['energy', 'noTrips', 'happy']
       : [
-          pick(w, ['energy', 'happy'] as GoalId[]),
+          pick(w.rng, ['energy', 'happy'] as GoalId[]),
           ...shuffle(w, ['noTrips', 'service', 'queue', 'peak'] as GoalId[]),
         ].slice(0, 3);
   const bonus = 150 + 50 * (w.day - 1);
@@ -120,8 +120,8 @@ export const forecastText = (w: World, f: Forecast) =>
 
 /** Tomorrow, from day 2 on. */
 export function pickForecast(w: World): Forecast {
-  const id = pick(w, Object.keys(FORECASTS) as ForecastId[]);
-  return id === 'taxis' ? { id, lot: pick(w, w.lots).id } : { id };
+  const id = pick(w.rng, Object.keys(FORECASTS) as ForecastId[]);
+  return id === 'taxis' ? { id, lot: pick(w.rng, w.lots).id } : { id };
 }
 
 /** Morning: put the day's forecast into the lots' schedules (price, fines and crowds are read where they apply). */
@@ -213,7 +213,7 @@ function open(w: World, d: Dilemma): void {
 
 /** A scheduled offer at a random lot; false when none fits right now. */
 function offer(w: World, t: number): boolean {
-  const lot = pick(w, w.lots);
+  const lot = pick(w.rng, w.lots);
   const kinds = w.day === 1 ? ['tv'] : shuffle(w, ['cap', 'tv', 'reserve']);
   for (const kind of kinds) {
     if (kind === 'tv') return tv(w, lot, t);
@@ -385,10 +385,6 @@ export function contractText(w: World, c: Contract): string {
 }
 
 const siteKw = (lot: Lot) => lot.state.supply.powerW.reduce((a, b) => a + b, 0) / 1000;
-
-function pick<T>(w: World, xs: readonly T[]): T {
-  return xs[Math.floor(w.rng() * xs.length)] as T;
-}
 
 function shuffle<T>(w: World, xs: T[]): T[] {
   return xs

@@ -1,12 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import {
-  buildSite,
-  type NodeDescription,
-  type SiteDescription,
-  SiteValidationError,
-  siteBuilder,
-  validateSite,
-} from '../src/index';
+import { buildSite, type NodeDescription, type SiteDescription, SiteValidationError, validateSite } from '../src/index';
 
 const desc = (nodes: NodeDescription[], supply: Partial<SiteDescription['supply']> = {}): SiteDescription => ({
   supply: { phases: 3, voltageV: 400, ...supply },
@@ -199,33 +192,70 @@ describe('validation', () => {
   });
 });
 
-describe('builder', () => {
-  test('produces a JSON-able description that builds', () => {
-    const b = siteBuilder(
-      { phases: 3, voltageV: 400, ratingA: 250 },
-      { name: 'Depot', tolerance: { seed: 7 } },
-    ).transformer('T1', { kva: 400, ukPercent: 4 }, (t) =>
-      t.fuse('F0', { ratingA: 250 }, (f) =>
-        f.board('MDB', { ratingA: 250 }, (m) =>
-          m
-            .meter('M1', { model: 'sdm630', unitId: 1 }, (x) =>
-              x.breaker('Q1', { type: 'mcb', curve: 'C', ratingA: 63 }, (q) =>
-                q.cable('W1', { mm2: 16, lengthM: 40, method: 'C' }, (w) =>
-                  w.evse('CP-1', { phases: 'L2L3L1', maxCurrentA: 32 }).evse('CP-2', { phases: 'L3L1L2' }),
-                ),
-              ),
-            )
-            .load('HVAC', { model: { type: 'shape', preset: 'office', peakW: 20000 } })
-            .pv('PV', { peakW: 30000 })
-            .battery('BESS', { capacityWh: 100_000, maxChargeW: 50_000, maxDischargeW: 50_000 })
-            .step('HP', { onW: 6000 }),
-        ),
-      ),
-    );
-    const d = b.describe();
-    expect(JSON.parse(JSON.stringify(d))).toEqual(d);
-    expect(d.nodes[0]).toMatchObject({ kind: 'transformer', id: 'T1', children: [{ kind: 'fuse', id: 'F0' }] });
-    const site = b.build();
+describe('a nested description', () => {
+  test('builds in document order with a seeded band spread', () => {
+    const d: SiteDescription = {
+      name: 'Depot',
+      tolerance: { seed: 7 },
+      supply: { phases: 3, voltageV: 400, ratingA: 250 },
+      nodes: [
+        {
+          kind: 'transformer',
+          id: 'T1',
+          kva: 400,
+          ukPercent: 4,
+          children: [
+            {
+              kind: 'fuse',
+              id: 'F0',
+              ratingA: 250,
+              children: [
+                {
+                  kind: 'board',
+                  id: 'MDB',
+                  ratingA: 250,
+                  children: [
+                    {
+                      kind: 'meter',
+                      id: 'M1',
+                      model: 'sdm630',
+                      unitId: 1,
+                      children: [
+                        {
+                          kind: 'breaker',
+                          id: 'Q1',
+                          type: 'mcb',
+                          curve: 'C',
+                          ratingA: 63,
+                          children: [
+                            {
+                              kind: 'cable',
+                              id: 'W1',
+                              mm2: 16,
+                              lengthM: 40,
+                              method: 'C',
+                              children: [
+                                { kind: 'evse', id: 'CP-1', phases: 'L2L3L1', maxCurrentA: 32 },
+                                { kind: 'evse', id: 'CP-2', phases: 'L3L1L2' },
+                              ],
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                    { kind: 'load', id: 'HVAC', model: { type: 'shape', preset: 'office', peakW: 20000 } },
+                    { kind: 'pv', id: 'PV', peakW: 30000 },
+                    { kind: 'battery', id: 'BESS', capacityWh: 100_000, maxChargeW: 50_000, maxDischargeW: 50_000 },
+                    { kind: 'step', id: 'HP', onW: 6000 },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const site = buildSite(d);
     expect(site.nodes.map((n) => n.id)).toEqual([
       'T1',
       'F0',
@@ -246,7 +276,7 @@ describe('builder', () => {
       ratingA: 76,
     });
     // The seeded spread puts each device at a stable, id-dependent band position.
-    const again = b.build();
+    const again = buildSite(d);
     expect(site.curveOf('Q1')?.band).toBe(again.curveOf('Q1')?.band as number);
     expect(site.curveOf('Q1')?.band).not.toBe(0.5);
     expect(site.curveOf('Q1')?.band).not.toBe(site.curveOf('F0')?.band as number);

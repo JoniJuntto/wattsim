@@ -7,6 +7,7 @@ import { useMemo, useRef } from 'react';
 import { Color, type InstancedMesh, type Mesh, MeshStandardMaterial, Object3D } from 'three';
 import { loadColour, useTick } from '../hooks';
 import { type P2, type Run, runs } from '../sim/layout';
+import { alongPath, pathLength } from '../sim/model';
 import type { Lot } from '../sim/world';
 
 const DOT_SPACING = 1.6;
@@ -14,31 +15,12 @@ const REDUCED = typeof matchMedia === 'function' && matchMedia('(prefers-reduced
 /** Runs whose positive power flows from their last point back to the first. */
 const SOURCES = new Set(['PV', 'BAT']);
 
-type Seg = { a: P2; b: P2; len: number; at: number };
-
-function segments(pts: P2[]): { segs: Seg[]; total: number } {
-  let at = 0;
-  const segs: Seg[] = [];
-  for (let i = 1; i < pts.length; i++) {
-    const a = pts[i - 1] as P2;
-    const b = pts[i] as P2;
-    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
-    segs.push({ a, b, len, at });
-    at += len;
-  }
-  return { segs, total: at };
-}
-
-function pointAt(segs: Seg[], d: number): P2 {
-  for (const s of segs) {
-    if (d <= s.at + s.len) {
-      const f = s.len > 0 ? (d - s.at) / s.len : 0;
-      return [s.a[0] + (s.b[0] - s.a[0]) * f, s.a[1] + (s.b[1] - s.a[1]) * f];
-    }
-  }
-  const last = segs[segs.length - 1];
-  return last ? last.b : [0, 0];
-}
+/** The straight pieces of a run, for its strips. */
+const strips = (pts: P2[]) =>
+  pts.slice(1).map((b, i) => {
+    const a = pts[i] as P2;
+    return { a, b, len: Math.hypot(b[0] - a[0], b[1] - a[1]) };
+  });
 
 /** What the scene needs of a node each frame: current (A), power (W), loading (%), live. */
 function reading(lot: Lot, run: Run) {
@@ -66,8 +48,8 @@ export function Flow({ lot }: { lot: Lot }) {
 }
 
 function Cable({ lot, run }: { lot: Lot; run: Run }) {
-  const { segs } = useMemo(() => segments(run.pts), [run]);
-  const strips = useRef<Array<Mesh | null>>([]);
+  const segs = useMemo(() => strips(run.pts), [run]);
+  const meshes = useRef<Array<Mesh | null>>([]);
   // One material per run: a single colour update covers all its strips.
   const mat = useMemo(() => new MeshStandardMaterial({ color: '#3a3f46' }), []);
   const colour = useMemo(() => new Color(), []);
@@ -80,7 +62,7 @@ function Cable({ lot, run }: { lot: Lot; run: Run }) {
     const hot = live && !REDUCED && (pct ?? 0) >= 85 ? Math.max(0, Math.sin(clock.elapsedTime * (pct ?? 0) * 0.08)) : 0;
     mat.emissiveIntensity = live ? 0.15 + 0.5 * Math.min(1, amps / 60) + 1.2 * hot : 0;
     const w = 0.12 + 0.45 * Math.min(1, amps / 100);
-    for (const s of strips.current) if (s) s.scale.x = w;
+    for (const s of meshes.current) if (s) s.scale.x = w;
   });
   return (
     <>
@@ -88,7 +70,7 @@ function Cable({ lot, run }: { lot: Lot; run: Run }) {
         <mesh
           key={`${s.a}-${s.b}`}
           ref={(m) => {
-            strips.current[i] = m;
+            meshes.current[i] = m;
           }}
           material={mat}
           position={[(s.a[0] + s.b[0]) / 2, 0.04, (s.a[1] + s.b[1]) / 2]}
@@ -104,11 +86,11 @@ function Cable({ lot, run }: { lot: Lot; run: Run }) {
 function Dots({ lot, list }: { lot: Lot; list: Run[] }) {
   const mesh = useRef<InstancedMesh>(null);
   const layout = useMemo(() => {
-    const out: Array<{ run: Run; segs: Seg[]; total: number; offsets: number[] }> = [];
+    const out: Array<{ run: Run; total: number; offsets: number[] }> = [];
     for (const run of list) {
-      const { segs, total } = segments(run.pts);
+      const total = pathLength(run.pts);
       const n = Math.max(2, Math.floor(total / DOT_SPACING));
-      out.push({ run, segs, total, offsets: Array.from({ length: n }, (_, i) => (i * total) / n) });
+      out.push({ run, total, offsets: Array.from({ length: n }, (_, i) => (i * total) / n) });
     }
     return out;
   }, [list]);
@@ -129,7 +111,7 @@ function Dots({ lot, list }: { lot: Lot; list: Run[] }) {
       for (let k = 0; k < l.offsets.length; k++) {
         const d = ((((l.offsets[k] as number) + speed * dt) % l.total) + l.total) % l.total;
         l.offsets[k] = d;
-        const [x, z] = pointAt(l.segs, d);
+        const [x, z] = alongPath(l.run.pts, d);
         tmp.position.set(x, 0.18, z);
         tmp.scale.setScalar(size);
         tmp.updateMatrix();

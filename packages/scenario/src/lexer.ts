@@ -75,12 +75,16 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   'controller',
 ]);
 
-const PUNCT2 = ['..', '<='];
-const PUNCT1 = new Set(['{', '}', '[', ']', '(', ')', ':', ',', '=', '+', '-', '%', '.', ';']);
-
-const isDigit = (c: string) => c >= '0' && c <= '9';
-const isIdentStart = (c: string) => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_';
-const isIdentPart = (c: string) => isIdentStart(c) || isDigit(c);
+// One sticky regex per token class, matched at the current offset.
+const SPACE = /[ \t\r]+/y;
+const COMMENT = /\/\/[^\n]*/y;
+/** The text between the quotes, escapes untouched; a backslash hides the next character, a newline ends the match. */
+const STRING = /"((?:[^"\\\n]|\\[\s\S])*)"/y;
+/** `int` without a fraction, `number` with one. */
+const NUMBER = /\d+(\.\d+)?/y;
+/** `°C` (and `°F`) is a unit word: `ev plug evse 1 { ambient 25°C }`. */
+const IDENT = /°?[A-Za-z_][A-Za-z0-9_]*/y;
+const PUNCT = /\.\.|<=|[{}[\]():,=+\-%.;]/y;
 
 /**
  * Tokenize a scenario source. Newlines are kept as tokens; comments are not tokens but are appended to `comments`
@@ -90,111 +94,64 @@ export function lex(src: string, file?: string, comments?: Comment[]): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   let line = 1;
-  let col = 1;
+  /** Offset of the current line's first character; the column is counted from it. */
+  let lineStart = 0;
   const n = src.length;
-
-  const push = (type: TokenType, value: string, l: number, c: number) => tokens.push({ type, value, line: l, col: c });
-  const fail = (message: string, l = line, c = col): never => {
-    throw new ParseError(message, l, c, file);
+  const match = (re: RegExp): RegExpExecArray | null => {
+    re.lastIndex = i;
+    return re.exec(src);
   };
 
   while (i < n) {
+    const col = i - lineStart + 1;
     const ch = src[i] as string;
 
     if (ch === '\n') {
-      push('newline', '\n', line, col);
+      tokens.push({ type: 'newline', value: '\n', line, col });
       i++;
       line++;
-      col = 1;
+      lineStart = i;
       continue;
     }
-    if (ch === ' ' || ch === '\t' || ch === '\r') {
-      i++;
-      col++;
+    const space = match(SPACE);
+    if (space) {
+      i += space[0].length;
       continue;
     }
-    if (ch === '/' && src[i + 1] === '/') {
-      const start = i;
-      const startCol = col;
-      while (i < n && src[i] !== '\n') {
-        i++;
-        col++;
-      }
+    const comment = match(COMMENT);
+    if (comment) {
       const last = tokens.at(-1);
       const trailing = last !== undefined && last.type !== 'newline' && last.line === line;
-      comments?.push({ text: src.slice(start + 2, i).trimEnd(), line, col: startCol, trailing });
+      comments?.push({ text: comment[0].slice(2).trimEnd(), line, col, trailing });
+      i += comment[0].length;
       continue;
     }
 
-    const startLine = line;
-    const startCol = col;
-
+    let type: TokenType;
+    let value: string;
+    let length: number;
     if (ch === '"') {
-      let j = i + 1;
-      while (j < n && src[j] !== '"') {
-        if (src[j] === '\n') fail('unterminated string', startLine, startCol);
-        if (src[j] === '\\') j++;
-        j++;
-      }
-      if (j >= n) fail('unterminated string', startLine, startCol);
-      push('string', src.slice(i + 1, j), startLine, startCol);
-      col += j + 1 - i;
-      i = j + 1;
-      continue;
+      const m = match(STRING);
+      if (!m) throw new ParseError('unterminated string', line, col, file);
+      type = 'string';
+      value = m[1] as string;
+      length = m[0].length;
+    } else {
+      const number = match(NUMBER);
+      const ident = number ? null : match(IDENT);
+      const punct = number || ident ? null : match(PUNCT);
+      const m = number ?? ident ?? punct;
+      if (!m) throw new ParseError(`unexpected character '${ch}'`, line, col, file);
+      value = m[0];
+      length = value.length;
+      if (number) type = number[1] === undefined ? 'int' : 'number';
+      else if (ident) type = KEYWORDS.has(value) ? 'keyword' : 'ident';
+      else type = 'punct';
     }
-
-    if (isDigit(ch)) {
-      let j = i;
-      while (j < n && isDigit(src[j] as string)) j++;
-      let type: TokenType = 'int';
-      if (src[j] === '.' && isDigit(src[j + 1] ?? '')) {
-        type = 'number';
-        j++;
-        while (j < n && isDigit(src[j] as string)) j++;
-      }
-      push(type, src.slice(i, j), startLine, startCol);
-      col += j - i;
-      i = j;
-      continue;
-    }
-
-    // `°C` (and `°F`) is a unit word: `ev plug evse 1 { ambient 25°C }`.
-    if (ch === '°' && isIdentStart(src[i + 1] ?? '')) {
-      let j = i + 1;
-      while (j < n && isIdentPart(src[j] as string)) j++;
-      push('ident', src.slice(i, j), startLine, startCol);
-      col += j - i;
-      i = j;
-      continue;
-    }
-
-    if (isIdentStart(ch)) {
-      let j = i;
-      while (j < n && isIdentPart(src[j] as string)) j++;
-      const word = src.slice(i, j);
-      push(KEYWORDS.has(word) ? 'keyword' : 'ident', word, startLine, startCol);
-      col += j - i;
-      i = j;
-      continue;
-    }
-
-    const two = src.slice(i, i + 2);
-    if (PUNCT2.includes(two)) {
-      push('punct', two, startLine, startCol);
-      i += 2;
-      col += 2;
-      continue;
-    }
-    if (PUNCT1.has(ch)) {
-      push('punct', ch, startLine, startCol);
-      i++;
-      col++;
-      continue;
-    }
-
-    fail(`unexpected character '${ch}'`);
+    tokens.push({ type, value, line, col });
+    i += length;
   }
 
-  push('eof', '', line, col);
+  tokens.push({ type: 'eof', value: '', line, col: i - lineStart + 1 });
   return tokens;
 }

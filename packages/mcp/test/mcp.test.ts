@@ -207,8 +207,8 @@ describe('embedded server', () => {
 
   test('scenario tools on examples/basic.ws', async () => {
     const text = await Bun.file(BASIC).text();
-    expect(await ok(client, 'check_scenario', { text })).toEqual({ ok: true, stations: 1 });
-    expect(await ok(client, 'format_scenario', { text })).toEqual({ formatted: text, changed: false });
+    expect(await ok(client, 'check_scenario', { text })).toEqual({ ok: true, stations: 1, diagnostics: [] });
+    expect(await ok(client, 'format_scenario', { text })).toEqual({ source: text });
 
     const report = await ok(client, 'run_scenario', { text, seed: 1 });
     expect(report).toMatchObject({ ok: true, virtual: true, stationCount: 1, failedCount: 0, violationCount: 0 });
@@ -242,8 +242,7 @@ describe('embedded server', () => {
     const text = 'wattsim 1\nstation "X" {\n  bogus\n}\n';
     const checked = await ok(client, 'check_scenario', { text });
     expect(checked.ok).toBe(false);
-    expect(checked.error).toMatchObject({ line: 3, col: 3 });
-    expect((checked.error as { text: string }).text).toStartWith('3:3: ');
+    expect(checked.diagnostics).toMatchObject([{ line: 3, col: 3 }]);
 
     const run = await call(client, 'run_scenario', { text });
     expect(run.isError).toBe(true);

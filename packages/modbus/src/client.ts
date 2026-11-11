@@ -1,5 +1,4 @@
 import type { Socket } from 'bun';
-import { type DataType, decodeValue, type WordOrder } from './encoding';
 import {
   type Adu,
   AduDecoder,
@@ -117,22 +116,6 @@ export class ModbusClient {
   async writeMultipleRegisters(address: number, values: readonly number[], unitId?: number): Promise<void> {
     const pdu = await this.request(writeMultipleRequestPdu(address, values), unitId);
     checkResponse(FC.WRITE_MULTIPLE_REGISTERS, pdu);
-  }
-
-  /** Reads one typed value. */
-  async readValue(
-    table: 'input' | 'holding',
-    address: number,
-    type: DataType,
-    order: WordOrder,
-    unitId?: number,
-  ): Promise<number> {
-    const n = type === 'int16' || type === 'uint16' ? 1 : 2;
-    const words =
-      table === 'input'
-        ? await this.readInputRegisters(address, n, unitId)
-        : await this.readHoldingRegisters(address, n, unitId);
-    return decodeValue(words, type, order);
   }
 
   close(): void {

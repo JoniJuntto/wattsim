@@ -5,14 +5,11 @@ import {
   currentPhasor,
   type Draws,
   heatAfter,
-  magnitude,
   mcbCurve,
   type NodeDescription,
-  neutralCurrent,
   PICKUP_HEAT,
   type SiteEvent,
   SUPPLY_ID,
-  siteBuilder,
   timeToTrip,
 } from '../src/index';
 
@@ -58,19 +55,6 @@ describe('phases', () => {
   });
 
   test('two phases at 16 A put 16 A in the neutral; mixed power factors add as phasors', () => {
-    expect(
-      neutralCurrent([
-        { phase: 'L1', amps: 16 },
-        { phase: 'L2', amps: 16 },
-      ]),
-    ).toBeCloseTo(16, 9);
-    expect(
-      neutralCurrent([
-        { phase: 'L1', amps: 10 },
-        { phase: 'L2', amps: 20 },
-        { phase: 'L3', amps: 30 },
-      ]),
-    ).toBeCloseTo(Math.sqrt(300), 9); // |10 + 20a² + 30a| = 10√3
     // L1 16 A at pf 1, L2 16 A at pf 0.8: by hand, I2 at -120° - 36.87° = -156.87°.
     const ang = (-156.87 * Math.PI) / 180;
     const byHand = Math.hypot(16 + 16 * Math.cos(ang), 16 * Math.sin(ang));
@@ -110,7 +94,7 @@ describe('phases', () => {
 
   test('currentPhasor follows the phase angle and power factor', () => {
     const p = currentPhasor(10, 'L3', 0.5);
-    expect(magnitude(p)).toBeCloseTo(10, 12);
+    expect(Math.hypot(p.re, p.im)).toBeCloseTo(10, 12);
     expect(Math.atan2(p.im, p.re)).toBeCloseTo(((120 - 60) * Math.PI) / 180, 12);
   });
 });
@@ -363,19 +347,51 @@ describe('nextEvent', () => {
 
 describe('trip, reclose and de-energising', () => {
   function tree() {
-    return siteBuilder({ phases: 3, voltageV: 400 })
-      .fuse('F0', { ratingA: 100 }, (f) =>
-        f.board('MDB', { ratingA: 100 }, (b) =>
-          b
-            .breaker('Q1', { type: 'mcb', curve: 'C', ratingA: 32, reclose: { afterS: 60, attempts: 1 } }, (q) =>
-              q.cable('W1', { mm2: 6, lengthM: 20, method: 'C' }, (w) =>
-                w.evse('CP1', { phases: 'L2L3L1' }).evse('CP2', { phases: 'L3' }),
-              ),
-            )
-            .breaker('Q2', { type: 'mcb', curve: 'C', ratingA: 16 }, (q) => q.load('HVAC')),
-        ),
-      )
-      .build();
+    return site3([
+      {
+        kind: 'fuse',
+        id: 'F0',
+        ratingA: 100,
+        children: [
+          {
+            kind: 'board',
+            id: 'MDB',
+            ratingA: 100,
+            children: [
+              {
+                kind: 'breaker',
+                id: 'Q1',
+                type: 'mcb',
+                curve: 'C',
+                ratingA: 32,
+                reclose: { afterS: 60, attempts: 1 },
+                children: [
+                  {
+                    kind: 'cable',
+                    id: 'W1',
+                    mm2: 6,
+                    lengthM: 20,
+                    method: 'C',
+                    children: [
+                      { kind: 'evse', id: 'CP1', phases: 'L2L3L1' },
+                      { kind: 'evse', id: 'CP2', phases: 'L3' },
+                    ],
+                  },
+                ],
+              },
+              {
+                kind: 'breaker',
+                id: 'Q2',
+                type: 'mcb',
+                curve: 'C',
+                ratingA: 16,
+                children: [{ kind: 'load', id: 'HVAC' }],
+              },
+            ],
+          },
+        ],
+      },
+    ]);
   }
 
   test('a tripped breaker de-energises its subtree only', () => {

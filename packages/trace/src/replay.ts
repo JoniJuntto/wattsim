@@ -16,7 +16,7 @@
  * - a CSMS frame (`in`) is an expectation, awaited for up to `timeoutMs`. A CALL (or 2.1 SEND) matches the first
  *   live CALL of the same action not matched yet; a response matches the live response to the station CALL it
  *   answered (same id: station CALLs keep their recorded ids). Payloads are compared with scenario's `partialMatch`
- *   after removing CSMS-assigned ids and timestamps from both sides (`ignoreKeys`, and every string that is an ISO
+ *   after removing CSMS-assigned ids and timestamps from both sides (`DEFAULT_IGNORE_KEYS`, and every string that is an ISO
  *   8601 timestamp); a CALLERROR is compared by its code.
  *
  * After the last entry the connection stays open for `settleMs` (default 1000 ms), and live CSMS frames that no
@@ -25,12 +25,12 @@
  * CALL in the trace (orphans), are not expected from the CSMS.
  */
 import type { Clock, SocketLike } from '@wattsim/core';
-import { WallClock } from '@wattsim/core';
+import { sleep, WallClock } from '@wattsim/core';
 import type { Frame, OcppVersion } from '@wattsim/protocol';
 import { encodeFrame, MessageType } from '@wattsim/protocol';
 import { partialMatch } from '@wattsim/scenario';
 import type { TraceEntry } from './entry';
-import { correlate, decodeRaw, isCallLike } from './entry';
+import { correlate, decodeRaw, isCallLike, openSocket } from './entry';
 
 const WS_OPEN = 1;
 
@@ -50,12 +50,8 @@ export type ReplayOptions = {
   /** How long to wait for each expected CSMS frame; default 30000 ms. */
   timeoutMs?: number;
   basicAuth?: { user: string; password: string };
-  /** Payload keys left out of the comparison (see `ignoreMatcher`); default `DEFAULT_IGNORE_KEYS`. */
-  ignoreKeys?: readonly string[];
   /** How long to keep listening after the last entry for CSMS frames the trace does not have; default 1000 ms. */
   settleMs?: number;
-  /** Opens each identity's socket instead of `new WebSocket`, as `ConnectionOptions.socket` does. */
-  socket?: (url: string, protocols: string[], headers: Record<string, string>) => SocketLike;
 };
 
 /**
@@ -243,41 +239,6 @@ class Link {
   }
 }
 
-function open(
-  url: string,
-  version: OcppVersion,
-  headers: Record<string, string>,
-  clock: Clock,
-  timeoutMs: number,
-  socket: ReplayOptions['socket'],
-) {
-  return new Promise<SocketLike>((resolve, reject) => {
-    let ws: SocketLike;
-    if (socket) ws = socket(url, [version], headers);
-    else {
-      const real = new WebSocket(url, { protocols: [version], headers });
-      real.binaryType = 'arraybuffer';
-      ws = real;
-    }
-    let message = 'connection closed during the handshake';
-    const timer = clock.setTimeout(() => {
-      ws.close();
-      reject(new Error('handshake timed out'));
-    }, timeoutMs);
-    ws.onopen = () => {
-      timer.cancel();
-      resolve(ws);
-    };
-    ws.onerror = (ev) => {
-      message = (ev as ErrorEvent).message || message;
-    };
-    ws.onclose = () => {
-      timer.cancel();
-      reject(new Error(message));
-    };
-  });
-}
-
 /** Replay `trace` against `opts.csmsUrl`. Never throws for a CSMS that behaves differently; that is in the report. */
 export async function replay(trace: readonly TraceEntry[], opts: ReplayOptions): Promise<ReplayReport> {
   const clock = opts.clock ?? new WallClock();
@@ -325,7 +286,7 @@ function mapIdentity(opts: ReplayOptions, identity: string): string {
 async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Promise<void> {
   const { trace, links, opts, clock, report } = ctx;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const ignore = ignoreMatcher(opts.ignoreKeys ?? DEFAULT_IGNORE_KEYS);
+  const ignore = ignoreMatcher(DEFAULT_IGNORE_KEYS);
   const fail = (m: Omit<ReplayMismatch, 'identity'>) => report.mismatches.push({ identity, ...m });
   const version = trace[indexes[0] as number]?.version ?? opts.version;
   if (!version) {
@@ -337,11 +298,11 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
     headers.Authorization = `Basic ${btoa(`${opts.basicAuth.user}:${opts.basicAuth.password}`)}`;
   }
   const url = `${opts.csmsUrl.replace(/\/+$/, '')}/${encodeURIComponent(mapIdentity(opts, identity))}`;
-  let ws: SocketLike;
-  try {
-    ws = await open(url, version, headers, clock, timeoutMs, opts.socket);
-  } catch (err) {
-    fail({ kind: 'connect', message: `cannot connect to ${url}: ${err instanceof Error ? err.message : String(err)}` });
+  const ws = new WebSocket(url, { protocols: [version], headers });
+  ws.binaryType = 'arraybuffer';
+  const opened = await openSocket(ws, clock, timeoutMs);
+  if (!opened.ok) {
+    fail({ kind: 'connect', message: `cannot connect to ${url}: ${opened.message}` });
     return;
   }
   const link = new Link(ws, version);
@@ -378,7 +339,7 @@ async function replayIdentity(ctx: Ctx, identity: string, indexes: number[]): Pr
       if (!opts.virtual) {
         const due = ctx.liveStart + (e.ts + wire.delayMs - ctx.t0) / (opts.speed ?? 1);
         const wait = due - clock.now();
-        if (wait > 0) await clock.sleep(wait);
+        if (wait > 0) await sleep(clock, wait);
       }
       let raw = wire.raw;
       const sent = raw === e.raw ? f : decodeRaw(raw, version).frame;

@@ -9,17 +9,15 @@ import {
   type BatteryModel,
   buildSite,
   type DlmScore,
-  dlmScore,
   mulberry32,
   type Phase,
-  type ScoreSample,
   type Site,
   type SiteEvent,
   type SiteState,
   type StepLoad,
 } from '@wattsim/grid';
+import { ScoreAccumulator, waterFill } from '@wattsim/site';
 import { OfflineError } from './csms';
-import { dlmLimits } from './dlm';
 import {
   BATTERY_W,
   type Bay,
@@ -62,6 +60,7 @@ import {
   PRESETS,
   type Preset,
   pathAt,
+  pick,
   type Selection,
   type ShopItem,
   type Tech,
@@ -73,6 +72,10 @@ import type { World } from './world';
 const DRIVE_MS = 75_000;
 const WAIT_MS = 20 * MIN;
 const DLM_EVERY_MS = MIN;
+/** The auto-DLM shares this much of every protective device's rating among the EVs under it. */
+const DLM_HEADROOM = 0.9;
+const DLM_MIN_A = 6;
+const PHASES: Phase[] = ['L1', 'L2', 'L3'];
 const SAMPLE_EVERY_MS = MIN;
 const WALK_MS_PER_M = 1_500;
 const REPAIR_MS = 25 * MIN;
@@ -92,7 +95,7 @@ const NOT_CHARGING_MS = 10 * MIN;
 /** Fast DC charging: full power to half full, then a taper. */
 const dcCurve = (soc: number) =>
   soc < 0.5 ? 1 : soc < 0.8 ? 1 - (soc - 0.5) * 2.3 : Math.max(0.08, 0.31 - (soc - 0.8));
-export const EXPAND_PRICE = 6000;
+const EXPAND_PRICE = 6000;
 
 type Incident = {
   at: number;
@@ -126,8 +129,7 @@ export class Lot {
   private sessions: Session[] = [];
   private lastDlm = 0;
   private lastSample = 0;
-  private samples: ScoreSample[] = [];
-  private siteEvents: SiteEvent[] = [];
+  private scoring = new ScoreAccumulator();
   private requestsWh: Record<string, number> = {};
   private warned = new Set<string>();
   private trippedAt = new Map<string, number>();
@@ -213,6 +215,8 @@ export class Lot {
     }
     this.state = this.site.evaluate(t, draws);
     for (const e of this.state.events) this.onSiteEvent(e);
+    // The score counts trips from the states it is fed: a state with a trip in it is scored at once.
+    if (this.state.events.some((e) => e.type === 'trip')) this.sample(t);
     for (const ch of this.chargers.values()) {
       const live = this.state.nodes[ch.bay.id]?.energized ?? false;
       if (live !== ch.powered) this.setPower(ch, live);
@@ -228,7 +232,6 @@ export class Lot {
   }
 
   private onSiteEvent(e: SiteEvent): void {
-    this.siteEvents.push(e);
     if (e.type === 'trip') {
       this.trippedAt.set(e.nodeId, e.t);
       this.alert('crit', `${deviceName(e.nodeId)} tripped at ${Math.round(e.currentA)} A`, this.device(e.nodeId));
@@ -338,7 +341,7 @@ export class Lot {
       const e = ch.station.evses[0];
       if (e) evse[ch.bay.id] = { allocatedW: e.tx ? e.offeredKw * 1000 : 0, active: !!e.tx };
     }
-    this.samples.push({ t, state: this.state, evse });
+    this.scoring.add({ t, state: this.state, evse });
   }
 
   // ---- drivers -----------------------------------------------------------------------------------------------
@@ -375,14 +378,13 @@ export class Lot {
     const span = this.kind.rate.length - 1.5;
     this.incidents = Array.from({ length: n }, () => ({
       at: base + (DAY_START_H + 0.5 + this.rng() * span) * HOUR,
-      kind: this.pick(kinds),
+      kind: pick(this.rng, kinds),
     }));
     // A lot bought in the afternoon only gets what is left of the day.
     this.arrivals = this.arrivals.filter((t) => t >= this.now).sort((a, b) => a - b);
     this.incidents = this.incidents.filter((i) => i.at >= this.now).sort((a, b) => a.at - b.at);
     this.requestsWh = {};
-    this.samples = [];
-    this.siteEvents = [];
+    this.scoring = new ScoreAccumulator();
     this.stats = emptyStats();
   }
 
@@ -392,9 +394,9 @@ export class Lot {
     const initialSoc = 0.1 + this.rng() * 0.4;
     const car: Car = {
       id: this.nextCarId++,
-      driver: this.pick(DRIVERS),
+      driver: pick(this.rng, DRIVERS),
       preset,
-      colour: this.pick(CAR_COLOURS),
+      colour: pick(this.rng, CAR_COLOURS),
       state: 'waiting',
       arrivedAt: t,
       departAt: t + stayH * HOUR,
@@ -427,7 +429,7 @@ export class Lot {
     const hurry = car.departAt - car.arrivedAt < 1.5 * HOUR;
     const liked = free.filter((c) => c.type.dc === hurry);
     const pool = liked.length > 0 ? liked : free;
-    return pool[Math.floor(this.rng() * pool.length)];
+    return pick(this.rng, pool);
   }
 
   private park(car: Car): boolean {
@@ -559,19 +561,19 @@ export class Lot {
 
   incident(inc: Incident): void {
     const chargers = [...this.chargers.values()].filter((c) => !c.fault && !c.hung && c.powered);
-    const ch = chargers.length > 0 ? this.pick(chargers) : undefined;
+    const ch = chargers.length > 0 ? pick(this.rng, chargers) : undefined;
     const target = (c: Charger): Selection => ({ kind: 'charger', id: c.id });
     switch (inc.kind) {
       case 'reset-fault':
         if (ch) {
-          const code = this.pick(['HighTemperature', 'EVCommunicationError', 'ReaderFailure']);
+          const code = pick(this.rng, ['HighTemperature', 'EVCommunicationError', 'ReaderFailure']);
           this.setFault(ch, code, 'reset');
           this.alert('crit', `${ch.id} faulted: ${code}. A remote reset usually clears it.`, target(ch));
         }
         return;
       case 'tech-fault':
         if (ch) {
-          const code = this.pick(['GroundFailure', 'PowerSwitchFailure']);
+          const code = pick(this.rng, ['GroundFailure', 'PowerSwitchFailure']);
           this.setFault(ch, code, 'tech');
           this.alert('crit', `${ch.id} faulted: ${code}. Needs a technician on site.`, target(ch));
         }
@@ -668,7 +670,7 @@ export class Lot {
       (c) => c.state === 'parked' && !c.stuck && c.departAt - this.now > 90 * MIN && c.soc < c.targetSoc - 0.05,
     );
     if (cars.length === 0) return;
-    const car = this.pick(cars);
+    const car = pick(this.rng, cars);
     const ch = this.chargers.get(car.bay ?? '');
     if (!ch) return;
     const leaveIn = (45 + this.rng() * 30) * MIN;
@@ -685,7 +687,7 @@ export class Lot {
   private billingQuestion(): void {
     const s = this.sessions.filter((x) => x.kwh > 2);
     if (s.length === 0) return;
-    const session = this.pick(s);
+    const session = pick(this.rng, s);
     const ch = this.chargers.get(session.charger);
     const metered = Math.round(session.kwh * this.kind.kwhPrice * (ch?.type.tariff ?? 1) * 100) / 100;
     const genuine = this.rng() < 0.6;
@@ -709,7 +711,7 @@ export class Lot {
       id: this.w.nextId(),
       lot: this.id,
       kind,
-      from: from ?? car?.driver ?? this.pick(DRIVERS),
+      from: from ?? car?.driver ?? pick(this.rng, DRIVERS),
       t: this.now,
       due: this.now + TICKET_MS[kind],
       text,
@@ -960,22 +962,37 @@ export class Lot {
   private runDlm(): void {
     if (!this.dlmOn) return;
     const live = [...this.chargers.values()].filter((c) => c.powered && c.station.evses[0]?.tx);
-    const limits = dlmLimits(
-      this.state,
-      live.map((c) => {
-        const e = c.station.evses[0];
-        const n = e?.phases ?? e?.ev?.config.phases ?? 3;
-        return {
-          id: c.id,
-          devices: ['F0', feederOf(c.bay, c.type.id)],
-          phases: [...c.bay.phases.matchAll(/L\d/g)].slice(0, n).map((m) => m[0] as Phase),
-          drawA: e?.meter.currentA ?? 0,
-          maxA: c.type.maxA,
-        };
-      }),
+    const evses = live.map((c) => {
+      const e = c.station.evses[0];
+      const n = e?.phases ?? e?.ev?.config.phases ?? 3;
+      const phases = [...c.bay.phases.matchAll(/L\d/g)].slice(0, n).map((m) => m[0] as Phase);
+      return { c, devices: ['F0', feederOf(c.bay, c.type.id)], phases, drawA: e?.meter.currentA ?? 0 };
+    });
+    // Per device and phase, the room for EVs: 90 % of the rating minus what the non-EV loads under it draw now.
+    const constraints: Array<{ key: string; budgetA: number }> = [];
+    for (const d of new Set(evses.flatMap((e) => e.devices))) {
+      const node = this.state.nodes[d];
+      if (!node?.ratingA) continue;
+      for (const [k, p] of PHASES.entries()) {
+        const ev = evses.filter((e) => e.devices.includes(d) && e.phases.includes(p)).reduce((s, e) => s + e.drawA, 0);
+        const other = Math.max(0, (node.currentA[k] ?? 0) - ev);
+        constraints.push({ key: `${d}|${p}`, budgetA: DLM_HEADROOM * node.ratingA - other });
+      }
+    }
+    const { amps } = waterFill(
+      constraints,
+      evses.map((e) => ({
+        id: e.c.id,
+        uses: e.devices.flatMap((d) => e.phases.map((p) => `${d}|${p}`)),
+        maxA: e.c.type.maxA,
+        minA: 0,
+        priority: 0,
+      })),
     );
-    for (const c of live) {
-      const a = Math.min(c.manualA, limits.get(c.id) ?? c.type.maxA);
+    for (const { c } of evses) {
+      // Never below the minimum an EV charges with: a slight overload beats a stalled car.
+      const share = Math.max(DLM_MIN_A, Math.floor(amps.get(c.id) ?? c.type.maxA));
+      const a = Math.min(c.manualA, share);
       if (Math.abs(a - c.sentA) >= 1) void this.sendLimit(c, a).catch(() => {});
     }
   }
@@ -1043,7 +1060,7 @@ export class Lot {
     for (const ch of this.chargers.values()) ch.car = undefined;
     // Only the building runs overnight.
     this.state = this.site.evaluate(this.now, this.site.loadDraws(this.now));
-    this.score = dlmScore(this.samples, { requestsWh: this.requestsWh, events: this.siteEvents });
+    this.score = this.scoring.result(this.requestsWh);
     return Math.max(0, this.stats.peakKw) * DEMAND_PER_KW;
   }
 
@@ -1194,7 +1211,6 @@ export class Lot {
     station.on('error', () => {});
     const ch: Charger = {
       id,
-      lot: this.id,
       bay,
       type,
       station,
@@ -1230,9 +1246,5 @@ export class Lot {
 
   private alert(level: 'info' | 'warn' | 'crit', text: string, target?: Selection): void {
     this.w.alert(level, text, target, this.id);
-  }
-
-  private pick<T>(xs: readonly T[]): T {
-    return xs[Math.floor(this.rng() * xs.length)] as T;
   }
 }

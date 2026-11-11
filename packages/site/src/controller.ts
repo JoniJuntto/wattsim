@@ -46,31 +46,6 @@ export type ReferenceOptions = {
   marginPct?: number;
   /** Lowest current an EV charges with, A. Default 6. */
   minA?: number;
-  /** A change smaller than this (and than `deadbandPct`) is not sent, A. Default 1. */
-  deadbandA?: number;
-  /** A change smaller than this share of the limit (and than `deadbandA`) is not sent, %. Default 5. */
-  deadbandPct?: number;
-  /** Give booting stations a TxDefaultProfile at `defaultA`. Default true. */
-  defaultProfile?: boolean;
-  /**
-   * Limit of that default profile, A. Default 0: a new session waits (SuspendedEVSE) for its first allocation,
-   * which its start triggers at once, so a new EV never draws before the others have made room.
-   */
-  defaultA?: number;
-  /**
-   * 2.x purpose of the per-EVSE limits. Default `TxProfile`. `ChargingStationExternalConstraints` is for stations
-   * that take external constraints from the CSMS (wattsim's own refuse them, as OCPP 2.0.1 reserves that purpose for
-   * limits from outside OCPP).
-   */
-  purpose?: 'TxProfile' | 'ChargingStationExternalConstraints';
-  /** Shortest time between two steps triggered by events, ms. Default 1000. */
-  minGapMs?: number;
-  /** An EV more than 2 A below its limit for this long is capped near what it draws, ms. Default 30000. */
-  settleMs?: number;
-  /** No cap within this time after an increase was confirmed (the EV is still ramping up), ms. Default 30000. */
-  rampMs?: number;
-  /** Wait before retrying a refused or unanswered profile; doubles per failure, at most 5 min. Default `intervalMs`. */
-  retryMs?: number;
 };
 
 export type AllocationReason =
@@ -221,7 +196,7 @@ const PROFILE_ID_BASE = 9000;
 const DEFAULT_PROFILE_ID = 8999;
 /** Above this an EVSE draws, A. */
 const DRAWING_A = 0.5;
-/** An EV this far below its limit (for `settleMs`) is capped at what it draws plus this, A. */
+/** An EV this far below its limit (for `SETTLE_MS`) is capped at what it draws plus this, A. */
 const HEADROOM_A = 2;
 /** A capped EV drawing within this of its cap gets its full share back, A. */
 const RELEASE_A = 1;
@@ -230,6 +205,19 @@ const OVERDRAW_A = 1;
 /** Overshoot below this is measurement noise, A. */
 const OVERSHOOT_A = 0.1;
 const MAX_RETRY_MS = 300_000;
+/** A change smaller than this, and than `DEADBAND_PCT` of the limit, is not sent, A. */
+const DEADBAND_A = 1;
+const DEADBAND_PCT = 5;
+/** Shortest time between two steps triggered by events, ms. */
+const MIN_GAP_MS = 1000;
+/** An EV more than `HEADROOM_A` below its limit for this long is capped near what it draws, ms. */
+const SETTLE_MS = 30_000;
+/** No cap within this time after an increase was confirmed (the EV is still ramping up), ms. */
+const RAMP_MS = 30_000;
+/** 2.x purpose of the per-EVSE limits (wattsim's own stations refuse `ChargingStationExternalConstraints`). */
+const PURPOSE = 'TxProfile';
+/** Limit of the TxDefaultProfile booting stations get, A: a new session waits for its first allocation. */
+const DEFAULT_A = 0;
 const EPS = 1e-6;
 
 const keyOf = (nodeId: string, p: Phase) => `${nodeId}|${p}`;
@@ -239,13 +227,6 @@ export class ReferenceController {
   readonly intervalMs: number;
   readonly marginPct: number;
   readonly minA: number;
-  private readonly deadbandA: number;
-  private readonly deadbandPct: number;
-  private readonly minGapMs: number;
-  private readonly settleMs: number;
-  private readonly rampMs: number;
-  private readonly retryMs: number;
-  private readonly opts: ReferenceOptions;
   private timer: Timer | undefined;
   private queued: Timer | undefined;
   private offs: Array<() => void> = [];
@@ -264,16 +245,9 @@ export class ReferenceController {
     private readonly csms: Csms,
     opts: ReferenceOptions = {},
   ) {
-    this.opts = opts;
     this.intervalMs = opts.intervalMs ?? 10_000;
     this.marginPct = opts.marginPct ?? 5;
     this.minA = opts.minA ?? 6;
-    this.deadbandA = opts.deadbandA ?? 1;
-    this.deadbandPct = opts.deadbandPct ?? 5;
-    this.minGapMs = opts.minGapMs ?? 1000;
-    this.settleMs = opts.settleMs ?? 30_000;
-    this.rampMs = opts.rampMs ?? 30_000;
-    this.retryMs = opts.retryMs ?? this.intervalMs;
     if (!(this.intervalMs > 0)) throw new RangeError(`controller interval must be > 0 ms, got ${this.intervalMs}`);
     if (!(this.marginPct >= 0 && this.marginPct < 100)) {
       throw new RangeError(`controller margin must be in [0, 100) %, got ${this.marginPct}`);
@@ -300,7 +274,7 @@ export class ReferenceController {
         if (a === 'BootNotification') {
           // A rebooted station has lost its profiles until it accepts new ones.
           this.defaults.delete(session.identity);
-          if (this.opts.defaultProfile !== false) queueMicrotask(() => this.sendDefault(session));
+          queueMicrotask(() => this.sendDefault(session));
         } else if (a === 'StartTransaction' || a === 'StopTransaction') {
           queueMicrotask(() => this.trigger('transaction'));
         } else if (a === 'TransactionEvent') {
@@ -322,11 +296,11 @@ export class ReferenceController {
     for (const off of this.offs.splice(0)) off();
   }
 
-  /** A step soon: now, or `minGapMs` after the last one. */
+  /** A step soon: now, or `MIN_GAP_MS` after the last one. */
   trigger(reason: AllocationReason): void {
     if (!this.running) return;
     const now = this.host.clock.now();
-    const due = this.lastStepAt + this.minGapMs;
+    const due = this.lastStepAt + MIN_GAP_MS;
     if (now >= due) {
       this.step(reason);
       return;
@@ -662,7 +636,7 @@ export class ReferenceController {
   }
 
   private deadband(limitA: number): number {
-    return Math.max(this.deadbandA, (this.deadbandPct / 100) * Math.max(0, limitA));
+    return Math.max(DEADBAND_A, (DEADBAND_PCT / 100) * Math.max(0, limitA));
   }
 
   private ctlFor(leaf: Leaf, txId: string, now: number): Ctl {
@@ -719,7 +693,7 @@ export class ReferenceController {
 
   /**
    * The cap of an EV that draws well below its limit, with hysteresis: it is set once the EV has been more than
-   * `HEADROOM_A` below its limit for `settleMs` (never within `rampMs` of a confirmed increase), at what it draws plus
+   * `HEADROOM_A` below its limit for `SETTLE_MS` (never within `RAMP_MS` of a confirmed increase), at what it draws plus
    * `HEADROOM_A` (at least the minimum current, the reserve it resumes with), and released once the EV draws within
    * `RELEASE_A` of it.
    */
@@ -730,13 +704,13 @@ export class ReferenceController {
       c.belowSince = undefined;
       return undefined;
     }
-    const below = ceiling >= this.minA && ceiling - measuredA > HEADROOM_A && now - c.raisedAt >= this.rampMs;
+    const below = ceiling >= this.minA && ceiling - measuredA > HEADROOM_A && now - c.raisedAt >= RAMP_MS;
     if (!below) {
       c.belowSince = undefined;
       return c.capA;
     }
     c.belowSince ??= now;
-    if (now - c.belowSince >= this.settleMs) {
+    if (now - c.belowSince >= SETTLE_MS) {
       const cap = Math.max(this.minA, floor1(measuredA + HEADROOM_A));
       if (cap < ceiling - 0.05) c.capA = cap;
       c.belowSince = undefined;
@@ -773,9 +747,9 @@ export class ReferenceController {
             chargingProfile: {
               id: PROFILE_ID_BASE + leaf.evseId,
               stackLevel: 1,
-              chargingProfilePurpose: this.opts.purpose ?? 'TxProfile',
+              chargingProfilePurpose: PURPOSE,
               chargingProfileKind: 'Relative',
-              ...(this.opts.purpose === 'ChargingStationExternalConstraints' ? {} : { transactionId: c.txId }),
+              transactionId: c.txId,
               chargingSchedule: [{ id: 1, ...schedule }],
             },
           };
@@ -808,13 +782,13 @@ export class ReferenceController {
     // Not taken, or not known to be: keep the old limit (or the unanswered one, if higher) and retry later.
     if (outcome === 'unknown') c.uncertainA = Math.max(c.uncertainA, limitA);
     c.failures++;
-    c.retryAt = now + Math.min(this.retryMs * 2 ** (c.failures - 1), MAX_RETRY_MS);
+    c.retryAt = now + Math.min(this.intervalMs * 2 ** (c.failures - 1), MAX_RETRY_MS);
     this.trigger('answer');
   }
 
   private sendDefault(session: Session): void {
     if (!this.running || !session.connected) return;
-    const limit = this.opts.defaultA ?? 0;
+    const limit = DEFAULT_A;
     const schedule = { chargingRateUnit: 'A', chargingSchedulePeriod: [{ startPeriod: 0, limit }] };
     const payload =
       session.version === 'ocpp1.6'

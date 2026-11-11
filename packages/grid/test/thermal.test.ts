@@ -5,7 +5,6 @@ import {
   type Draws,
   gGCurve,
   heatAfter,
-  heatRate,
   mcbCurve,
   mccbCurve,
   PICKUP_HEAT,
@@ -132,20 +131,11 @@ describe('below the pickup the device warms but never trips', () => {
 describe('closed form against brute force', () => {
   test('time to trip and heat match 1 ms Euler steps of the ODE through a sub-pickup and a crawl phase', () => {
     const c = mcbCurve('C', 16);
+    // The ODE written out here is the one the module integrates.
     const ode = (m: number, h: number) => {
       const relax = (PICKUP_HEAT * Math.min(1, m / c.pickup) ** 2 - h) / c.coolingS;
       return Number.isFinite(c.thermalTime(m)) ? Math.max(relax, crawlRate(c, m)) : relax;
     };
-    // The ODE written out here is the one the module integrates.
-    for (const [m, h] of [
-      [0.5, 0.3],
-      [1.3, 0.1],
-      [1.3, 0.75],
-      [3, 0.2],
-    ] as const) {
-      expect(heatRate(c, m, h)).toBeCloseTo(ode(m, h), 15);
-    }
-
     const history: Array<[number, number]> = [
       [600, 1.0], // sub-pickup warm-up
       [120, 0], // cooling

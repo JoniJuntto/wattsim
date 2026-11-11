@@ -12,7 +12,7 @@
  */
 import type { OcppVersion } from '@wattsim/protocol';
 import { v16, v21, v201 } from '@wattsim/protocol';
-import type { ChaosFaultEffect } from './chaos';
+import type { ChaosEffect } from './chaos';
 import { isoTimestamp } from './clock';
 import type { EvseState, Station } from './station';
 
@@ -232,7 +232,7 @@ export function mutatePayload(
   action: string | undefined,
   kind: PayloadKind,
   payload: unknown,
-  fault: ChaosFaultEffect,
+  fault: ChaosEffect,
 ): unknown {
   const a = action ?? '';
   switch (fault.kind) {
@@ -324,7 +324,7 @@ export async function faultEvse(station: Station, evseId: number, code?: string)
   const eventId = (eventIds.get(station) ?? 0) + 1;
   eventIds.set(station, eventId);
   const now = isoTimestamp(station.clock);
-  await station.sendRaw('NotifyEvent', {
+  await station.request('NotifyEvent', {
     generatedAt: now,
     seqNo: 0,
     tbc: false,

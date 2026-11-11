@@ -1,4 +1,5 @@
 import type { Station, VirtualClock } from '@wattsim/core';
+import type { ScoreSample } from '@wattsim/grid';
 import type { SiteRuntime } from '../src/index';
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -31,4 +32,38 @@ export async function drive(clock: VirtualClock, ms: number, stepMs: number, idl
     await clock.advance(Math.min(stepMs, end - clock.now()));
   }
   await settle(idle);
+}
+
+/**
+ * Every score sample of the run as the runtime scores it: the latest state of each instant, with the events of the
+ * instant's earlier states, and the controller's allocations per EVSE.
+ */
+export function collectSamples(rt: SiteRuntime): ScoreSample[] {
+  const samples: ScoreSample[] = [];
+  const first = rt.state();
+  if (first) samples.push({ t: first.t, state: first });
+  rt.on('node', (state) => {
+    const prev = samples.at(-1);
+    const a = rt.snapshot().controller.last;
+    const evse =
+      a && rt.controllerMode === 'reference'
+        ? Object.fromEntries(
+            a.evses.map((e) => [
+              e.leafId,
+              { allocatedW: e.limitA * e.phases.length * rt.site.phaseVoltage, active: true },
+            ]),
+          )
+        : undefined;
+    if (prev && prev.t === state.t) {
+      const events = prev.state.events.length > 0 ? [...prev.state.events, ...state.events] : state.events;
+      samples[samples.length - 1] = {
+        t: state.t,
+        state: events === state.events ? state : { ...state, events },
+        ...(evse ? { evse } : {}),
+      };
+      return;
+    }
+    samples.push({ t: state.t, state, ...(evse ? { evse } : {}) });
+  });
+  return samples;
 }

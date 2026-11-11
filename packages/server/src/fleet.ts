@@ -7,7 +7,7 @@ import { STATUS_ORDER } from './series';
 import type { FleetBin, FleetSeriesView } from './types';
 
 export const FLEET_BIN_MS = 10_000;
-export const FLEET_BINS = 8640;
+const FLEET_BINS = 8640;
 /** The status columns: the known statuses, then one for any other value. */
 export const FLEET_STATUSES = [...STATUS_ORDER, 'Other'] as const;
 const OTHER = FLEET_STATUSES.length - 1;

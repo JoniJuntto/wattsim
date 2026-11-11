@@ -64,12 +64,13 @@ export type Prop = { name: string; value: PropValue; loc: Loc };
 
 export type EvAction = 'plug' | 'unplug' | 'ready' | 'suspend' | 'resume';
 
-export type ChaosFault = 'drop' | 'delay' | 'duplicate' | 'corrupt' | 'wrongId' | 'callError' | 'noResponse';
-/**
- * The chaos faults added in milestone 4, with their arguments. They parse to `ChaosFaultStmt` rather than
- * `ChaosStmt`, so code written against `ChaosStmt` (whose `fault` maps 1:1 onto core's `ChaosEffect`) still holds.
- */
-export type ChaosFaultSpec =
+/** The chaos faults that take no arguments. */
+export type ChaosPlainFault = 'drop' | 'duplicate' | 'corrupt' | 'wrongId' | 'callError' | 'noResponse';
+/** A chaos fault with its arguments; `chaosEffect` (chaos.ts) maps it onto core's `ChaosEffect`. */
+export type ChaosFault =
+  | { kind: ChaosPlainFault }
+  /** `delay DUR`: hold every matching frame. */
+  | { kind: 'delay'; delay: DurExpr }
   /** `jitter MIN..MAX`: a delay drawn per frame from the run's seeded RNG. */
   | { kind: 'jitter'; min: DurExpr; max: DurExpr }
   /** `reorder [after N]`: hold the frame until N (default 1) later frames have passed it. */
@@ -88,7 +89,7 @@ export type ChaosFaultSpec =
   | { kind: 'timestamp'; shift: DurExpr }
   /** `oversized N kB`: pad the payload to N kB (1 kB = 1024 bytes). */
   | { kind: 'oversized'; kb: NumExpr };
-export type ChaosFaultKind = ChaosFaultSpec['kind'];
+export type ChaosFaultKind = ChaosFault['kind'];
 export type ChaosDirection = 'in' | 'out';
 /** Which frames a chaos rule counts: `nth N`, or `every N [from M]` (the M-th frame, then every N-th after it). */
 export type ChaosTrigger = { kind: 'nth'; n: NumExpr } | { kind: 'every'; n: NumExpr; from?: NumExpr };
@@ -160,21 +161,9 @@ export type OnStmt = {
   response: OnResponse;
   loc: Loc;
 };
-export type ChaosStmt = {
-  kind: 'chaos';
-  fault: ChaosFault;
-  /** Only for `fault === 'delay'`. */
-  delay?: DurExpr;
-  direction?: ChaosDirection;
-  /** OCPP action name filter. */
-  action?: string;
-  trigger?: ChaosTrigger;
-  /** `probability P%`: drawn for each frame the other filters select. `percent` is P, not P/100. */
-  probability?: NumExpr;
-  once: boolean;
-  loc: Loc;
-};
-/** Filters and triggers shared by `chaos` rules of either kind. */
+/** `chaos FAULT [ARGS] [in|out] [ACTION] [nth N | every N [from M]] [probability P%] [once]`. */
+export type ChaosStmt = { kind: 'chaos'; fault: ChaosFault; loc: Loc } & ChaosFilters;
+/** The filters and triggers of a `chaos` rule. */
 export type ChaosFilters = {
   direction?: ChaosDirection;
   /** OCPP action name filter. */
@@ -184,8 +173,6 @@ export type ChaosFilters = {
   probability?: NumExpr;
   once: boolean;
 };
-/** `chaos jitter|reorder|halfOpen|slowRead|reconnectStorm|invalidEnum|missingField|timestamp|oversized ...`. */
-export type ChaosFaultStmt = { kind: 'chaosFault'; fault: ChaosFaultSpec; loc: Loc } & ChaosFilters;
 /** `1500Wh`, `2kWh`: an energy, kept in the unit it was written in. */
 export type EnergyLit = { kind: 'energy'; wh: number; unit: 'Wh' | 'kWh'; loc: Loc };
 /** An energy literal or a variable holding a number of Wh. */
@@ -368,7 +355,6 @@ export type Stmt = (
   | NetStmt
   | OnStmt
   | ChaosStmt
-  | ChaosFaultStmt
   | BootLoopStmt
   | FaultStmt
   | MeterStmt
@@ -385,8 +371,6 @@ export type Stmt = (
   | ControllerStmt
   | SiteExpectStmt
 ) & { comments?: Comments };
-
-export type StmtKind = Stmt['kind'];
 
 // ---- top level --------------------------------------------------------------------------------------------------
 
@@ -440,3 +424,19 @@ export type Scenario = {
   /** Comments on the header line and the `csms` line, and comments after the last declaration. */
   comments?: { header?: Comments; csms?: Comments; end?: string[] };
 };
+
+// ---- helpers ----------------------------------------------------------------------------------------------------
+
+/** A string literal's text as written, escapes resolved and `{var}` references kept as such. */
+export function rawText(s: StringExpr): string {
+  return s.parts.map((p) => (typeof p === 'string' ? p : `{${p.var}}`)).join('');
+}
+
+/** Calls `visit` on every statement of `body` and of every block nested in it (`at`, `repeat`, `choose`), in order. */
+export function forEachStmt(body: readonly Stmt[], visit: (s: Stmt) => void): void {
+  for (const s of body) {
+    visit(s);
+    if (s.kind === 'at' || s.kind === 'repeat') forEachStmt(s.body, visit);
+    else if (s.kind === 'choose') for (const b of s.branches) forEachStmt(b.body, visit);
+  }
+}
