@@ -106,6 +106,22 @@ export const SMART_CHARGING_16 = {
   maxInstalled: 10,
 } as const;
 
+/** The measurands `meterValue16` produces: what StopTxnSampledData may name. */
+const MEASURANDS_16: readonly string[] = [
+  'Energy.Active.Import.Register',
+  'Power.Active.Import',
+  'Voltage',
+  'Current.Import',
+  'SoC',
+];
+
+/**
+ * StopTxnSampledData per station: the measurands a StopTransaction's `transactionData` repeats. The spec sets no
+ * default; the energy register alone is the usual factory setting and keeps a long charge's StopTransaction small.
+ */
+const stopTxnSampledData = new WeakMap<StationContext, readonly string[]>();
+const stopTxnMeasurands = (st: StationContext) => stopTxnSampledData.get(st) ?? ['Energy.Active.Import.Register'];
+
 type ConfigEntry = {
   readonly: boolean;
   get: (st: StationContext) => string;
@@ -115,6 +131,20 @@ type ConfigEntry = {
 const CONFIG: Record<string, ConfigEntry> = {
   HeartbeatInterval: { readonly: false, ...HEARTBEAT_INTERVAL },
   MeterValueSampleInterval: { readonly: false, ...METER_INTERVAL },
+  StopTxnSampledData: {
+    readonly: false,
+    get: (st) => stopTxnMeasurands(st).join(','),
+    set: (st, v) => {
+      const list = v
+        .split(',')
+        .map((m) => m.trim())
+        .filter(Boolean);
+      if (list.length > MEASURANDS_16.length || !list.every((m) => MEASURANDS_16.includes(m))) return false;
+      stopTxnSampledData.set(st, list);
+      return true;
+    },
+  },
+  StopTxnSampledDataMaxLength: { readonly: true, get: () => String(MEASURANDS_16.length) },
   NumberOfConnectors: { readonly: true, get: (st) => String(st.evses.length) },
   SupportedFeatureProfiles: { readonly: true, get: () => 'Core,SmartCharging,RemoteTrigger' },
   ChargeProfileMaxStackLevel: { readonly: true, get: () => String(SMART_CHARGING_16.maxStackLevel) },
@@ -340,8 +370,15 @@ export const ocpp16: VersionAdapter = {
       meterStop: Math.round(end.energyWh),
       timestamp: end.timestamp,
       reason: stopReason16(reason),
-      transactionData: tx.samples.map(({ sample, context }) => meterValue16(sample, context)),
     };
+    // Only the StopTxnSampledData measurands; a meter value left with none (SoC without an EV that reports it) goes.
+    // ponytail: no cap on how many samples; a very long charge at a short MeterValueSampleInterval can still grow large.
+    const measurands = stopTxnMeasurands(st);
+    const transactionData = tx.samples
+      .map(({ sample, context }) => meterValue16(sample, context))
+      .map((mv) => ({ ...mv, sampledValue: mv.sampledValue.filter((v) => measurands.includes(v.measurand ?? '')) }))
+      .filter((mv) => mv.sampledValue.length > 0);
+    if (transactionData.length > 0) payload.transactionData = transactionData;
     if (reason === 'Local') payload.idTag = tx.idTag;
     await st.request('StopTransaction', payload);
   },

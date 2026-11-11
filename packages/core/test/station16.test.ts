@@ -427,6 +427,44 @@ describe('Station 1.6: inbound CALLs', () => {
     expect(calls('MeterValues').length).toBe(4);
   });
 
+  test('StopTransaction transactionData carries the StopTxnSampledData measurands only', async () => {
+    const station = await booted();
+    const stopMeasurands = async () => {
+      await station.plugIn(1, { initialSoc: 0.5 });
+      await station.evReady(1);
+      await station.startTransaction(1);
+      await advanceSettled(station, MINUTE);
+      await station.stopTransaction(1);
+      await station.unplug(1);
+      const stop = payload<v16.StopTransactionRequest>(calls('StopTransaction').at(-1));
+      return stop.transactionData?.map((mv) => mv.sampledValue.map((v): string | undefined => v.measurand));
+    };
+    expect(await call('GetConfiguration', { key: ['StopTxnSampledData', 'StopTxnSampledDataMaxLength'] })).toEqual({
+      configurationKey: [
+        { key: 'StopTxnSampledData', readonly: false, value: 'Energy.Active.Import.Register' },
+        { key: 'StopTxnSampledDataMaxLength', readonly: true, value: '5' },
+      ],
+    });
+    const energy = ['Energy.Active.Import.Register'];
+    expect(await stopMeasurands()).toEqual([energy, energy, energy]); // begin + 1 periodic + end
+
+    expect(await call('ChangeConfiguration', { key: 'StopTxnSampledData', value: 'SoC, Power.Active.Import' })).toEqual(
+      {
+        status: 'Accepted',
+      },
+    );
+    const both = ['Power.Active.Import', 'SoC'];
+    expect(await stopMeasurands()).toEqual([both, both, both]);
+
+    expect(await call('ChangeConfiguration', { key: 'StopTxnSampledData', value: 'Temperature' })).toEqual({
+      status: 'Rejected',
+    });
+    expect(await call('ChangeConfiguration', { key: 'StopTxnSampledData', value: '' })).toEqual({
+      status: 'Accepted',
+    });
+    expect(await stopMeasurands()).toBeUndefined();
+  });
+
   test('SetChargingProfile: limit 0 -> SuspendedEVSE, 11000 W caps power, Clear restores', async () => {
     const station = await booted();
     await station.plugIn(1);
